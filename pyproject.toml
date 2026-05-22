@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autodebug"
+version = "0.1.0"
+description = "End-to-end agentic debugger: reproduce, bisect, and fix bugs automatically"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",
+    "langgraph>=0.2.0",
+    "langchain>=0.3.0",
+    "langchain-anthropic>=0.3.0",
+    "langchain-openai>=0.3.0",
+    "langchain-community>=0.3.0",
+    "gitpython>=3.1.40",
+    "PyGithub>=2.1.1",
+    "docker>=7.0.0",
+    "pydantic>=2.5.0",
+    "rich>=13.7.0",
+    "typer>=0.12.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.3.0",
+    "mypy>=1.8.0",
+]
+eval = [
+    "datasets>=2.16.0",
+    "pandas>=2.1.0",
+    "tabulate>=0.9.0",
+]
+
+[project.scripts]
+autodebug = "autodebug.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["autodebug*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
