@@ -37,7 +37,7 @@ def get_commit_info(repo_path: str, sha: str) -> CommitInfo:
         message=lines[2],
         author=lines[3],
         date=lines[4],
-        diff=diff[:8000],  # cap diff size sent to LLM
+        diff=(diff or "")[:8000],
     )
 
 
