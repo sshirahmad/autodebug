@@ -6,12 +6,24 @@ from pathlib import Path
 
 from langchain_core.tools import tool
 
+# Container paths the LLM might use instead of relative paths
+_CONTAINER_PREFIXES = ("/workspace/repo/", "/workspace/repo", "/repo/", "/repo")
+
+
+def _to_repo_relative(path: str) -> str:
+    """Strip container-absolute prefixes so paths resolve against repo_path."""
+    for prefix in _CONTAINER_PREFIXES:
+        if path == prefix.rstrip("/") or path.startswith(prefix.rstrip("/") + "/"):
+            path = path[len(prefix):]
+            break
+    return path.lstrip("/")
+
 
 def make_read_file_tool(repo_path: Path, **_):
     @tool
     def read_file(path: str) -> str:
         """Read a file from the repository."""
-        fp = repo_path / path
+        fp = repo_path / _to_repo_relative(path)
         if fp.exists():
             return fp.read_text(encoding="utf-8", errors="replace")
         return f"File not found: {path}"
@@ -22,7 +34,7 @@ def make_list_files_tool(repo_path: Path, **_):
     @tool
     def list_files(path: str) -> str:
         """List files in a directory of the repository."""
-        dp = repo_path / path
+        dp = repo_path / _to_repo_relative(path)
         if dp.is_dir():
             entries = sorted(dp.iterdir())
             return "\n".join(("  " if e.is_dir() else "") + e.name for e in entries)
