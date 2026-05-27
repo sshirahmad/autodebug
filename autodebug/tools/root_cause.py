@@ -24,14 +24,17 @@ def make_run_repro_with_traceback_tool(sandbox: Sandbox, repro_script: str, **_)
     @tool
     def run_repro_with_traceback() -> str:
         """Run the reproduction script and capture the full Python traceback."""
-        run = sandbox.run_script(
+        wrapper = (
             "import traceback, sys\n"
             "try:\n"
             "    exec(open('/workspace/repro.py').read())\n"
             "except Exception:\n"
             "    traceback.print_exc()\n"
-            "    sys.exit(1)\n",
-            extra_files={"repro.py": repro_script},
+            "    sys.exit(1)\n"
+        )
+        run = sandbox.run(
+            command="python /workspace/script.py",
+            extra_files={"script.py": wrapper, "repro.py": repro_script},
         )
         return run.output[-4000:]
     return run_repro_with_traceback
