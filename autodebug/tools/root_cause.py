@@ -42,8 +42,18 @@ def make_run_repro_with_traceback_tool(sandbox: Sandbox, repro_script: str, **_)
 
 def make_submit_root_cause_tool(result: list, **_):
     @tool
-    def submit_root_cause(summary: str, relevant_lines: list[str], hypothesis: str) -> str:
-        """Submit the root cause analysis."""
+    def submit_root_cause(summary: str, relevant_lines: str | list[str], hypothesis: str) -> str:
+        """Submit the root cause analysis.
+
+        Args:
+            summary: One-paragraph description of the root cause.
+            relevant_lines: List of relevant file:line references, e.g.
+                ["lib/foo/bar.py:42", "lib/foo/bar.py:55"]. May also be
+                passed as a newline-separated string.
+            hypothesis: Explanation of why the change caused the bug.
+        """
+        if isinstance(relevant_lines, str):
+            relevant_lines = [l.strip() for l in relevant_lines.splitlines() if l.strip()]
         result.append(RootCauseResult(
             summary=summary,
             relevant_lines=relevant_lines,
