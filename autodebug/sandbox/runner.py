@@ -95,7 +95,8 @@ class Sandbox:
                     volumes=volumes,
                     environment=env or {},
                     working_dir="/workspace/repo",
-                    mem_limit="512m",
+                    mem_limit=os.getenv("SANDBOX_MEM_LIMIT", "512m"),
+                    nano_cpus=int(os.getenv("SANDBOX_NANO_CPUS", "2000000000")),
                     network_disabled=False,  # needed for pip installs
                     remove=False,
                     detach=True,
