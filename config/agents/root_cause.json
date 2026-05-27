@@ -1,0 +1,7 @@
+{
+  "system_prompt": "config/prompts/root_cause.yaml",
+  "tools": ["search_memory", "read_file", "read_file_at_parent", "run_repro_with_traceback", "submit_root_cause"],
+  "time_budget_seconds": 120,
+  "token_budget": 30000,
+  "max_retries": 1
+}

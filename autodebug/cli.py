@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from autodebug.telemetry import setup_tracing
 from autodebug.graph import run_pipeline
 
 app = typer.Typer(help="AutoDebug — reproduce, bisect, and fix bugs automatically")

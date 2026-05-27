@@ -1,17 +1,16 @@
 """Docker sandbox for safely running untrusted code during debugging."""
 
-import os
 import tempfile
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
 import docker
+import os
+import requests.exceptions
 from docker.errors import ContainerError, ImageNotFound
-
-
-SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "autodebug-sandbox:latest")
-TIMEOUT = int(os.getenv("SANDBOX_TIMEOUT_SECONDS", "60"))
+from dotenv import load_dotenv
+from urllib3.exceptions import ReadTimeoutError
 
 
 @dataclass
@@ -37,9 +36,9 @@ class Sandbox:
     All containers are removed after execution regardless of outcome.
     """
 
-    def __init__(self, repo_path: str, image: str = SANDBOX_IMAGE):
+    def __init__(self, repo_path: str, image: str | None = None):
         self.repo_path = Path(repo_path)
-        self.image = image
+        self.image = image or os.getenv("SANDBOX_IMAGE", "autodebug-sandbox:latest")
         self._client = docker.from_env()
         self._ensure_image()
 
@@ -57,7 +56,7 @@ class Sandbox:
         command: str,
         extra_files: dict[str, str] | None = None,
         env: dict[str, str] | None = None,
-        timeout: int = TIMEOUT,
+        timeout: int | None = None,
     ) -> RunResult:
         """Execute command inside a container with the repo mounted read-only.
 
@@ -68,6 +67,8 @@ class Sandbox:
             env: Additional environment variables.
             timeout: Max seconds before the container is killed.
         """
+        if timeout is None:
+            timeout = int(os.getenv("SANDBOX_TIMEOUT_SECONDS", "300"))
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
 
@@ -105,6 +106,14 @@ class Sandbox:
                     stdout = container.logs(stdout=True, stderr=False).decode(errors="replace")
                     stderr = container.logs(stdout=False, stderr=True).decode(errors="replace")
                     exit_code = result["StatusCode"]
+                except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout, ReadTimeoutError):
+                    stdout = container.logs(stdout=True, stderr=False).decode(errors="replace")
+                    stderr = container.logs(stdout=False, stderr=True).decode(errors="replace")
+                    return RunResult(
+                        exit_code=124,
+                        stdout=stdout,
+                        stderr=stderr + f"\n[sandbox] container timed out after {timeout}s",
+                    )
                 finally:
                     container.remove(force=True)
 

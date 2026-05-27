@@ -2,19 +2,17 @@
 
 from __future__ import annotations
 
-import json
-import os
 from pathlib import Path
+from typing import Callable
 
 from langchain_core.messages import BaseMessage
 
-from autodebug.agents.base import BaseAgent
+from autodebug.agents.base import BaseAgent, BudgetExceeded
 from autodebug.sandbox import Sandbox
-from autodebug.state import DebugState, PipelineStage, ReproResult
+from autodebug.state import DebugState, PipelineStage
 
-MAX_ATTEMPTS = int(os.getenv("REPRO_MAX_ATTEMPTS", "5"))
-
-SYSTEM_PROMPT = """You are an expert software debugger. Your job is to reproduce a bug
+_DEFAULT_SYSTEM_PROMPT = """\
+You are an expert software debugger. Your job is to reproduce a bug
 given a bug report and access to the repository.
 
 You will be given tools to:
@@ -32,143 +30,64 @@ Think step by step:
 4. Run it to confirm it fails
 5. If it doesn't fail, revise and retry
 
-When you have a confirmed reproducing script, call the `submit_repro` tool."""
-
-TOOLS = [
-    {
-        "name": "read_file",
-        "description": "Read a file from the repository",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Path relative to repo root"},
-            },
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "list_files",
-        "description": "List files in a directory of the repository",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Directory path relative to repo root"},
-            },
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "run_script",
-        "description": "Run a Python script in the sandbox against the repository",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "script": {"type": "string", "description": "Python code to execute"},
-            },
-            "required": ["script"],
-        },
-    },
-    {
-        "name": "submit_repro",
-        "description": "Submit the confirmed reproduction script when the bug is reproduced",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "script": {"type": "string", "description": "The minimal reproducing script"},
-                "error_output": {"type": "string", "description": "The error output confirming the bug"},
-            },
-            "required": ["script", "error_output"],
-        },
-    },
-]
-
+When you have a confirmed reproducing script, call the `submit_repro` tool.\
+"""
 
 class ReproAgent(BaseAgent):
-    """Runs a tool-use loop to write and validate a bug reproduction script."""
+    def __init__(self, *, tool_builder: Callable, system_prompt=None, **kwargs):
+        super().__init__(**kwargs)
+        self._tool_builder = tool_builder
+        self._system_prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
 
     def run(self, state: DebugState) -> DebugState:
-        assert state.repo_local_path, "repo must be cloned before repro agent runs"
-
+        assert state.repo_local_path
         repo_path = Path(state.repo_local_path)
         sandbox = Sandbox(str(repo_path))
+        result: list = []
 
-        messages: list[BaseMessage] = [
-            self.human(
-                f"Bug report:\n\n{state.bug_report}\n\n"
-                "Please reproduce this bug. Start by exploring the repository structure."
-            )
-        ]
+        tools = self._tool_builder(repo_path=repo_path, sandbox=sandbox, result=result)
+        tool_map = {t.name: t for t in tools}
 
-        for _ in range(MAX_ATTEMPTS):
-            response = self._chat(messages, tools=TOOLS, system=SYSTEM_PROMPT)
-            state.total_llm_calls += 1
-            state.total_tokens += self.count_tokens(response)
+        for retry in range(self._max_retries + 1):
+            budget = self._new_budget()
+            result.clear()
+            messages: list[BaseMessage] = [
+                self.human(
+                    f"Bug report:\n\n{state.bug_report}\n\n"
+                    "Please reproduce this bug. Start by exploring the repository structure."
+                )
+            ]
+            try:
+                while True:
+                    response = self._chat(messages, tools=tools, system=self._system_prompt)
+                    state.total_llm_calls += 1
+                    tokens = self.count_tokens(response)
+                    state.total_tokens += tokens
+                    budget.add_tokens(tokens)
+                    budget.check()
 
-            if not response.tool_calls:
-                break
+                    if not response.tool_calls:
+                        break
 
-            tool_results: list[BaseMessage] = []
-            submitted: ReproResult | None = None
+                    tool_results: list[BaseMessage] = []
+                    for tc in response.tool_calls:
+                        tool_results.append(self.invoke_tool(tool_map, tc))
 
-            for tc in response.tool_calls:
-                name = tc["name"]
-                args = tc["args"]
-                tc_id = tc["id"]
+                    messages.append(response)
+                    messages.extend(tool_results)
 
-                if name == "read_file":
-                    file_path = repo_path / args["path"]
-                    content = (
-                        file_path.read_text(encoding="utf-8", errors="replace")
-                        if file_path.exists()
-                        else f"File not found: {args['path']}"
-                    )
+                    if result:
+                        state.repro = result[0]
+                        state.stage = PipelineStage.BISECT
+                        return state
 
-                elif name == "list_files":
-                    dir_path = repo_path / args["path"]
-                    if dir_path.is_dir():
-                        entries = sorted(dir_path.iterdir())
-                        content = "\n".join(
-                            ("  " if e.is_dir() else "") + e.name for e in entries
-                        )
-                    else:
-                        content = f"Directory not found: {args['path']}"
-
-                elif name == "run_script":
-                    run_result = sandbox.run_script(args["script"])
-                    content = json.dumps({
-                        "exit_code": run_result.exit_code,
-                        "stdout": run_result.stdout[-3000:],
-                        "stderr": run_result.stderr[-3000:],
-                    })
-
-                elif name == "submit_repro":
-                    final_run = sandbox.run_script(args["script"])
-                    if not final_run.success:
-                        submitted = ReproResult(
-                            repro_script=args["script"],
-                            error_output=args["error_output"],
-                            confirmed=True,
-                        )
-                        content = "Repro confirmed. Pipeline will continue."
-                    else:
-                        content = (
-                            "Script exited with 0 — bug was NOT reproduced. "
-                            "Revise the script so it fails when the bug is present."
-                        )
-
-                else:
-                    content = f"Unknown tool: {name}"
-
-                tool_results.append(self.tool_result(tc_id, content))
-
-            messages.append(response)
-            messages.extend(tool_results)
-
-            if submitted:
-                state.repro = submitted
-                state.stage = PipelineStage.BISECT
+            except BudgetExceeded:
+                if retry < self._max_retries:
+                    continue
+                state.stage = PipelineStage.FAILED
+                state.error = f"ReproAgent: budget exceeded after {retry + 1} attempt(s)"
                 return state
 
         state.stage = PipelineStage.FAILED
-        state.error = f"ReproAgent failed to reproduce the bug after {MAX_ATTEMPTS} attempts"
+        state.error = "ReproAgent failed to reproduce the bug"
         return state

@@ -21,6 +21,8 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 OUTPUT_PATH = Path(__file__).parent / "datasets" / "buginspy.json"
@@ -169,6 +171,7 @@ def convert(buginspy_root: Path, project_filter: str | None, limit: int, fetch_m
                 "requirements": requirements,
                 # Pipeline inputs
                 "bug_report": bug_report,
+                "pre_fix_commit": f"{fixed_commit}~1" if fixed_commit else None,
                 "known_good_commit": None,  # let BisectAgent find it heuristically
             })
 

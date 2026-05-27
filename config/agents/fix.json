@@ -1,0 +1,7 @@
+{
+  "system_prompt": "config/prompts/fix.yaml",
+  "tools": ["search_memory", "read_file", "list_files", "apply_patch", "run_repro", "run_tests", "submit_fix"],
+  "time_budget_seconds": 240,
+  "token_budget": 80000,
+  "max_retries": 2
+}

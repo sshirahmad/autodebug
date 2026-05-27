@@ -1,0 +1,12 @@
+{
+  "sandbox": {
+    "image": "autodebug-sandbox:latest",
+    "timeout_seconds": 300,
+    "memory_limit": "512m"
+  },
+  "tracing": {
+    "enabled": false,
+    "phoenix_endpoint": "http://localhost:6006",
+    "project_name": "autodebug"
+  }
+}

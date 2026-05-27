@@ -99,6 +99,12 @@ def get_file_at_commit(repo_path: str, sha: str, file_path: str) -> str:
     return result.stdout if result.returncode == 0 else ""
 
 
+def first_commit(repo_path: str) -> str:
+    """Return the SHA of the very first commit in the repo."""
+    result = _git(repo_path, "rev-list", "--max-parents=0", "HEAD", check=False)
+    return result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+
+
 def unshallow(repo_path: str) -> None:
     """Convert a shallow clone to full history (needed for deep bisects)."""
     _git(repo_path, "fetch", "--unshallow", check=False)

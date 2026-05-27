@@ -16,29 +16,81 @@ OpenRouter example:
 from __future__ import annotations
 
 import os
+import time
 from abc import ABC, abstractmethod
 
+from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
+
+load_dotenv()  # load .env from cwd or any parent directory
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 _DEFAULT_MODEL    = "claude-sonnet-4-6"
 _DEFAULT_PROVIDER = "anthropic"
 
 
-def _build_model(model_id: str | None = None, provider: str | None = None):
+class BudgetExceeded(Exception):
+    """Raised when an agent exhausts its time or token budget."""
+
+
+class Budget:
+    """Tracks elapsed time and token spend; raises BudgetExceeded when either limit is hit."""
+
+    def __init__(self, time_seconds: int | None, tokens: int | None) -> None:
+        self._deadline = time.monotonic() + time_seconds if time_seconds else None
+        self._token_limit = tokens
+        self._tokens_used = 0
+
+    def add_tokens(self, n: int) -> None:
+        self._tokens_used += n
+
+    def check(self) -> None:
+        if self._deadline and time.monotonic() > self._deadline:
+            raise BudgetExceeded(
+                f"Time budget exceeded ({self._tokens_used} tokens used so far)"
+            )
+        if self._token_limit and self._tokens_used > self._token_limit:
+            raise BudgetExceeded(
+                f"Token budget exceeded ({self._tokens_used} > {self._token_limit})"
+            )
+
+
+def _build_model(
+    model_id: str | None = None,
+    provider: str | None = None,
+    temperature: float | None = None,
+    base_url: str | None = None,
+):
     mid = model_id or os.getenv("AUTODEBUG_MODEL", _DEFAULT_MODEL)
     prv = provider or os.getenv("AUTODEBUG_MODEL_PROVIDER", _DEFAULT_PROVIDER)
     kwargs: dict = {}
-    # OpenRouter / custom base URL support
-    base_url = os.getenv("OPENAI_API_BASE") or os.getenv("OPENROUTER_BASE_URL")
-    if base_url and prv == "openai":
-        kwargs["base_url"] = base_url
+    # base_url: explicit arg wins over env var (for OpenRouter / Ollama)
+    resolved_base = base_url or os.getenv("OPENAI_API_BASE") or os.getenv("OPENROUTER_BASE_URL")
+    if resolved_base and prv == "openai":
+        kwargs["base_url"] = resolved_base
+    if temperature is not None:
+        kwargs["temperature"] = temperature
     return init_chat_model(mid, model_provider=prv, **kwargs)
 
 
 class BaseAgent(ABC):
-    def __init__(self, model_id: str | None = None, provider: str | None = None):
-        self.llm = _build_model(model_id, provider)
+    def __init__(
+        self,
+        model_id: str | None = None,
+        provider: str | None = None,
+        temperature: float | None = None,
+        base_url: str | None = None,
+        time_budget_seconds: int | None = None,
+        token_budget: int | None = None,
+        max_retries: int = 0,
+    ):
+        self.llm = _build_model(model_id, provider, temperature, base_url)
+        self._time_budget_seconds = time_budget_seconds
+        self._token_budget = token_budget
+        self._max_retries = max_retries
+
+    def _new_budget(self) -> Budget:
+        return Budget(self._time_budget_seconds, self._token_budget)
 
     # ------------------------------------------------------------------
     # Unified chat helper — hides LangChain message types from subclasses
@@ -69,6 +121,16 @@ class BaseAgent(ABC):
     @staticmethod
     def tool_result(tool_call_id: str, content: str) -> ToolMessage:
         return ToolMessage(content=content, tool_call_id=tool_call_id)
+
+    @staticmethod
+    def invoke_tool(tool_map: dict, tc: dict) -> ToolMessage:
+        name = tc["name"]
+        if name not in tool_map:
+            available = ", ".join(sorted(tool_map))
+            content = f"Error: unknown tool '{name}'. Available tools: {available}"
+        else:
+            content = str(tool_map[name].invoke(tc["args"]))
+        return ToolMessage(content=content, tool_call_id=tc["id"])
 
     @staticmethod
     def count_tokens(response: AIMessage) -> int:

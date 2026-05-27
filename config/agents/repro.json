@@ -1,0 +1,7 @@
+{
+  "system_prompt": "config/prompts/repro.yaml",
+  "tools": ["search_memory", "read_file", "list_files", "run_script", "submit_repro"],
+  "time_budget_seconds": 180,
+  "token_budget": 50000,
+  "max_retries": 2
+}

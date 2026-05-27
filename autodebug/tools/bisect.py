@@ -1,0 +1,70 @@
+"""Tools for the Bisect agent: mark_bad, mark_good, mark_skip, submit_result."""
+
+from __future__ import annotations
+
+from langchain_core.tools import tool
+
+from autodebug.state import BisectResult
+
+
+def make_mark_bad_tool(verdict: list, **_):
+    @tool
+    def mark_bad() -> str:
+        """Mark the current commit as BAD (bug is present)."""
+        verdict.append("bad")
+        return "Marked as bad."
+    return mark_bad
+
+
+def make_mark_good_tool(verdict: list, **_):
+    @tool
+    def mark_good() -> str:
+        """Mark the current commit as GOOD (bug is NOT present)."""
+        verdict.append("good")
+        return "Marked as good."
+    return mark_good
+
+
+def make_mark_skip_tool(verdict: list, **_):
+    @tool
+    def mark_skip() -> str:
+        """Skip this commit (ambiguous or environment error)."""
+        verdict.append("skip")
+        return "Marked as skip."
+    return mark_skip
+
+
+def make_submit_result_tool(sha: str, info, result: list, **_):
+    @tool
+    def submit_result(culprit_sha: str, explanation: str) -> str:
+        """Submit the final culprit commit when bisect is complete."""
+        result.append(BisectResult(
+            culprit_commit=sha,
+            commit_message=info.message,
+            commit_diff=info.diff,
+            steps_taken=0,
+        ))
+        return "Bisect result submitted."
+    return submit_result
+
+
+def make_submit_culprit_tool(repo: str, result: list, **_):
+    from autodebug.tools import git_utils as _gu
+
+    @tool
+    def submit_culprit(sha: str, explanation: str) -> str:
+        """Submit the SHA of the commit that introduced the bug.
+
+        Args:
+            sha: The full or short commit SHA of the culprit commit.
+            explanation: Brief explanation of why this commit is the culprit.
+        """
+        info = _gu.get_commit_info(repo, sha)
+        result.append(BisectResult(
+            culprit_commit=info.sha,
+            commit_message=info.message,
+            commit_diff=info.diff,
+            steps_taken=0,
+        ))
+        return f"Culprit commit recorded: {info.sha} — {info.message}"
+    return submit_culprit

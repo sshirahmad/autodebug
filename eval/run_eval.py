@@ -41,6 +41,7 @@ def run_on_instance(instance: dict) -> dict:
         state = run_pipeline(
             repo_url=instance["repo_url"],
             bug_report=instance["bug_report"],
+            pre_fix_commit=instance.get("pre_fix_commit"),
             known_good_commit=instance.get("known_good_commit"),
         )
         return {

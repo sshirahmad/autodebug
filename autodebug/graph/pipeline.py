@@ -9,101 +9,77 @@ import git
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
-from autodebug.agents.bisect import BisectAgent
-from autodebug.agents.fix import FixAgent
-from autodebug.agents.repro import ReproAgent
-from autodebug.agents.root_cause import RootCauseAgent
+from autodebug.telemetry import setup_tracing
 from autodebug.state import DebugState, PipelineStage
+from autodebug.memory import store_agent_run
 
 
-# ---------------------------------------------------------------------------
-# Node functions
-# ---------------------------------------------------------------------------
+def _coerce(state) -> DebugState:
+    return DebugState(**state) if isinstance(state, dict) else state
 
-def clone_repo(state: DebugState) -> DebugState:
-    """Clone target repo into a temp directory with full history for bisect."""
+
+def clone_repo(state) -> dict:
+    state = _coerce(state)
     tmp = tempfile.mkdtemp(prefix="autodebug_")
-    git.Repo.clone_from(state.repo_url, tmp)  # full clone — bisect needs history
+    repo = git.Repo.clone_from(state.repo_url, tmp)
+    if state.pre_fix_commit:
+        repo.git.checkout(state.pre_fix_commit)
     state.repo_local_path = tmp
     state.stage = PipelineStage.REPRO
-    return state
+    return state.model_dump()
 
 
-def run_repro(state: DebugState) -> DebugState:
-    return ReproAgent().run(state)
+def route_after_repro(state) -> Literal["bisect", "failed"]:
+    return "bisect" if _coerce(state).stage == PipelineStage.BISECT else "failed"
 
 
-def run_bisect(state: DebugState) -> DebugState:
-    return BisectAgent().run(state)
+def route_after_bisect(state) -> Literal["root_cause", "failed"]:
+    return "root_cause" if _coerce(state).stage == PipelineStage.ROOT_CAUSE else "failed"
 
 
-def run_root_cause(state: DebugState) -> DebugState:
-    return RootCauseAgent().run(state)
+def route_after_root_cause(state) -> Literal["fix", "failed"]:
+    return "fix" if _coerce(state).stage == PipelineStage.FIX else "failed"
 
 
-def run_fix(state: DebugState) -> DebugState:
-    return FixAgent().run(state)
+def route_after_fix(state) -> Literal["done", "failed"]:
+    return "done" if _coerce(state).stage == PipelineStage.DONE else "failed"
 
 
-# ---------------------------------------------------------------------------
-# Routing functions
-# ---------------------------------------------------------------------------
-
-def route_after_repro(state: DebugState) -> Literal["bisect", "failed"]:
-    return "bisect" if state.stage == PipelineStage.BISECT else "failed"
-
-
-def route_after_bisect(state: DebugState) -> Literal["root_cause", "failed"]:
-    return "root_cause" if state.stage == PipelineStage.ROOT_CAUSE else "failed"
-
-
-def route_after_root_cause(state: DebugState) -> Literal["fix", "failed"]:
-    return "fix" if state.stage == PipelineStage.FIX else "failed"
-
-
-def route_after_fix(state: DebugState) -> Literal["done", "failed"]:
-    return "done" if state.stage == PipelineStage.DONE else "failed"
-
-
-# ---------------------------------------------------------------------------
-# Graph assembly
-# ---------------------------------------------------------------------------
-
-def build_graph(checkpointer=None):
+def build_graph(registry, checkpointer=None):
     graph = StateGraph(DebugState)
 
-    graph.add_node("clone", clone_repo)
-    graph.add_node("repro", run_repro)
-    graph.add_node("bisect", run_bisect)
-    graph.add_node("root_cause", run_root_cause)
-    graph.add_node("fix", run_fix)
+    repro      = registry.create_repro_agent()
+    bisect     = registry.create_bisect_agent()
+    root_cause = registry.create_root_cause_agent()
+    fix        = registry.create_fix_agent()
+
+    graph.add_node("clone",      clone_repo)
+    def _run(stage: str, agent, s):
+        state = agent.run(_coerce(s))
+        store_agent_run(stage, state)
+        return state.model_dump()
+
+    graph.add_node("repro",      lambda s: _run("repro", repro, s))
+    graph.add_node("bisect",     lambda s: _run("bisect", bisect, s))
+    graph.add_node("root_cause", lambda s: _run("root_cause", root_cause, s))
+    graph.add_node("fix",        lambda s: _run("fix", fix, s))
 
     graph.set_entry_point("clone")
     graph.add_edge("clone", "repro")
 
-    graph.add_conditional_edges("repro", route_after_repro, {
-        "bisect": "bisect",
-        "failed": END,
-    })
-    graph.add_conditional_edges("bisect", route_after_bisect, {
-        "root_cause": "root_cause",
-        "failed": END,
-    })
-    graph.add_conditional_edges("root_cause", route_after_root_cause, {
-        "fix": "fix",
-        "failed": END,
-    })
-    graph.add_conditional_edges("fix", route_after_fix, {
-        "done": END,
-        "failed": END,
-    })
+    graph.add_conditional_edges("repro", route_after_repro, {"bisect": "bisect", "failed": END})
+    graph.add_conditional_edges("bisect", route_after_bisect, {"root_cause": "root_cause", "failed": END})
+    graph.add_conditional_edges("root_cause", route_after_root_cause, {"fix": "fix", "failed": END})
+    graph.add_conditional_edges("fix", route_after_fix, {"done": END, "failed": END})
 
     return graph.compile(checkpointer=checkpointer or MemorySaver())
 
 
 def run_pipeline(repo_url: str, bug_report: str, **kwargs) -> DebugState:
-    """Entry point: run the full pipeline and return final state."""
-    app = build_graph()
+    from autodebug.registry import AutoDebugRegistry
+    setup_tracing()
+    registry = AutoDebugRegistry.from_file()
+    app = build_graph(registry)
     initial_state = DebugState(repo_url=repo_url, bug_report=bug_report, **kwargs)
-    config = {"configurable": {"thread_id": "main"}}
-    return app.invoke(initial_state, config=config)
+    result = app.invoke(initial_state, config={"configurable": {"thread_id": "main"}})
+    return _coerce(result)

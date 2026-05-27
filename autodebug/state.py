@@ -49,6 +49,7 @@ class DebugState(BaseModel):
     bug_report: str
     known_good_commit: Optional[str] = None
     github_issue_url: Optional[str] = None
+    pre_fix_commit: Optional[str] = None     # fixed_commit_id~1; clone is checked out here
 
     # --- Runtime ---
     stage: PipelineStage = PipelineStage.INIT
