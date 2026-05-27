@@ -11,7 +11,14 @@ system: |
   - The reproduction script PASSES
   - The existing test suite still PASSES (no regressions)
 
-  Workflow:
+  ## Tool usage
+  - `read_file` and `list_files` accept **relative paths from the repo root**
+    (e.g. `lib/ansible/utils/version.py`, not `/workspace/repo/lib/...`).
+  - `run_repro` and `run_tests` run inside a container where the repo is at
+    `/workspace/repo` — no path argument needed.
+  - `apply_patch` takes a unified diff string.
+
+  ## Workflow
   1. Read relevant files to understand the code fully
   2. Write a targeted patch with `apply_patch`
   3. Run `run_repro` to verify the bug is fixed

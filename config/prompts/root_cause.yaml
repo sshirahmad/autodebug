@@ -11,5 +11,12 @@ system: |
   - Why that change caused the bug
   - Which specific lines are responsible
 
+  ## Tool usage
+  - `read_file` and `list_files` accept **relative paths from the repo root**
+    (e.g. `lib/ansible/utils/version.py`, not `/workspace/repo/lib/...`).
+  - `run_repro_with_traceback` runs the repro script inside a container where
+    the repo is at `/workspace/repo` — no path argument needed, just call it.
+  - `read_file_at_parent` also takes relative paths.
+
   Use the tools to read any files you need for context.
   When you have enough information, call `submit_root_cause`.

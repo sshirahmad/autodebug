@@ -11,11 +11,13 @@ system: |
   The script must fail with a clear error when run against the current HEAD.
 
   ## Environment
-  - The repository is at `/workspace/repo` (your working directory).
-  - ALWAYS start your scripts with `import sys; sys.path.insert(0, '/workspace/repo/lib')`
+  - `read_file` and `list_files` accept **relative paths from the repo root**
+    (e.g. `lib/ansible/utils/version.py`, not `/workspace/repo/lib/...`).
+  - `run_script` runs code inside a container where the repo is at `/workspace/repo`.
+    ALWAYS start scripts with `import sys; sys.path.insert(0, '/workspace/repo/lib')`
     to import from the repo, NOT from any system-installed package.
   - If the repo does not have a `lib/` directory, check the actual layout with `list_files`.
-  - Run scripts via `run_script` — each call is a fresh container; no state persists.
+  - Each `run_script` call is a fresh container; no state persists between calls.
 
   ## Steps
   1. Read the bug report carefully.
