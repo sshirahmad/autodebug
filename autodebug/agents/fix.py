@@ -59,18 +59,24 @@ class FixAgent(BaseAgent):
             repo_path=repo_path,
             sandbox=sandbox,
             repro_script=state.repro.repro_script,
+            test_command=state.test_command or "",
             patches=patches,
             result=result,
         )
         tool_map = {t.name: t for t in tools}
 
+        test_cmd_note = (
+            f"\nTest command to verify fix: `{state.test_command}`\n"
+            if state.test_command else ""
+        )
         initial_context = (
             f"Root cause:\n{state.root_cause.hypothesis}\n\n"
             f"{state.root_cause.summary}\n\n"
             "Relevant lines:\n"
             + "\n".join(f"  - {l}" for l in state.root_cause.relevant_lines)
-            + f"\n\nCulprit commit diff:\n```diff\n{state.bisect.commit_diff}\n```\n\n"
-            "Please fix this bug. Start by reading the relevant files."
+            + f"\n\nCulprit commit diff:\n```diff\n{state.bisect.commit_diff}\n```\n"
+            + test_cmd_note
+            + "\nPlease fix this bug. Start by reading the relevant files."
         )
 
         for retry in range(self._max_retries + 1):
@@ -82,9 +88,9 @@ class FixAgent(BaseAgent):
                 while True:
                     response = self._chat(messages, tools=tools, system=self._system_prompt)
                     state.total_llm_calls += 1
-                    tokens = self.count_tokens(response)
-                    state.total_tokens += tokens
-                    budget.add_tokens(tokens)
+                    inp, out = self._usage(response)
+                    state.total_tokens += inp + out
+                    state.total_cost += budget.add_tokens(inp, out)
                     budget.check()
 
                     if not response.tool_calls:

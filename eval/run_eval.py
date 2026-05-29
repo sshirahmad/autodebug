@@ -43,6 +43,8 @@ def run_on_instance(instance: dict) -> dict:
             bug_report=instance["bug_report"],
             pre_fix_commit=instance.get("pre_fix_commit"),
             known_good_commit=instance.get("known_good_commit"),
+            test_file=instance.get("test_file"),
+            test_command=instance.get("test_command"),
         )
         return {
             "instance_id": instance["id"],
@@ -52,6 +54,7 @@ def run_on_instance(instance: dict) -> dict:
             "fix_success": fix_correct(state, instance),
             "stage_reached": state.stage,
             "total_tokens": state.total_tokens,
+            "total_cost": round(state.total_cost, 4),
             "llm_calls": state.total_llm_calls,
             "wall_seconds": round(time.time() - start, 1),
             "error": state.error,
@@ -79,6 +82,7 @@ def compute_metrics(results: list[dict]) -> dict[str, Any]:
         "bisect_accuracy": sum(r["bisect_correct"] for r in results) / n,
         "fix_rate": sum(r["fix_success"] for r in results) / n,
         "avg_tokens": sum(r.get("total_tokens", 0) for r in results) / n,
+        "avg_cost_usd": sum(r.get("total_cost", 0) for r in results) / n,
         "avg_wall_seconds": sum(r.get("wall_seconds", 0) for r in results) / n,
     }
 

@@ -35,6 +35,32 @@ class ConfigLoader:
         data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
         return data["system"].strip()
 
+    def resolve_skills(self, names: list[str]) -> str:
+        """Return concatenated SKILL.md content for the given skill names.
+
+        Skills are looked up under <repo_root>/.skills/<name>/SKILL.md.
+        Frontmatter (--- ... ---) is stripped. Missing skills are skipped with
+        a warning.
+        """
+        if not names:
+            return ""
+        skills_root = _REPO_ROOT / ".skills"
+        parts: list[str] = []
+        for name in names:
+            skill_file = skills_root / name / "SKILL.md"
+            if not skill_file.exists():
+                import warnings
+                warnings.warn(f"Skill '{name}' not found at {skill_file}", stacklevel=2)
+                continue
+            content = skill_file.read_text(encoding="utf-8")
+            # Strip YAML frontmatter (--- ... ---)
+            if content.startswith("---"):
+                end = content.find("---", 3)
+                if end != -1:
+                    content = content[end + 3:].lstrip()
+            parts.append(f"# Skill: {name}\n\n{content.strip()}")
+        return "\n\n---\n\n".join(parts)
+
     def _read_json(self, relative: str) -> dict:
         path = self.config_dir / relative
         return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
@@ -46,12 +72,11 @@ class ConfigLoader:
             return result
         for fp in sorted(d.glob("*.json")):
             data = json.loads(fp.read_text(encoding="utf-8"))
+            # Split: known model fields go directly to AgentConfig, everything
+            # else lands in `extra` so the registry can forward it to agents.
+            known = {k: v for k, v in data.items() if k in AgentConfig.model_fields and k != "extra"}
             extra = {k: v for k, v in data.items() if k not in AgentConfig.model_fields}
-            result[fp.stem] = AgentConfig(
-                system_prompt=data["system_prompt"],
-                tools=data["tools"],
-                extra=extra,
-            )
+            result[fp.stem] = AgentConfig(extra=extra, **known)
         return result
 
     def _apply_env_overrides(self, config: PipelineConfig) -> PipelineConfig:

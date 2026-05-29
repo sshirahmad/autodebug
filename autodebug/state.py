@@ -50,6 +50,8 @@ class DebugState(BaseModel):
     known_good_commit: Optional[str] = None
     github_issue_url: Optional[str] = None
     pre_fix_commit: Optional[str] = None     # fixed_commit_id~1; clone is checked out here
+    test_file: Optional[str] = None          # path to the relevant test file
+    test_command: Optional[str] = None       # command to run targeted regression tests
 
     # --- Runtime ---
     stage: PipelineStage = PipelineStage.INIT
@@ -66,6 +68,7 @@ class DebugState(BaseModel):
     messages: list[dict] = Field(default_factory=list)
     total_llm_calls: int = 0
     total_tokens: int = 0
+    total_cost: float = 0.0
 
     class Config:
         use_enum_values = True

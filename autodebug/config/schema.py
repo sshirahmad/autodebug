@@ -23,7 +23,11 @@ class AgentConfig(BaseModel):
     tools: list[str]
     time_budget_seconds: int | None = None
     token_budget: int | None = None
+    cost_budget_usd: float | None = None          # max USD spend per attempt
+    cost_per_1k_input_tokens: float | None = None  # pricing for cost tracking
+    cost_per_1k_output_tokens: float | None = None
     max_retries: int = 0
+    skills: list[str] = Field(default_factory=list)  # skill names from .skills/
     model: str | None = None      # overrides AUTODEBUG_MODEL if set
     provider: str | None = None   # overrides AUTODEBUG_MODEL_PROVIDER if set
     extra: dict[str, Any] = Field(default_factory=dict)

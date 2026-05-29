@@ -18,5 +18,6 @@ system: |
     the repo is at `/workspace/repo` — no path argument needed, just call it.
   - `read_file_at_parent` also takes relative paths.
 
-  Use the tools to read any files you need for context.
+  Read each file at most ONCE. If you already have a file's contents, do not
+  call `read_file` on it again — use what you already saw.
   When you have enough information, call `submit_root_cause`.

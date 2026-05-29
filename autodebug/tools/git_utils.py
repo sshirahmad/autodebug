@@ -31,6 +31,9 @@ def get_commit_info(repo_path: str, sha: str) -> CommitInfo:
     log = _git(repo_path, "log", "-1", "--format=%H%n%h%n%s%n%an%n%ai", sha)
     lines = log.stdout.strip().splitlines()
     diff = _git(repo_path, "diff", f"{sha}^", sha, check=False).stdout
+    if not diff:
+        # Merge commit: git diff sha^ sha is empty; use git show instead
+        diff = _git(repo_path, "show", "--format=", sha, check=False).stdout
     return CommitInfo(
         sha=lines[0],
         short_sha=lines[1],

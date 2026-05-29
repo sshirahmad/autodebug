@@ -30,28 +30,51 @@ _DEFAULT_PROVIDER = "anthropic"
 
 
 class BudgetExceeded(Exception):
-    """Raised when an agent exhausts its time or token budget."""
+    """Raised when an agent exhausts its time, token, or cost budget."""
 
 
 class Budget:
-    """Tracks elapsed time and token spend; raises BudgetExceeded when either limit is hit."""
+    """Tracks elapsed time, token spend, and USD cost; raises BudgetExceeded when any limit is hit."""
 
-    def __init__(self, time_seconds: int | None, tokens: int | None) -> None:
+    def __init__(
+        self,
+        time_seconds: int | None,
+        tokens: int | None,
+        cost_usd: float | None = None,
+        cost_per_1k_input_tokens: float | None = None,
+        cost_per_1k_output_tokens: float | None = None,
+    ) -> None:
         self._deadline = time.monotonic() + time_seconds if time_seconds else None
         self._token_limit = tokens
+        self._cost_limit = cost_usd
         self._tokens_used = 0
+        self._cost_used = 0.0
+        self._input_rate  = (cost_per_1k_input_tokens  or 0.0) / 1000
+        self._output_rate = (cost_per_1k_output_tokens or 0.0) / 1000
 
-    def add_tokens(self, n: int) -> None:
-        self._tokens_used += n
+    def add_tokens(self, input_tokens: int, output_tokens: int = 0) -> float:
+        """Track tokens and cost. Returns the USD cost for this call."""
+        self._tokens_used += input_tokens + output_tokens
+        cost = input_tokens * self._input_rate + output_tokens * self._output_rate
+        self._cost_used += cost
+        return cost
+
+    @property
+    def cost_used(self) -> float:
+        return self._cost_used
 
     def check(self) -> None:
         if self._deadline and time.monotonic() > self._deadline:
             raise BudgetExceeded(
-                f"Time budget exceeded ({self._tokens_used} tokens used so far)"
+                f"Time budget exceeded ({self._tokens_used} tokens, ${self._cost_used:.4f} spent)"
             )
         if self._token_limit and self._tokens_used > self._token_limit:
             raise BudgetExceeded(
                 f"Token budget exceeded ({self._tokens_used} > {self._token_limit})"
+            )
+        if self._cost_limit and self._cost_used > self._cost_limit:
+            raise BudgetExceeded(
+                f"Cost budget exceeded (${self._cost_used:.4f} > ${self._cost_limit})"
             )
 
 
@@ -82,15 +105,27 @@ class BaseAgent(ABC):
         base_url: str | None = None,
         time_budget_seconds: int | None = None,
         token_budget: int | None = None,
+        cost_budget_usd: float | None = None,
+        cost_per_1k_input_tokens: float | None = None,
+        cost_per_1k_output_tokens: float | None = None,
         max_retries: int = 0,
     ):
         self.llm = _build_model(model_id, provider, temperature, base_url)
         self._time_budget_seconds = time_budget_seconds
         self._token_budget = token_budget
+        self._cost_budget_usd = cost_budget_usd
+        self._cost_per_1k_input = cost_per_1k_input_tokens
+        self._cost_per_1k_output = cost_per_1k_output_tokens
         self._max_retries = max_retries
 
     def _new_budget(self) -> Budget:
-        return Budget(self._time_budget_seconds, self._token_budget)
+        return Budget(
+            self._time_budget_seconds,
+            self._token_budget,
+            self._cost_budget_usd,
+            self._cost_per_1k_input,
+            self._cost_per_1k_output,
+        )
 
     # ------------------------------------------------------------------
     # Unified chat helper — hides LangChain message types from subclasses
@@ -131,6 +166,12 @@ class BaseAgent(ABC):
         else:
             content = str(tool_map[name].invoke(tc["args"]))
         return ToolMessage(content=content, tool_call_id=tc["id"])
+
+    @staticmethod
+    def _usage(response: AIMessage) -> tuple[int, int]:
+        """Return (input_tokens, output_tokens) from response metadata."""
+        meta = response.usage_metadata or {}
+        return meta.get("input_tokens", 0), meta.get("output_tokens", 0)
 
     @staticmethod
     def count_tokens(response: AIMessage) -> int:

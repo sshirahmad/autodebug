@@ -115,7 +115,7 @@ def store_agent_run(stage: str, state) -> None:
         project = _project_from_url(state.repo_url)
         messages = [HumanMessage(content=_build_summary(stage, project, state))]
         manager = _get_manager(("autodebug", stage))
-        manager.invoke({"messages": messages})
+        manager.invoke({"messages": messages}, config={"recursion_limit": 100})
     except Exception:
         pass  # memory failures must never break the pipeline
 

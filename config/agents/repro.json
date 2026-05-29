@@ -3,5 +3,8 @@
   "tools": ["search_memory", "read_file", "list_files", "run_script", "submit_repro"],
   "time_budget_seconds": 180,
   "token_budget": 50000,
+  "cost_budget_usd": 0.50,
+  "cost_per_1k_input_tokens": 3.0,
+  "cost_per_1k_output_tokens": 15.0,
   "max_retries": 2
 }

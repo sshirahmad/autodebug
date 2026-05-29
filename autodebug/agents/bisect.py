@@ -42,15 +42,17 @@ class BisectAgent(BaseAgent):
         )
         tool_map = {t.name: t for t in tools}
 
+        known_good = state.known_good_commit or ""
         initial_msg = self.human(
             f"Bug report:\n{state.bug_report}\n\n"
-            f"Current HEAD: {head_info.short_sha} — {head_info.message}\n"
-            f"Date: {head_info.date}\n\n"
-            f"Repro script (fails at HEAD, exits non-zero when bug is present):\n"
+            f"Current HEAD (last buggy state): {head_info.short_sha} — {head_info.message}\n"
+            f"Date: {head_info.date}\n"
+            + (f"Known-good commit (bug did NOT exist here): {known_good}\n" if known_good else "")
+            + f"\nRepro script (fails at HEAD, exits non-zero when bug is present):\n"
             f"```python\n{state.repro.repro_script}\n```\n\n"
             f"Repro error output:\n```\n{state.repro.error_output[:2000]}\n```\n\n"
-            "Use git log/blame/show (via run_script with subprocess) to find the commit "
-            "that introduced this bug, then call `submit_culprit` with its SHA."
+            "Find the FIRST commit between the known-good commit and HEAD that introduced "
+            "this bug, then call `submit_culprit` with its SHA."
         )
 
         for retry in range(self._max_retries + 1):
@@ -60,10 +62,10 @@ class BisectAgent(BaseAgent):
             try:
                 while True:
                     response = self._chat(messages, tools=tools, system=self._system_prompt)
-                    tokens = self.count_tokens(response)
                     state.total_llm_calls += 1
-                    state.total_tokens += tokens
-                    budget.add_tokens(tokens)
+                    inp, out = self._usage(response)
+                    state.total_tokens += inp + out
+                    state.total_cost += budget.add_tokens(inp, out)
                     budget.check()
 
                     if not response.tool_calls:

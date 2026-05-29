@@ -104,10 +104,18 @@ class AutoDebugRegistry:
             raise KeyError(f"Unknown agent '{name}'. Available: {self.available_agents()}")
         cfg = self._get(name)
         cls = _AGENT_CLASSES[name]
+        base_prompt = self._loader.resolve_prompt(cfg.system_prompt)
+        skill_content = self._loader.resolve_skills(cfg.skills)
+        system_prompt = (
+            f"{base_prompt}\n\n---\n\n{skill_content}" if skill_content else base_prompt
+        )
         kwargs: dict = dict(
-            system_prompt=self._loader.resolve_prompt(cfg.system_prompt),
+            system_prompt=system_prompt,
             time_budget_seconds=cfg.time_budget_seconds,
             token_budget=cfg.token_budget,
+            cost_budget_usd=cfg.cost_budget_usd,
+            cost_per_1k_input_tokens=cfg.cost_per_1k_input_tokens,
+            cost_per_1k_output_tokens=cfg.cost_per_1k_output_tokens,
             max_retries=cfg.max_retries,
             **_model_kwargs(cfg),
             **cfg.extra,

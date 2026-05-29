@@ -69,9 +69,9 @@ class RootCauseAgent(BaseAgent):
                 while True:
                     response = self._chat(messages, tools=tools, system=self._system_prompt)
                     state.total_llm_calls += 1
-                    tokens = self.count_tokens(response)
-                    state.total_tokens += tokens
-                    budget.add_tokens(tokens)
+                    inp, out = self._usage(response)
+                    state.total_tokens += inp + out
+                    state.total_cost += budget.add_tokens(inp, out)
                     budget.check()
 
                     if not response.tool_calls:
