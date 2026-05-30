@@ -21,12 +21,22 @@ def _to_repo_relative(path: str) -> str:
 
 def make_read_file_tool(repo_path: Path, **_):
     @tool
-    def read_file(path: str) -> str:
-        """Read a file from the repository."""
+    def read_file(path: str, offset: int = 0, limit: int = 500) -> str:
+        """Read a file from the repository.
+
+        Args:
+            path: Relative path from the repo root.
+            offset: Line number to start reading from (0-based). Default 0.
+            limit: Maximum number of lines to return. Default 500.
+        """
         fp = repo_path / _to_repo_relative(path)
-        if fp.exists():
-            return fp.read_text(encoding="utf-8", errors="replace")
-        return f"File not found: {path}"
+        if not fp.exists():
+            return f"File not found: {path}"
+        lines = fp.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        total = len(lines)
+        chunk = lines[offset: offset + limit]
+        header = f"[Lines {offset + 1}-{min(offset + limit, total)} of {total}]\n"
+        return header + "".join(chunk)
     return read_file
 
 

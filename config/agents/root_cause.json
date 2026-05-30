@@ -1,11 +1,11 @@
 {
   "system_prompt": "config/prompts/root_cause.yaml",
-  "tools": ["search_memory", "read_file", "read_file_at_parent", "run_repro_with_traceback", "submit_root_cause"],
-  "skills": ["systematic-debugging"],
+  "tools": ["search_memory", "read_file", "read_file_at_parent", "run_repro_with_traceback", "load_skill", "update_skill", "submit_root_cause"],
+  "skills": ["investigate", "systematic-debugging"],
   "time_budget_seconds": 120,
   "token_budget": 30000,
   "cost_budget_usd": 0.30,
-  "cost_per_1k_input_tokens": 3.0,
-  "cost_per_1k_output_tokens": 15.0,
+  "cost_per_1k_input_tokens": 0.003,
+  "cost_per_1k_output_tokens": 0.015,
   "max_retries": 1
 }

@@ -1,3 +1,3 @@
-from .pipeline import build_graph, run_pipeline
+from .pipeline import run_pipeline
 
-__all__ = ["build_graph", "run_pipeline"]
+__all__ = ["run_pipeline"]

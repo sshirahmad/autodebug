@@ -1,12 +1,10 @@
-"""Tests for AutoDebugRegistry — agent creation and pipeline compilation."""
+"""Tests for AutoDebugRegistry: config loading, tool building, prompt resolution."""
+
+from unittest.mock import MagicMock
 
 import pytest
+
 from autodebug.registry import AutoDebugRegistry
-from autodebug.agents.repro import ReproAgent
-from autodebug.agents.bisect import BisectAgent
-from autodebug.agents.root_cause import RootCauseAgent
-from autodebug.agents.fix import FixAgent
-from autodebug.graph import build_graph
 
 
 def test_registry_loads_from_file():
@@ -27,60 +25,31 @@ def test_registry_available_tools():
     assert "apply_patch" in tools
 
 
-def test_create_repro_agent():
-    registry = AutoDebugRegistry.from_file()
-    agent = registry.create_repro_agent()
-    assert isinstance(agent, ReproAgent)
-    assert callable(agent._tool_builder)
-
-
-def test_create_bisect_agent():
-    registry = AutoDebugRegistry.from_file()
-    agent = registry.create_bisect_agent()
-    assert isinstance(agent, BisectAgent)
-
-
-def test_create_root_cause_agent():
-    registry = AutoDebugRegistry.from_file()
-    agent = registry.create_root_cause_agent()
-    assert isinstance(agent, RootCauseAgent)
-    assert callable(agent._tool_builder)
-
-
-def test_create_fix_agent():
-    registry = AutoDebugRegistry.from_file()
-    agent = registry.create_fix_agent()
-    assert isinstance(agent, FixAgent)
-    assert callable(agent._tool_builder)
-
-
-def test_create_agent_by_name():
+def test_get_config_for_each_agent():
     registry = AutoDebugRegistry.from_file()
     for name in registry.available_agents():
-        agent = registry.create_agent(name)
-        assert hasattr(agent, "run"), f"{name}: missing run()"
+        cfg = registry.get_config(name)
+        assert cfg.tools, f"{name}: tools list is empty"
+        assert cfg.system_prompt, f"{name}: system_prompt is empty"
 
 
-def test_create_agent_unknown_raises():
+def test_get_config_unknown_raises():
     registry = AutoDebugRegistry.from_file()
-    with pytest.raises(KeyError, match="Unknown agent"):
-        registry.create_agent("does_not_exist")
+    with pytest.raises(KeyError, match="not in config"):
+        registry.get_config("does_not_exist")
 
 
-def test_build_graph_compiles():
+def test_system_prompt_resolves_for_each_agent():
     registry = AutoDebugRegistry.from_file()
-    graph = build_graph(registry)
-    assert graph is not None
+    for name in registry.available_agents():
+        prompt = registry.system_prompt(name)
+        assert len(prompt) > 20, f"{name}: prompt too short ({len(prompt)} chars)"
 
 
-def test_tool_builder_produces_tools(tmp_path):
-    from pathlib import Path
-    from unittest.mock import MagicMock
-
+def test_build_tools_for_repro(tmp_path):
     registry = AutoDebugRegistry.from_file()
-    agent = registry.create_repro_agent()
-
-    tools = agent._tool_builder(
+    tools = registry.build_tools(
+        "repro",
         repo_path=tmp_path,
         sandbox=MagicMock(),
         result=[],
@@ -88,3 +57,9 @@ def test_tool_builder_produces_tools(tmp_path):
     tool_names = {t.name for t in tools}
     assert "read_file" in tool_names
     assert "submit_repro" in tool_names
+
+
+def test_build_tools_unknown_agent_raises():
+    registry = AutoDebugRegistry.from_file()
+    with pytest.raises(KeyError, match="not in config"):
+        registry.build_tools("does_not_exist", repo_path=None)

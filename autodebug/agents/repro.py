@@ -3,91 +3,80 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable
 
-from langchain_core.messages import BaseMessage
+from langchain.agents import create_agent
+from langchain_core.messages import HumanMessage
 
-from autodebug.agents.base import BaseAgent, BudgetExceeded
+from autodebug.agents.base import Budget, BudgetExceeded, build_model, budget_middleware
 from autodebug.sandbox import Sandbox
 from autodebug.state import DebugState, PipelineStage
 
-_DEFAULT_SYSTEM_PROMPT = """\
-You are an expert software debugger. Your job is to reproduce a bug
-given a bug report and access to the repository.
 
-You will be given tools to:
-- read files from the repository
-- run Python code in a sandbox
-- write a reproduction script
+def run_repro(state: DebugState, *, registry) -> DebugState:
+    """Drive the repro agent until it produces a confirmed reproducing script."""
+    assert state.repo_local_path
+    cfg = registry.get_config("repro")
+    repo_path = Path(state.repo_local_path)
+    sandbox = Sandbox(str(repo_path))
+    result: list = []
 
-Your goal: write the MINIMAL Python script that triggers the reported bug.
-The script must fail with a clear error when run against the current HEAD.
+    test_cmd_hint = (
+        f"\nKnown failing test (run this first to see the failure):\n"
+        f"  `{state.test_command}`\n"
+        if state.test_command else ""
+    )
+    initial_text = (
+        f"Bug report:\n\n{state.bug_report}\n"
+        f"{test_cmd_hint}\n"
+        + (
+            "Start by running the failing test above to observe the error output, "
+            "then write a minimal Python script that reproduces the same failure.\n"
+            if state.test_command else
+            "Please reproduce this bug.\n"
+        )
+    )
 
-Think step by step:
-1. Read the bug report carefully
-2. Explore relevant source files to understand the code
-3. Write a minimal script that triggers the bug
-4. Run it to confirm it fails
-5. If it doesn't fail, revise and retry
+    system_prompt = registry.system_prompt("repro")
+    llm = build_model(model_id=cfg.model, provider=cfg.provider)
 
-When you have a confirmed reproducing script, call the `submit_repro` tool.\
-"""
+    for attempt in range(cfg.max_retries + 1):
+        budget = Budget.from_config(cfg)
+        result.clear()
+        tools = registry.build_tools(
+            "repro",
+            repo_path=repo_path,
+            sandbox=sandbox,
+            result=result,
+        )
+        agent = create_agent(
+            model=llm,
+            tools=tools,
+            system_prompt=system_prompt,
+            middleware=budget_middleware(budget),
+        )
 
-class ReproAgent(BaseAgent):
-    def __init__(self, *, tool_builder: Callable, system_prompt=None, **kwargs):
-        super().__init__(**kwargs)
-        self._tool_builder = tool_builder
-        self._system_prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        try:
+            agent.invoke(
+                {"messages": [HumanMessage(content=initial_text)]},
+                config={"recursion_limit": 100},
+            )
+        except BudgetExceeded:
+            state.total_tokens += budget.tokens_used
+            state.total_cost += budget.cost_used
+            if attempt < cfg.max_retries:
+                continue
+            state.stage = PipelineStage.FAILED
+            state.error = f"ReproAgent: budget exceeded after {attempt + 1} attempt(s)"
+            return state
 
-    def run(self, state: DebugState) -> DebugState:
-        assert state.repo_local_path
-        repo_path = Path(state.repo_local_path)
-        sandbox = Sandbox(str(repo_path))
-        result: list = []
+        state.total_tokens += budget.tokens_used
+        state.total_cost += budget.cost_used
 
-        tools = self._tool_builder(repo_path=repo_path, sandbox=sandbox, result=result)
-        tool_map = {t.name: t for t in tools}
+        if result:
+            state.repro = result[0]
+            state.stage = PipelineStage.BISECT
+            return state
 
-        for retry in range(self._max_retries + 1):
-            budget = self._new_budget()
-            result.clear()
-            messages: list[BaseMessage] = [
-                self.human(
-                    f"Bug report:\n\n{state.bug_report}\n\n"
-                    "Please reproduce this bug. Start by exploring the repository structure."
-                )
-            ]
-            try:
-                while True:
-                    response = self._chat(messages, tools=tools, system=self._system_prompt)
-                    state.total_llm_calls += 1
-                    inp, out = self._usage(response)
-                    state.total_tokens += inp + out
-                    state.total_cost += budget.add_tokens(inp, out)
-                    budget.check()
-
-                    if not response.tool_calls:
-                        break
-
-                    tool_results: list[BaseMessage] = []
-                    for tc in response.tool_calls:
-                        tool_results.append(self.invoke_tool(tool_map, tc))
-
-                    messages.append(response)
-                    messages.extend(tool_results)
-
-                    if result:
-                        state.repro = result[0]
-                        state.stage = PipelineStage.BISECT
-                        return state
-
-            except BudgetExceeded:
-                if retry < self._max_retries:
-                    continue
-                state.stage = PipelineStage.FAILED
-                state.error = f"ReproAgent: budget exceeded after {retry + 1} attempt(s)"
-                return state
-
-        state.stage = PipelineStage.FAILED
-        state.error = "ReproAgent failed to reproduce the bug"
-        return state
+    state.stage = PipelineStage.FAILED
+    state.error = "ReproAgent: failed to reproduce the bug"
+    return state

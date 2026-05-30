@@ -36,30 +36,30 @@ class ConfigLoader:
         return data["system"].strip()
 
     def resolve_skills(self, names: list[str]) -> str:
-        """Return concatenated SKILL.md content for the given skill names.
+        """Inject a compact skills directory into the system prompt.
 
-        Skills are looked up under <repo_root>/.skills/<name>/SKILL.md.
-        Frontmatter (--- ... ---) is stripped. Missing skills are skipped with
-        a warning.
+        Each skill's SKILL.md must have YAML frontmatter with `name` and
+        `description` fields. Only those two fields are injected here — the
+        full content is loaded on demand via the load_skill tool.
         """
         if not names:
             return ""
         skills_root = _REPO_ROOT / ".skills"
-        parts: list[str] = []
+        entries: list[str] = []
         for name in names:
             skill_file = skills_root / name / "SKILL.md"
             if not skill_file.exists():
                 import warnings
                 warnings.warn(f"Skill '{name}' not found at {skill_file}", stacklevel=2)
                 continue
-            content = skill_file.read_text(encoding="utf-8")
-            # Strip YAML frontmatter (--- ... ---)
-            if content.startswith("---"):
-                end = content.find("---", 3)
-                if end != -1:
-                    content = content[end + 3:].lstrip()
-            parts.append(f"# Skill: {name}\n\n{content.strip()}")
-        return "\n\n---\n\n".join(parts)
+            description = _parse_skill_description(skill_file.read_text(encoding="utf-8"))
+            entries.append(f"- **{name}**: {description}")
+        if not entries:
+            return ""
+        lines = ["## Available Skills", ""]
+        lines.extend(entries)
+        lines += ["", "Call `load_skill(name)` to load the full guide for any skill above."]
+        return "\n".join(lines)
 
     def _read_json(self, relative: str) -> dict:
         path = self.config_dir / relative
@@ -95,3 +95,17 @@ class ConfigLoader:
 
 def load_config(config_dir: str | Path | None = None) -> PipelineConfig:
     return ConfigLoader(config_dir).load()
+
+
+def _parse_skill_description(text: str) -> str:
+    """Extract the `description` field from YAML frontmatter, or return a fallback."""
+    if not text.startswith("---"):
+        return "(no description — add a `description:` field to this skill's frontmatter)"
+    end = text.find("---", 3)
+    if end == -1:
+        return "(malformed frontmatter)"
+    frontmatter = text[3:end]
+    for line in frontmatter.splitlines():
+        if line.startswith("description:"):
+            return line[len("description:"):].strip().strip('"').strip("'")
+    return "(no description — add a `description:` field to this skill's frontmatter)"

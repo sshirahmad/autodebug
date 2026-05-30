@@ -20,6 +20,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
+from langchain_core.tools import tool
 from langgraph.store.base import IndexConfig
 from langgraph.store.sqlite import SqliteStore
 from langmem import create_memory_store_manager, create_search_memory_tool
@@ -115,7 +116,7 @@ def store_agent_run(stage: str, state) -> None:
         project = _project_from_url(state.repo_url)
         messages = [HumanMessage(content=_build_summary(stage, project, state))]
         manager = _get_manager(("autodebug", stage))
-        manager.invoke({"messages": messages}, config={"recursion_limit": 100})
+        manager.invoke({"messages": messages}, config={"recursion_limit": 500})
     except Exception:
         pass  # memory failures must never break the pipeline
 
@@ -159,35 +160,58 @@ def _build_summary(stage: str, project: str, state) -> str:
 # Search tool factory (auto-discovered via make_*_tool naming convention)
 # ---------------------------------------------------------------------------
 
+_SEARCH_INSTRUCTIONS_BY_AGENT = {
+    "repro": (
+        "Search your past reproduction attempts for similar bugs. Look for scripts that "
+        "successfully reproduced comparable errors, useful import patterns, or environment "
+        "setups that worked. Avoid repeating approaches that previously failed."
+    ),
+    "bisect": (
+        "Search your past bisect runs for similar projects or error patterns. Look for "
+        "strategies that efficiently narrowed down culprit commits, and ranges that were "
+        "previously identified as good starting points."
+    ),
+    "root_cause": (
+        "Search your past root cause analyses for similar bugs or projects. Look for "
+        "relevant file paths, hypothesis patterns, or analysis strategies that worked."
+    ),
+    "fix": (
+        "Search your past fix attempts for similar bugs. Look for patch patterns that "
+        "worked, approaches that failed, or test commands that reliably validated fixes."
+    ),
+}
+
+
 def make_search_memory_tool(agent_name: str = "unknown", **_):
-    """Factory: returns a LangChain tool that searches this agent's past memories only."""
+    """Factory: returns a LangChain tool that searches this agent's past memories only.
+
+    The underlying LangMem tool exposes a rich schema (query, namespace filters,
+    limits, etc.) that models often hallucinate field names for — we've seen
+    `{'key': '<uuid>'}` instead of `{'query': '<text>'}`. Wrap it with a clean
+    single-arg `query: str` signature so the LLM can only get it right.
+    """
     namespace = ("autodebug", agent_name)
-    instructions_by_agent = {
-        "repro": (
-            "Search your past reproduction attempts for similar bugs. Look for scripts that "
-            "successfully reproduced comparable errors, useful import patterns, or environment "
-            "setups that worked. Avoid repeating approaches that previously failed."
-        ),
-        "bisect": (
-            "Search your past bisect runs for similar projects or error patterns. Look for "
-            "strategies that efficiently narrowed down culprit commits, and ranges that were "
-            "previously identified as good starting points."
-        ),
-        "root_cause": (
-            "Search your past root cause analyses for similar bugs or projects. Look for "
-            "relevant file paths, hypothesis patterns, or analysis strategies that worked."
-        ),
-        "fix": (
-            "Search your past fix attempts for similar bugs. Look for patch patterns that "
-            "worked, approaches that failed, or test commands that reliably validated fixes."
-        ),
-    }
-    instructions = instructions_by_agent.get(
+    instructions = _SEARCH_INSTRUCTIONS_BY_AGENT.get(
         agent_name,
         "Search past debugging sessions for relevant patterns and strategies.",
     )
-    return create_search_memory_tool(
+    underlying = create_search_memory_tool(
         namespace=namespace,
         store=memory_store(),
         instructions=instructions,
     )
+
+    @tool
+    def search_memory(query: str) -> str:
+        """Search past debugging sessions for relevant patterns.
+
+        Args:
+            query: Natural-language description of what you're looking for
+                (e.g. "ansible collection MANIFEST.json verify error").
+        """
+        try:
+            return str(underlying.invoke({"query": query}))
+        except Exception as exc:
+            return f"memory search failed: {exc}"
+
+    return search_memory
