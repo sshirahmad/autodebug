@@ -13,11 +13,14 @@ import tempfile
 from pathlib import Path
 
 import git
+from opentelemetry import trace
 
 from autodebug.agents import run_bisect, run_fix, run_repro, run_root_cause
 from autodebug.memory import store_agent_run
 from autodebug.state import DebugState, PipelineStage
 from autodebug.telemetry import setup_tracing
+
+_tracer = trace.get_tracer("autodebug.pipeline")
 
 
 # ---------------------------------------------------------------------------
@@ -109,14 +112,24 @@ def run_pipeline(repo_url: str, bug_report: str, **kwargs) -> DebugState:
     from autodebug.registry import AutoDebugRegistry
     registry = AutoDebugRegistry.from_file()
 
-    state = DebugState(repo_url=repo_url, bug_report=bug_report, **kwargs)
-    state = clone_repo(state)
+    # Wrap the whole run in a single OTel span so each agent's `LangGraph`
+    # span becomes a child rather than its own root. Safe when tracing is
+    # disabled: get_tracer returns a no-op tracer and the context manager
+    # is a no-op.
+    with _tracer.start_as_current_span("autodebug.pipeline") as span:
+        span.set_attribute("repo_url", repo_url)
+        span.set_attribute("bug_report", bug_report[:500])
 
-    for name, runner in _STAGES:
-        if _failed(state):
-            break
-        state = runner(state, registry=registry)
-        if os.getenv("AUTODEBUG_MEMORY_ENABLED", "0") == "1":
-            store_agent_run(name, state)
+        state = DebugState(repo_url=repo_url, bug_report=bug_report, **kwargs)
+        state = clone_repo(state)
 
-    return state
+        for name, runner in _STAGES:
+            if _failed(state):
+                break
+            with _tracer.start_as_current_span(f"autodebug.{name}"):
+                state = runner(state, registry=registry)
+            if os.getenv("AUTODEBUG_MEMORY_ENABLED", "0") == "1":
+                store_agent_run(name, state)
+
+        span.set_attribute("final_stage", str(state.stage))
+        return state

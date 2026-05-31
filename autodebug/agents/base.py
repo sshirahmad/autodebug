@@ -28,18 +28,26 @@ class BudgetExceeded(Exception):
 
 @dataclass
 class Budget:
+    """Time + cost budget. Tokens are counted (so we can compute cost and
+    populate state.total_tokens) but never used as a limit."""
+
     time_seconds: int | None = None
-    tokens: int | None = None
     cost_usd: float | None = None
     cost_per_1k_input: float = 0.0
     cost_per_1k_output: float = 0.0
 
     tokens_used: int = field(default=0, init=False)
     cost_used: float = field(default=0.0, init=False)
+    _start: float = field(default=0.0, init=False, repr=False)
     _deadline: float | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self._deadline = (time.monotonic() + self.time_seconds) if self.time_seconds else None
+        self._start = time.monotonic()
+        self._deadline = (self._start + self.time_seconds) if self.time_seconds else None
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return time.monotonic() - self._start
 
     def add_tokens(self, input_tokens: int, output_tokens: int = 0) -> float:
         self.tokens_used += input_tokens + output_tokens
@@ -53,22 +61,19 @@ class Budget:
     def check(self) -> None:
         if self._deadline and time.monotonic() > self._deadline:
             raise BudgetExceeded(
-                f"Time budget exceeded ({self.tokens_used} tokens, ${self.cost_used:.4f})"
-            )
-        if self.tokens is not None and self.tokens_used > self.tokens:
-            raise BudgetExceeded(
-                f"Token budget exceeded ({self.tokens_used} > {self.tokens})"
+                f"Time budget exceeded ({self.elapsed_seconds:.1f}s > {self.time_seconds}s; "
+                f"{self.tokens_used} tokens, ${self.cost_used:.4f})"
             )
         if self.cost_usd is not None and self.cost_used > self.cost_usd:
             raise BudgetExceeded(
-                f"Cost budget exceeded (${self.cost_used:.4f} > ${self.cost_usd})"
+                f"Cost budget exceeded (${self.cost_used:.4f} > ${self.cost_usd}; "
+                f"{self.elapsed_seconds:.1f}s, {self.tokens_used} tokens)"
             )
 
     @classmethod
     def from_config(cls, cfg) -> "Budget":
         return cls(
             time_seconds=cfg.time_budget_seconds,
-            tokens=cfg.token_budget,
             cost_usd=cfg.cost_budget_usd,
             cost_per_1k_input=cfg.cost_per_1k_input_tokens or 0.0,
             cost_per_1k_output=cfg.cost_per_1k_output_tokens or 0.0,

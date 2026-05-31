@@ -22,7 +22,6 @@ class AgentConfig(BaseModel):
     system_prompt: str
     tools: list[str]
     time_budget_seconds: int | None = None
-    token_budget: int | None = None
     cost_budget_usd: float | None = None          # max USD spend per attempt
     cost_per_1k_input_tokens: float | None = None  # pricing for cost tracking
     cost_per_1k_output_tokens: float | None = None

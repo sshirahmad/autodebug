@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from langchain.agents import create_agent
@@ -56,7 +57,7 @@ def run_root_cause(state: DebugState, *, registry) -> DebugState:
         try:
             agent.invoke(
                 {"messages": [HumanMessage(content=initial_text)]},
-                config={"recursion_limit": 100},
+                config={"recursion_limit": sys.maxsize},
             )
         except BudgetExceeded:
             state.total_tokens += budget.tokens_used

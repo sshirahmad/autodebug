@@ -26,3 +26,6 @@ Thumbs.db
 
 # BugsInPy (cloned separately)
 BugsInPy/
+
+# LangMem SQLite store (env-specific binary)
+data/

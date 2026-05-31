@@ -177,13 +177,13 @@ class TestRunFix:
 # ---------------------------------------------------------------------------
 
 class TestBudgetMiddleware:
-    def test_check_raises_after_threshold(self):
+    def test_check_raises_when_cost_threshold_exceeded(self):
         from autodebug.agents.base import Budget, BudgetExceeded
-        b = Budget(time_seconds=None, tokens=100, cost_usd=None)
-        b.add_tokens(50, 30)
-        b.check()  # 80 <= 100 -> ok
-        b.add_tokens(20, 5)
-        with pytest.raises(BudgetExceeded, match="Token budget"):
+        b = Budget(time_seconds=None, cost_usd=0.01, cost_per_1k_input=0.003, cost_per_1k_output=0.015)
+        b.add_tokens(1000, 200)  # 0.003 + 0.003 = 0.006 -> ok
+        b.check()
+        b.add_tokens(500, 200)  # +0.0015 + 0.003 = +0.0045, total ~0.0105 -> over
+        with pytest.raises(BudgetExceeded, match="Cost budget"):
             b.check()
 
     def test_cost_tracking(self):
