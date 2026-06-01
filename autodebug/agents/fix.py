@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import sys
-from pathlib import Path
 
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage
@@ -16,14 +15,12 @@ from autodebug.state import DebugState, PipelineStage
 
 def run_fix(state: DebugState, *, registry) -> DebugState:
     """Drive the fix agent until it submits a passing patch."""
-    assert state.repo_local_path
+    assert state.repo_volume
     assert state.repro
     assert state.bisect
     assert state.root_cause
 
     cfg = registry.get_config("fix")
-    repo_path = Path(state.repo_local_path)
-    sandbox = Sandbox(str(repo_path))
     patches: list[dict] = []
     result: list = []
 
@@ -41,53 +38,52 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
         + "\nPlease fix this bug. Start by reading the relevant files."
     )
 
-    # Fix agent may use a stronger model than the rest (configurable)
     model_id = cfg.model or os.getenv("AUTODEBUG_FIX_MODEL")
     provider = cfg.provider or os.getenv("AUTODEBUG_FIX_MODEL_PROVIDER")
     system_prompt = registry.system_prompt("fix")
     llm = build_model(model_id=model_id, provider=provider)
 
-    for attempt in range(cfg.max_retries + 1):
-        budget = Budget.from_config(cfg)
-        result.clear()
-        patches.clear()
-        tools = registry.build_tools(
-            "fix",
-            repo_path=repo_path,
-            sandbox=sandbox,
-            repro_script=state.repro.repro_script,
-            test_command=state.test_command or "",
-            patches=patches,
-            result=result,
-        )
-        agent = create_agent(
-            model=llm,
-            tools=tools,
-            system_prompt=system_prompt,
-            middleware=budget_middleware(budget),
-        )
-
-        try:
-            agent.invoke(
-                {"messages": [HumanMessage(content=initial_text)]},
-                config={"recursion_limit": sys.maxsize},
+    with Sandbox(volume=state.repo_volume) as sandbox:
+        for attempt in range(cfg.max_retries + 1):
+            budget = Budget.from_config(cfg)
+            result.clear()
+            patches.clear()
+            tools = registry.build_tools(
+                "fix",
+                sandbox=sandbox,
+                repro_script=state.repro.repro_script,
+                test_command=state.test_command or "",
+                patches=patches,
+                result=result,
             )
-        except BudgetExceeded:
+            agent = create_agent(
+                model=llm,
+                tools=tools,
+                system_prompt=system_prompt,
+                middleware=budget_middleware(budget),
+            )
+
+            try:
+                agent.invoke(
+                    {"messages": [HumanMessage(content=initial_text)]},
+                    config={"recursion_limit": sys.maxsize},
+                )
+            except BudgetExceeded:
+                state.total_tokens += budget.tokens_used
+                state.total_cost += budget.cost_used
+                if attempt < cfg.max_retries:
+                    continue
+                state.stage = PipelineStage.FAILED
+                state.error = f"FixAgent: budget exceeded after {attempt + 1} attempt(s)"
+                return state
+
             state.total_tokens += budget.tokens_used
             state.total_cost += budget.cost_used
-            if attempt < cfg.max_retries:
-                continue
-            state.stage = PipelineStage.FAILED
-            state.error = f"FixAgent: budget exceeded after {attempt + 1} attempt(s)"
-            return state
 
-        state.total_tokens += budget.tokens_used
-        state.total_cost += budget.cost_used
-
-        if result:
-            state.fix = result[0]
-            state.stage = PipelineStage.DONE
-            return state
+            if result:
+                state.fix = result[0]
+                state.stage = PipelineStage.DONE
+                return state
 
     state.stage = PipelineStage.FAILED
     state.error = "FixAgent: could not produce a valid fix"

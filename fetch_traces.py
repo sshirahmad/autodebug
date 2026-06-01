@@ -35,7 +35,7 @@ data = gql('''
           input  { value }
           output { value }
           events { name message }
-          descendants(first: 60) {
+          descendants(first: 500) {
             edges {
               node {
                 name

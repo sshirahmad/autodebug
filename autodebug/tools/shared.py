@@ -1,25 +1,30 @@
-"""Tools shared across multiple agents: read_file, list_files."""
+"""Tools shared across multiple agents: read_file, list_files.
+
+Every file operation routes through the long-lived sandbox container so the
+repo state stays inside the Docker volume.
+"""
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from langchain_core.tools import tool
 
-# Container paths the LLM might use instead of relative paths
+from autodebug.sandbox import Sandbox
+
+
 _CONTAINER_PREFIXES = ("/workspace/repo/", "/workspace/repo", "/repo/", "/repo")
 
 
 def _to_repo_relative(path: str) -> str:
-    """Strip container-absolute prefixes so paths resolve against repo_path."""
+    """Strip container-absolute prefixes the LLM might prepend."""
     for prefix in _CONTAINER_PREFIXES:
-        if path == prefix.rstrip("/") or path.startswith(prefix.rstrip("/") + "/"):
-            path = path[len(prefix):]
+        bare = prefix.rstrip("/")
+        if path == bare or path.startswith(bare + "/"):
+            path = path[len(prefix):] if path.startswith(prefix) else path[len(bare):]
             break
     return path.lstrip("/")
 
 
-def make_read_file_tool(repo_path: Path, **_):
+def make_read_file_tool(sandbox: Sandbox, **_):
     @tool
     def read_file(path: str, offset: int = 0, limit: int = 500) -> str:
         """Read a file from the repository.
@@ -29,24 +34,14 @@ def make_read_file_tool(repo_path: Path, **_):
             offset: Line number to start reading from (0-based). Default 0.
             limit: Maximum number of lines to return. Default 500.
         """
-        fp = repo_path / _to_repo_relative(path)
-        if not fp.exists():
-            return f"File not found: {path}"
-        lines = fp.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
-        total = len(lines)
-        chunk = lines[offset: offset + limit]
-        header = f"[Lines {offset + 1}-{min(offset + limit, total)} of {total}]\n"
-        return header + "".join(chunk)
+        return sandbox.read_file(_to_repo_relative(path), offset=offset, limit=limit)
     return read_file
 
 
-def make_list_files_tool(repo_path: Path, **_):
+def make_list_files_tool(sandbox: Sandbox, **_):
     @tool
     def list_files(path: str) -> str:
         """List files in a directory of the repository."""
-        dp = repo_path / _to_repo_relative(path)
-        if dp.is_dir():
-            entries = sorted(dp.iterdir())
-            return "\n".join(("  " if e.is_dir() else "") + e.name for e in entries)
-        return f"Directory not found: {path}"
+        rel = _to_repo_relative(path) if path not in ("", ".") else "."
+        return sandbox.list_files(rel or ".")
     return list_files

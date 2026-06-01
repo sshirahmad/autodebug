@@ -46,11 +46,10 @@ def test_system_prompt_resolves_for_each_agent():
         assert len(prompt) > 20, f"{name}: prompt too short ({len(prompt)} chars)"
 
 
-def test_build_tools_for_repro(tmp_path):
+def test_build_tools_for_repro():
     registry = AutoDebugRegistry.from_file()
     tools = registry.build_tools(
         "repro",
-        repo_path=tmp_path,
         sandbox=MagicMock(),
         result=[],
     )
@@ -62,4 +61,4 @@ def test_build_tools_for_repro(tmp_path):
 def test_build_tools_unknown_agent_raises():
     registry = AutoDebugRegistry.from_file()
     with pytest.raises(KeyError, match="not in config"):
-        registry.build_tools("does_not_exist", repo_path=None)
+        registry.build_tools("does_not_exist", sandbox=MagicMock())

@@ -2,16 +2,18 @@
 
 We mock `create_agent` so its `.invoke()` either populates the runner's `result`
 list (success path) or raises `BudgetExceeded` (budget path) without ever touching
-a real LLM. The runner itself is fully exercised end-to-end.
+a real LLM. We also mock `Sandbox` so the runner's context-manager block returns
+our fake without spinning up a real container.
 """
 
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from autodebug.agents.base import BudgetExceeded
+from autodebug.sandbox import RunResult
 from autodebug.state import (
-    BisectResult,
     DebugState,
     FixResult,
     PipelineStage,
@@ -21,7 +23,7 @@ from autodebug.state import (
 
 
 # ---------------------------------------------------------------------------
-# create_agent mocking helpers
+# Mocking helpers
 # ---------------------------------------------------------------------------
 
 class FakeAgent:
@@ -35,22 +37,35 @@ class FakeAgent:
 
 
 def patch_create_agent(module_path: str, behavior):
-    """Patch `create_agent` in the given runner module with a fake that calls
-    `behavior()` on each `.invoke()`. `behavior` runs in the closure of the
-    runner, so it can append to result lists captured via patch_build_tools.
-    """
     def fake_create_agent(**kwargs):
         return FakeAgent(behavior)
     return patch(f"{module_path}.create_agent", new=fake_create_agent)
 
 
+def _make_fake_sandbox() -> MagicMock:
+    """Sandbox mock that supports the `with` protocol and the methods runners call."""
+    sb = MagicMock()
+    ok = RunResult(exit_code=0, stdout="", stderr="")
+    sb.run_script.return_value = ok
+    sb.exec.return_value = ok
+    sb.git.return_value = ok
+    sb.read_file.return_value = "(fake)"
+    sb.list_files.return_value = ""
+    sb.write_file.return_value = ok
+    # context manager protocol — `with Sandbox(...) as s:` yields the same mock
+    sb.__enter__.return_value = sb
+    sb.__exit__.return_value = None
+    return sb
+
+
+def patch_sandbox(module_path: str, fake: MagicMock):
+    """Patch `Sandbox(volume=...)` to return our fake instance in that module."""
+    return patch(f"{module_path}.Sandbox", return_value=fake)
+
+
 @pytest.fixture
 def capture_result_list(monkeypatch):
-    """Patch AutoDebugRegistry.build_tools to capture the `result` list kwarg.
-
-    Returns a one-element holder; after run_*() is called, holder[0] is the
-    list the submit_* tool would append to.
-    """
+    """Capture the `result` list kwarg as each agent's tools are built."""
     holder: list = []
 
     from autodebug.registry import AutoDebugRegistry
@@ -65,6 +80,18 @@ def capture_result_list(monkeypatch):
     return holder
 
 
+@contextmanager
+def _patched_bisect_helpers():
+    """Mock git_utils calls bisect makes before agent.invoke (unshallow, current_sha, get_commit_info)."""
+    from autodebug.tools.git_utils import CommitInfo
+    info = CommitInfo(sha="deadbeef", short_sha="dead", message="initial",
+                      author="x", date="2024-01-01", diff="")
+    with patch("autodebug.agents.bisect.git_utils.unshallow") as un, \
+         patch("autodebug.agents.bisect.git_utils.current_sha", return_value="deadbeef") as cs, \
+         patch("autodebug.agents.bisect.git_utils.get_commit_info", return_value=info) as ci:
+        yield un, cs, ci
+
+
 # ---------------------------------------------------------------------------
 # run_repro
 # ---------------------------------------------------------------------------
@@ -75,9 +102,8 @@ class TestRunRepro:
             capture_result_list[0].append(
                 ReproResult(repro_script="x", error_output="boom", confirmed=True)
             )
-
-        from autodebug.agents import repro as repro_mod
-        with patch.object(repro_mod, "Sandbox", return_value=MagicMock()), \
+        sb = _make_fake_sandbox()
+        with patch_sandbox("autodebug.agents.repro", sb), \
              patch_create_agent("autodebug.agents.repro", behavior):
             from autodebug.registry import AutoDebugRegistry
             from autodebug.agents.repro import run_repro
@@ -89,10 +115,9 @@ class TestRunRepro:
 
     def test_fails_when_no_result_after_retries(self, base_state, capture_result_list):
         def behavior():
-            pass  # never populate result
-
-        from autodebug.agents import repro as repro_mod
-        with patch.object(repro_mod, "Sandbox", return_value=MagicMock()), \
+            pass
+        sb = _make_fake_sandbox()
+        with patch_sandbox("autodebug.agents.repro", sb), \
              patch_create_agent("autodebug.agents.repro", behavior):
             from autodebug.registry import AutoDebugRegistry
             from autodebug.agents.repro import run_repro
@@ -104,9 +129,8 @@ class TestRunRepro:
     def test_fails_when_budget_exceeded_on_every_attempt(self, base_state, capture_result_list):
         def behavior():
             raise BudgetExceeded("token budget hit")
-
-        from autodebug.agents import repro as repro_mod
-        with patch.object(repro_mod, "Sandbox", return_value=MagicMock()), \
+        sb = _make_fake_sandbox()
+        with patch_sandbox("autodebug.agents.repro", sb), \
              patch_create_agent("autodebug.agents.repro", behavior):
             from autodebug.registry import AutoDebugRegistry
             from autodebug.agents.repro import run_repro
@@ -130,11 +154,9 @@ class TestRunRootCause:
                     hypothesis="- was used instead of +",
                 )
             )
-
-        sandbox = MagicMock()
-        sandbox.run_script.return_value = MagicMock(output="AssertionError")
-        from autodebug.agents import root_cause as rc_mod
-        with patch.object(rc_mod, "Sandbox", return_value=sandbox), \
+        sb = _make_fake_sandbox()
+        sb.run_script.return_value = RunResult(exit_code=1, stdout="", stderr="AssertionError")
+        with patch_sandbox("autodebug.agents.root_cause", sb), \
              patch_create_agent("autodebug.agents.root_cause", behavior):
             from autodebug.registry import AutoDebugRegistry
             from autodebug.agents.root_cause import run_root_cause
@@ -151,18 +173,10 @@ class TestRunRootCause:
 class TestRunFix:
     def test_advances_to_done_when_result_populated(self, root_cause_state, capture_result_list):
         def behavior():
-            # capture_result_list[-1] is the most recent result list captured;
-            # for fix agent, patches list is captured separately — we only need result.
             results = [lst for lst in capture_result_list if isinstance(lst, list)]
-            results[-1].append(
-                FixResult(patch="x", attempts=1, test_output="all passed")
-            )
-
-        sandbox = MagicMock()
-        sandbox.run_script.return_value = MagicMock(success=True, exit_code=0)
-        sandbox.run.return_value = MagicMock(success=True, exit_code=0)
-        from autodebug.agents import fix as fix_mod
-        with patch.object(fix_mod, "Sandbox", return_value=sandbox), \
+            results[-1].append(FixResult(patch="x", attempts=1, test_output="all passed"))
+        sb = _make_fake_sandbox()
+        with patch_sandbox("autodebug.agents.fix", sb), \
              patch_create_agent("autodebug.agents.fix", behavior):
             from autodebug.registry import AutoDebugRegistry
             from autodebug.agents.fix import run_fix
@@ -179,10 +193,11 @@ class TestRunFix:
 class TestBudgetMiddleware:
     def test_check_raises_when_cost_threshold_exceeded(self):
         from autodebug.agents.base import Budget, BudgetExceeded
-        b = Budget(time_seconds=None, cost_usd=0.01, cost_per_1k_input=0.003, cost_per_1k_output=0.015)
-        b.add_tokens(1000, 200)  # 0.003 + 0.003 = 0.006 -> ok
+        b = Budget(time_seconds=None, cost_usd=0.01,
+                   cost_per_1k_input=0.003, cost_per_1k_output=0.015)
+        b.add_tokens(1000, 200)
         b.check()
-        b.add_tokens(500, 200)  # +0.0015 + 0.003 = +0.0045, total ~0.0105 -> over
+        b.add_tokens(500, 200)
         with pytest.raises(BudgetExceeded, match="Cost budget"):
             b.check()
 
@@ -190,7 +205,6 @@ class TestBudgetMiddleware:
         from autodebug.agents.base import Budget
         b = Budget(cost_per_1k_input=0.003, cost_per_1k_output=0.015)
         cost = b.add_tokens(1000, 500)
-        # 1000 * 0.003/1000 + 500 * 0.015/1000 = 0.003 + 0.0075 = 0.0105
         assert abs(cost - 0.0105) < 1e-9
         assert abs(b.cost_used - 0.0105) < 1e-9
 

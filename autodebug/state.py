@@ -55,7 +55,7 @@ class DebugState(BaseModel):
 
     # --- Runtime ---
     stage: PipelineStage = PipelineStage.INIT
-    repo_local_path: Optional[str] = None
+    repo_volume: Optional[str] = None  # Docker volume name holding the cloned repo
     error: Optional[str] = None
 
     # --- Agent outputs (filled in as pipeline progresses) ---
