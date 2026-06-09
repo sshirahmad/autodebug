@@ -27,6 +27,7 @@ class AgentConfig(BaseModel):
     cost_per_1k_output_tokens: float | None = None
     max_retries: int = 0
     skills: list[str] = Field(default_factory=list)  # skill names from .skills/
+    tool_call_limits: dict[str, int] = Field(default_factory=dict)  # per-run cap per tool
     model: str | None = None      # overrides AUTODEBUG_MODEL if set
     provider: str | None = None   # overrides AUTODEBUG_MODEL_PROVIDER if set
     extra: dict[str, Any] = Field(default_factory=dict)

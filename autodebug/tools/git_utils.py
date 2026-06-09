@@ -18,7 +18,7 @@ class CommitInfo:
     message: str
     author: str
     date: str
-    diff: str  # diff vs parent, truncated
+    diff: str  # full diff vs parent; consumers truncate for display
 
 
 def get_commit_info(sandbox: Sandbox, sha: str) -> CommitInfo:
@@ -38,7 +38,7 @@ def get_commit_info(sandbox: Sandbox, sha: str) -> CommitInfo:
         message=lines[2],
         author=lines[3],
         date=lines[4],
-        diff=(diff or "")[:8000],
+        diff=diff or "",
     )
 
 

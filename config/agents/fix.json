@@ -3,8 +3,14 @@
   "tools": ["search_memory", "read_file", "list_files", "apply_patch", "run_repro", "run_tests", "load_skill", "update_skill", "submit_fix"],
   "skills": ["systematic-debugging"],
   "time_budget_seconds": 1800,
-  "cost_budget_usd": 1.50,
+  "cost_budget_usd": 2.00,
   "cost_per_1k_input_tokens": 0.003,
   "cost_per_1k_output_tokens": 0.015,
-  "max_retries": 2
+  "max_retries": 2,
+  "tool_call_limits": {
+    "read_file": 30,
+    "list_files": 10,
+    "search_memory": 2,
+    "load_skill": 2
+  }
 }

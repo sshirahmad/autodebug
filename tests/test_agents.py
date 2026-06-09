@@ -212,3 +212,69 @@ class TestBudgetMiddleware:
         from autodebug.agents.base import Budget, budget_middleware
         mw = budget_middleware(Budget())
         assert len(mw) == 2
+
+
+class TestSubmissionMiddleware:
+    def test_jumps_to_end_when_result_populated(self):
+        from autodebug.agents.base import submission_middleware
+        result = ["submitted"]
+        mw = submission_middleware(result)
+        assert len(mw) == 1
+        # Call the underlying hook function directly (decorated as before_model)
+        out = mw[0].before_model(state={"messages": []}, runtime=None)
+        assert out == {"jump_to": "end"}
+
+    def test_returns_none_when_result_empty(self):
+        from autodebug.agents.base import submission_middleware
+        result: list = []
+        mw = submission_middleware(result)
+        out = mw[0].before_model(state={"messages": []}, runtime=None)
+        assert out is None
+
+    def test_combined_with_budget_middleware(self):
+        from autodebug.agents.base import Budget, budget_middleware, submission_middleware
+        budget = Budget()
+        combined = budget_middleware(budget) + submission_middleware([])
+        assert len(combined) == 3  # check_budget + track_tokens + check_submitted
+
+
+class TestRequireToolCallsMiddleware:
+    def test_jumps_back_to_model_when_no_tool_calls(self):
+        from langchain_core.messages import AIMessage
+        from autodebug.agents.base import require_tool_calls_middleware
+
+        mw = require_tool_calls_middleware()
+        assert len(mw) == 1
+
+        ai_msg = AIMessage(content="Some analysis text", tool_calls=[])
+        out = mw[0].after_model(
+            state={"messages": [ai_msg]}, runtime=None,
+        )
+        assert out is not None
+        assert out["jump_to"] == "model"
+        appended = out["messages"][0]
+        assert "tool call" in appended.content.lower()
+
+    def test_passes_through_when_tool_calls_present(self):
+        from langchain_core.messages import AIMessage
+        from autodebug.agents.base import require_tool_calls_middleware
+
+        mw = require_tool_calls_middleware()
+        ai_msg = AIMessage(
+            content="",
+            tool_calls=[{"name": "read_file", "args": {"path": "x"}, "id": "1", "type": "tool_call"}],
+        )
+        out = mw[0].after_model(
+            state={"messages": [ai_msg]}, runtime=None,
+        )
+        assert out is None
+
+    def test_passes_through_when_last_message_is_not_ai(self):
+        from langchain_core.messages import HumanMessage
+        from autodebug.agents.base import require_tool_calls_middleware
+
+        mw = require_tool_calls_middleware()
+        out = mw[0].after_model(
+            state={"messages": [HumanMessage(content="hi")]}, runtime=None,
+        )
+        assert out is None
