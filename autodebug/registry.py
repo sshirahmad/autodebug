@@ -56,6 +56,15 @@ class AutoDebugRegistry:
         skills = self._loader.resolve_skills(cfg.skills)
         return f"{base}\n\n---\n\n{skills}" if skills else base
 
+    def prompt_states(self, agent_name: str) -> dict[str, str]:
+        """Return the per-state system prompts for a multi-state agent.
+
+        The agent's `system_prompt` config points at a YAML whose top-level keys
+        are state names (e.g. the Manager's FSM phases) mapped to prompts.
+        """
+        cfg = self.get_config(agent_name)
+        return self._loader.resolve_prompt_map(cfg.system_prompt)
+
     def build_tools(self, agent_name: str, **context) -> list:
         cfg = self.get_config(agent_name)
         ctx = {"agent_name": agent_name, **context}

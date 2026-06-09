@@ -12,7 +12,7 @@ def test_config_loads():
 
 def test_all_agents_in_config():
     cfg = load_config()
-    assert {"repro", "bisect", "root_cause", "fix"} == set(cfg.agents)
+    assert {"repro", "bisect", "root_cause", "fix", "manager"} == set(cfg.agents)
 
 
 def test_agent_config_has_required_fields():

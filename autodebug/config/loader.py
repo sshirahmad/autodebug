@@ -35,6 +35,18 @@ class ConfigLoader:
         data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
         return data["system"].strip()
 
+    def resolve_prompt_map(self, path: str) -> dict[str, str]:
+        """Load every top-level key from a prompt YAML as name -> prompt.
+
+        Used by multi-state agents (e.g. the Manager FSM) where each phase has
+        its own system prompt keyed by the phase name.
+        """
+        yaml_path = self.config_dir.parent / path
+        data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+        return {
+            k: (v.strip() if isinstance(v, str) else v) for k, v in data.items()
+        }
+
     def resolve_skills(self, names: list[str]) -> str:
         """Inject a compact skills directory into the system prompt.
 

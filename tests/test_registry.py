@@ -14,7 +14,7 @@ def test_registry_loads_from_file():
 
 def test_registry_available_agents():
     registry = AutoDebugRegistry.from_file()
-    assert set(registry.available_agents()) == {"repro", "bisect", "root_cause", "fix"}
+    assert set(registry.available_agents()) == {"repro", "bisect", "root_cause", "fix", "manager"}
 
 
 def test_registry_available_tools():

@@ -1,6 +1,6 @@
 """Tests for auto-discovery of tools and agent config registration."""
 
-from autodebug.agents import run_bisect, run_fix, run_repro, run_root_cause
+from autodebug.agents import run_bisect, run_fix, run_manager, run_repro, run_root_cause
 from autodebug.registry import AutoDebugRegistry, _TOOL_FACTORIES
 from autodebug.tools import _FACTORIES
 
@@ -12,9 +12,12 @@ EXPECTED_TOOLS = {
     "read_file_at_parent", "run_repro_with_traceback", "submit_root_cause",
     "apply_patch", "run_repro", "run_tests", "submit_fix",
     "search_memory", "load_skill", "update_skill",
+    # Manager (FSM brain) delegates to the sub-agents via these tools.
+    "run_repro_agent", "run_bisect_agent", "run_root_cause_agent",
+    "run_fix_agent", "finish",
 }
 
-EXPECTED_AGENTS = {"repro", "bisect", "root_cause", "fix"}
+EXPECTED_AGENTS = {"repro", "bisect", "root_cause", "fix", "manager"}
 
 
 def test_all_tools_discovered():
@@ -41,6 +44,7 @@ def test_agent_runners_exported():
         "bisect": run_bisect,
         "root_cause": run_root_cause,
         "fix": run_fix,
+        "manager": run_manager,
     }
     for name, fn in runners.items():
         assert callable(fn), f"{name} runner is not callable"

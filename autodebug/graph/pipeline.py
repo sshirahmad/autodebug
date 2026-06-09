@@ -32,7 +32,13 @@ def clone_repo(state: DebugState) -> DebugState:
     """Provision a Docker volume and clone the repo into it via a one-shot container."""
     volume = create_repo_volume()
     try:
-        clone_into_volume(volume, state.repo_url, state.pre_fix_commit)
+        clone_into_volume(
+            volume,
+            state.repo_url,
+            state.pre_fix_commit,
+            test_patch=state.test_patch,
+            fixed_commit=state.fixed_commit_id,
+        )
     except Exception:
         remove_repo_volume(volume)
         raise
@@ -51,6 +57,23 @@ _STAGES = (
     ("root_cause", run_root_cause),
     ("fix", run_fix),
 )
+
+
+def _resolve_stages(registry):
+    """Pick the orchestration mode.
+
+    If a `manager` agent is configured (and not disabled via AUTODEBUG_MANAGER=0),
+    run the single FSM-driven Manager agent, which delegates to the sub-agents
+    itself. Otherwise fall back to the classic linear repro->...->fix sequence.
+    """
+    manager_on = (
+        "manager" in registry.config.agents
+        and os.getenv("AUTODEBUG_MANAGER", "1") != "0"
+    )
+    if manager_on:
+        from autodebug.agents import run_manager
+        return (("manager", run_manager),)
+    return _STAGES
 
 
 def _failed(state: DebugState) -> bool:
@@ -72,7 +95,7 @@ def run_pipeline(repo_url: str, bug_report: str, **kwargs) -> DebugState:
         try:
             state = clone_repo(state)
 
-            for name, runner in _STAGES:
+            for name, runner in _resolve_stages(registry):
                 if _failed(state):
                     break
                 with _tracer.start_as_current_span(f"autodebug.{name}"):

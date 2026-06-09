@@ -50,11 +50,14 @@ class DebugState(BaseModel):
     known_good_commit: Optional[str] = None
     github_issue_url: Optional[str] = None
     pre_fix_commit: Optional[str] = None     # fixed_commit_id~1; clone is checked out here
+    fixed_commit_id: Optional[str] = None    # the commit where the fix landed (for test-file sync)
     test_file: Optional[str] = None          # path to the relevant test file
     test_command: Optional[str] = None       # command to run targeted regression tests
+    test_patch: Optional[str] = None         # explicit test-only diff to apply at clone
 
     # --- Runtime ---
     stage: PipelineStage = PipelineStage.INIT
+    manager_phase: Optional[str] = None  # last Manager FSM phase (manager mode only)
     repo_volume: Optional[str] = None  # Docker volume name holding the cloned repo
     error: Optional[str] = None
 
