@@ -6,8 +6,14 @@ import sys
 
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
 
-from autodebug.agents.base import Budget, BudgetExceeded, build_model, budget_middleware
+from autodebug.agents.base import (
+    Budget, BudgetExceeded, attempt_trajectory, build_model, budget_middleware,
+    maybe_optimize_prompt, planning_middleware, require_tool_calls_middleware,
+    retry_feedback, submission_middleware, summarization_middleware,
+    tool_call_limit_middleware,
+)
 from autodebug.sandbox import Sandbox
 from autodebug.state import DebugState, PipelineStage
 
@@ -34,9 +40,9 @@ def run_root_cause(state: DebugState, *, registry) -> DebugState:
             "Please identify the root cause of this regression."
         )
 
+        crashed = False
         for attempt in range(cfg.max_retries + 1):
             budget = Budget.from_config(cfg)
-            result.clear()
             tools = registry.build_tools(
                 "root_cause",
                 sandbox=sandbox,
@@ -44,26 +50,34 @@ def run_root_cause(state: DebugState, *, registry) -> DebugState:
                 repro_script=state.repro.repro_script,
                 result=result,
             )
+            saver = InMemorySaver()
             agent = create_agent(
                 model=llm,
                 tools=tools,
                 system_prompt=system_prompt,
-                middleware=budget_middleware(budget),
+                checkpointer=saver,
+                middleware=(
+                    budget_middleware(budget)
+                    + planning_middleware()
+                    + summarization_middleware(cfg.model, cfg.provider)
+                    + submission_middleware(result)
+                    + require_tool_calls_middleware()
+                    + tool_call_limit_middleware(cfg.tool_call_limits)
+                ),
             )
+            invoke_config = {
+                "recursion_limit": sys.maxsize,
+                "configurable": {"thread_id": f"root_cause-{attempt}"},
+            }
 
+            crashed = False
             try:
                 agent.invoke(
                     {"messages": [HumanMessage(content=initial_text)]},
-                    config={"recursion_limit": sys.maxsize},
+                    config=invoke_config,
                 )
             except BudgetExceeded:
-                state.total_tokens += budget.tokens_used
-                state.total_cost += budget.cost_used
-                if attempt < cfg.max_retries:
-                    continue
-                state.stage = PipelineStage.FAILED
-                state.error = f"RootCauseAgent: budget exceeded after {attempt + 1} attempt(s)"
-                return state
+                crashed = True
 
             state.total_tokens += budget.tokens_used
             state.total_cost += budget.cost_used
@@ -73,6 +87,20 @@ def run_root_cause(state: DebugState, *, registry) -> DebugState:
                 state.stage = PipelineStage.FIX
                 return state
 
+            if not crashed or attempt >= cfg.max_retries:
+                break
+
+            # Retrying: optimize the prompt from this failed attempt's history.
+            system_prompt = maybe_optimize_prompt(
+                system_prompt,
+                attempt_trajectory(agent, invoke_config),
+                retry_feedback("determining the root cause and calling submit_root_cause"),
+                model_id=cfg.model, provider=cfg.provider,
+            )
+
     state.stage = PipelineStage.FAILED
-    state.error = "RootCauseAgent: could not determine root cause"
+    state.error = (
+        "RootCauseAgent: budget exceeded with no submission"
+        if crashed else "RootCauseAgent: could not determine root cause"
+    )
     return state

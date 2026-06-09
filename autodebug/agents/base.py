@@ -12,7 +12,14 @@ import time
 from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
-from langchain.agents.middleware import AgentState, after_model, before_model
+from langchain.agents.middleware import (
+    AgentState,
+    ToolCallLimitMiddleware,
+    TodoListMiddleware,
+    SummarizationMiddleware,
+    after_model,
+    before_model,
+)
 from langchain.chat_models import init_chat_model
 from langgraph.runtime import Runtime
 
@@ -96,6 +103,184 @@ def budget_middleware(budget: Budget) -> list:
         return None
 
     return [_check_budget, _track_tokens]
+
+
+def tool_call_limit_middleware(limits: dict[str, int]) -> list:
+    """Cap how many times each named tool can be called in a single agent run.
+
+    When a tool's limit is reached, further calls to that tool are blocked
+    (the model gets a notice) but the agent continues — so it can fall back
+    to a different tool. Force the fix agent to attempt `apply_patch` instead
+    of endlessly re-reading the same files, force bisect to submit after
+    enough exploration, etc.
+    """
+    return [
+        ToolCallLimitMiddleware(
+            tool_name=name, run_limit=limit, exit_behavior="continue",
+        )
+        for name, limit in (limits or {}).items()
+    ]
+
+
+def planning_middleware() -> list:
+    """TodoListMiddleware: a `write_todos` tool so the agent can plan multi-step work.
+
+    The agent maintains a structured task list (plan, mark in-progress, complete),
+    which helps long multi-tool runs (bisect, fix) stay on track instead of looping.
+    """
+    return [TodoListMiddleware()]
+
+
+# Absolute token trigger for summarization. A fractional trigger needs per-model
+# profile metadata (max_input_tokens) that isn't reliably available, so we use an
+# absolute count that fits comfortably under a 200k-context model and still leaves
+# room for the summary + continued work. Override via env if needed.
+_SUMMARIZE_TRIGGER_TOKENS = int(os.getenv("AUTODEBUG_SUMMARIZE_TRIGGER_TOKENS", "120000"))
+_SUMMARIZE_KEEP_MESSAGES = int(os.getenv("AUTODEBUG_SUMMARIZE_KEEP_MESSAGES", "20"))
+
+
+def summarization_middleware(
+    model_id: str | None = None, provider: str | None = None
+) -> list:
+    """SummarizationMiddleware: compress old turns when context grows large.
+
+    Once the running history exceeds the token trigger, older messages are
+    summarized while the most recent turns are kept verbatim (AI/Tool pairs
+    preserved). This keeps long agent runs from blowing the context window — a
+    failure mode behind stalled fix attempts.
+    """
+    model = build_model(model_id=model_id, provider=provider)
+    return [
+        SummarizationMiddleware(
+            model=model,
+            trigger=("tokens", _SUMMARIZE_TRIGGER_TOKENS),
+            keep=("messages", _SUMMARIZE_KEEP_MESSAGES),
+        )
+    ]
+
+
+def require_tool_calls_middleware() -> list:
+    """Reject text-only AI responses and force the model to retry with a tool call.
+
+    Modern reasoning models will happily emit thousands of tokens of analysis
+    text without ever calling a tool — burning budget without making progress.
+    After every model call, if the response has no tool_calls, we append a
+    short corrective message and jump back to the model node so it tries
+    again. The budget middleware naturally bounds the loop.
+    """
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    @after_model(can_jump_to=["model"])
+    def _require_tool(state: AgentState, runtime: Runtime):
+        msg = state["messages"][-1]
+        if not isinstance(msg, AIMessage):
+            return None
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        if tool_calls:
+            return None
+        return {
+            "messages": [
+                HumanMessage(content=(
+                    "Your last response had no tool call. Every response MUST "
+                    "be a tool call. Make a tool call now — do not write text."
+                ))
+            ],
+            "jump_to": "model",
+        }
+
+    return [_require_tool]
+
+
+# Cap how much trajectory we feed the optimizer — long fix runs can be 100+
+# messages and the optimizer sends them all to an LLM. Keep the opening (task
+# framing) plus the most recent turns, where the failure actually shows up.
+_TRAJ_HEAD = 4
+_TRAJ_TAIL = 56
+
+
+def retry_feedback(goal: str) -> str:
+    """Feedback string handed to the optimizer describing why a retry happened."""
+    return (
+        f"The previous attempt FAILED: it exhausted its time/cost budget before "
+        f"{goal}. Study the trajectory for wasted effort — repeated file reads, "
+        f"loops, unproductive tangents, or missing tool calls — and revise the "
+        f"system prompt so the next attempt avoids those failure modes and reaches "
+        f"its submission faster. Preserve the prompt's required tools, output "
+        f"contract, and any STOP/format rules."
+    )
+
+
+def attempt_trajectory(agent, config) -> list:
+    """Recover the message history of an attempt from its checkpointer.
+
+    Works even when the attempt ended by raising BudgetExceeded — the last
+    completed super-step is still persisted to the in-memory checkpoint.
+    """
+    try:
+        return list(agent.get_state(config).values.get("messages", []))
+    except Exception:
+        return []
+
+
+def _trim_trajectory(messages: list) -> list:
+    if len(messages) <= _TRAJ_HEAD + _TRAJ_TAIL:
+        return messages
+    return messages[:_TRAJ_HEAD] + messages[-_TRAJ_TAIL:]
+
+
+def maybe_optimize_prompt(
+    current_prompt: str,
+    messages: list,
+    feedback: str,
+    *,
+    model_id: str | None = None,
+    provider: str | None = None,
+) -> str:
+    """Improve `current_prompt` from a failed attempt's trajectory via LangMem.
+
+    Uses the gradient prompt optimizer: it reflects on the trajectory + feedback
+    and rewrites the prompt to avoid the observed failure mode. Best-effort — any
+    error (missing dep, optimizer failure, empty trajectory) returns the original
+    prompt so the retry loop is never blocked. Disable with AUTODEBUG_PROMPT_OPTIM=0.
+    """
+    if os.getenv("AUTODEBUG_PROMPT_OPTIM", "1") == "0" or not messages:
+        return current_prompt
+    try:
+        from langmem import create_prompt_optimizer
+        from langmem.prompts.types import AnnotatedTrajectory
+
+        model = build_model(model_id=model_id, provider=provider)
+        optimizer = create_prompt_optimizer(model, kind="gradient")
+        trajectory = AnnotatedTrajectory(
+            messages=_trim_trajectory(messages), feedback=feedback
+        )
+        improved = optimizer.invoke(
+            {"trajectories": [trajectory], "prompt": current_prompt}
+        )
+        if isinstance(improved, str) and improved.strip():
+            return improved
+    except Exception:
+        pass
+    return current_prompt
+
+
+def submission_middleware(result: list) -> list:
+    """Stop the agent loop as soon as a submit_* tool populates `result`.
+
+    Without this, the agent keeps making LLM calls (and burning budget) after
+    its final tool answer is already on the result list — verifying its
+    candidate, re-reading code, or re-submitting the same answer. This
+    middleware checks the result list before each model invocation and jumps
+    to the agent's end node when it sees a result.
+    """
+
+    @before_model(can_jump_to=["end"])
+    def _check_submitted(state: AgentState, runtime: Runtime):
+        if result:
+            return {"jump_to": "end"}
+        return None
+
+    return [_check_submitted]
 
 
 def build_model(
