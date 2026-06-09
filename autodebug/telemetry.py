@@ -45,12 +45,18 @@ def setup_tracing(project_name: str = "autodebug") -> None:
             "  pip install 'autodebug[tracing]'"
         )
 
+    # We deviate from the Phoenix docs' `auto_instrument=True` recipe because
+    # arize-phoenix (the server, installed in this env so `phoenix serve` works)
+    # hard-depends on openinference-instrumentation-openai. With both LangChain
+    # and OpenAI instrumentors active, the OpenAI tracer uses OTel context
+    # propagation while the LangChain tracer uses callbacks — they can't see
+    # each other, so every LLM call gets an extra orphan ChatCompletion root
+    # span. Activating LangChain explicitly avoids the duplicate.
     tracer_provider = register(
         project_name=project_name,
         endpoint=f"{endpoint.rstrip('/')}/v1/traces",
         verbose=False,
     )
-
     LangChainInstrumentor().instrument(tracer_provider=tracer_provider)
 
     _instrumented = True

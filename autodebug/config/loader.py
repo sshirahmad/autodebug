@@ -35,6 +35,44 @@ class ConfigLoader:
         data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
         return data["system"].strip()
 
+    def resolve_prompt_map(self, path: str) -> dict[str, str]:
+        """Load every top-level key from a prompt YAML as name -> prompt.
+
+        Used by multi-state agents (e.g. the Manager FSM) where each phase has
+        its own system prompt keyed by the phase name.
+        """
+        yaml_path = self.config_dir.parent / path
+        data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+        return {
+            k: (v.strip() if isinstance(v, str) else v) for k, v in data.items()
+        }
+
+    def resolve_skills(self, names: list[str]) -> str:
+        """Inject a compact skills directory into the system prompt.
+
+        Each skill's SKILL.md must have YAML frontmatter with `name` and
+        `description` fields. Only those two fields are injected here — the
+        full content is loaded on demand via the load_skill tool.
+        """
+        if not names:
+            return ""
+        skills_root = _REPO_ROOT / ".skills"
+        entries: list[str] = []
+        for name in names:
+            skill_file = skills_root / name / "SKILL.md"
+            if not skill_file.exists():
+                import warnings
+                warnings.warn(f"Skill '{name}' not found at {skill_file}", stacklevel=2)
+                continue
+            description = _parse_skill_description(skill_file.read_text(encoding="utf-8"))
+            entries.append(f"- **{name}**: {description}")
+        if not entries:
+            return ""
+        lines = ["## Available Skills", ""]
+        lines.extend(entries)
+        lines += ["", "Call `load_skill(name)` to load the full guide for any skill above."]
+        return "\n".join(lines)
+
     def _read_json(self, relative: str) -> dict:
         path = self.config_dir / relative
         return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
@@ -46,12 +84,11 @@ class ConfigLoader:
             return result
         for fp in sorted(d.glob("*.json")):
             data = json.loads(fp.read_text(encoding="utf-8"))
+            # Split: known model fields go directly to AgentConfig, everything
+            # else lands in `extra` so the registry can forward it to agents.
+            known = {k: v for k, v in data.items() if k in AgentConfig.model_fields and k != "extra"}
             extra = {k: v for k, v in data.items() if k not in AgentConfig.model_fields}
-            result[fp.stem] = AgentConfig(
-                system_prompt=data["system_prompt"],
-                tools=data["tools"],
-                extra=extra,
-            )
+            result[fp.stem] = AgentConfig(extra=extra, **known)
         return result
 
     def _apply_env_overrides(self, config: PipelineConfig) -> PipelineConfig:
@@ -70,3 +107,17 @@ class ConfigLoader:
 
 def load_config(config_dir: str | Path | None = None) -> PipelineConfig:
     return ConfigLoader(config_dir).load()
+
+
+def _parse_skill_description(text: str) -> str:
+    """Extract the `description` field from YAML frontmatter, or return a fallback."""
+    if not text.startswith("---"):
+        return "(no description — add a `description:` field to this skill's frontmatter)"
+    end = text.find("---", 3)
+    if end == -1:
+        return "(malformed frontmatter)"
+    frontmatter = text[3:end]
+    for line in frontmatter.splitlines():
+        if line.startswith("description:"):
+            return line[len("description:"):].strip().strip('"').strip("'")
+    return "(no description — add a `description:` field to this skill's frontmatter)"

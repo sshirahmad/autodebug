@@ -1,10 +1,14 @@
-"""Git utilities for bisect and commit inspection."""
+"""Git helpers — all run inside the sandbox container against the shared volume.
+
+There is no host-side git access; every operation goes through `sandbox.git(...)`
+so the repo lives entirely inside the Docker volume.
+"""
 
 from __future__ import annotations
 
-import subprocess
 from dataclasses import dataclass
-from pathlib import Path
+
+from autodebug.sandbox import Sandbox
 
 
 @dataclass
@@ -14,97 +18,64 @@ class CommitInfo:
     message: str
     author: str
     date: str
-    diff: str  # diff vs parent
+    diff: str  # full diff vs parent; consumers truncate for display
 
 
-def _git(repo_path: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-        check=check,
-    )
-
-
-def get_commit_info(repo_path: str, sha: str) -> CommitInfo:
-    log = _git(repo_path, "log", "-1", "--format=%H%n%h%n%s%n%an%n%ai", sha)
+def get_commit_info(sandbox: Sandbox, sha: str) -> CommitInfo:
+    log = sandbox.git("log", "-1", "--format=%H%n%h%n%s%n%an%n%ai", sha)
     lines = log.stdout.strip().splitlines()
-    diff = _git(repo_path, "diff", f"{sha}^", sha, check=False).stdout
+    while len(lines) < 5:
+        lines.append("")
+
+    diff = sandbox.git("diff", f"{sha}^", sha).stdout
+    if not diff.strip():
+        # Merge commit or unreachable parent: fall back to `git show`.
+        diff = sandbox.git("show", "--format=", sha).stdout
+
     return CommitInfo(
         sha=lines[0],
         short_sha=lines[1],
         message=lines[2],
         author=lines[3],
         date=lines[4],
-        diff=diff[:8000],  # cap diff size sent to LLM
+        diff=diff or "",
     )
 
 
-def checkout(repo_path: str, ref: str) -> None:
-    _git(repo_path, "checkout", "--force", ref)
+def current_sha(sandbox: Sandbox) -> str:
+    return sandbox.git("rev-parse", "HEAD").stdout.strip()
 
 
-def bisect_start(repo_path: str) -> None:
-    _git(repo_path, "bisect", "start")
-
-
-def bisect_reset(repo_path: str) -> None:
-    _git(repo_path, "bisect", "reset", check=False)
-
-
-def bisect_good(repo_path: str, ref: str | None = None) -> str:
-    args = ["bisect", "good"] + ([ref] if ref else [])
-    result = _git(repo_path, *args)
-    return result.stdout.strip()
-
-
-def bisect_bad(repo_path: str, ref: str | None = None) -> str:
-    args = ["bisect", "bad"] + ([ref] if ref else [])
-    result = _git(repo_path, *args)
-    return result.stdout.strip()
-
-
-def bisect_skip(repo_path: str) -> str:
-    return _git(repo_path, "bisect", "skip").stdout.strip()
-
-
-def current_sha(repo_path: str) -> str:
-    return _git(repo_path, "rev-parse", "HEAD").stdout.strip()
-
-
-def count_commits_between(repo_path: str, good: str, bad: str) -> int:
-    result = _git(repo_path, "rev-list", "--count", f"{good}..{bad}", check=False)
+def count_commits_between(sandbox: Sandbox, good: str, bad: str) -> int:
+    result = sandbox.git("rev-list", "--count", f"{good}..{bad}")
     try:
         return int(result.stdout.strip())
     except ValueError:
         return -1
 
 
-def find_commit_before_days(repo_path: str, days: int) -> str:
+def find_commit_before_days(sandbox: Sandbox, days: int) -> str:
     """Return the latest commit SHA that is at least `days` old."""
-    result = _git(
-        repo_path,
-        "rev-list",
-        "-1",
-        f"--before={days} days ago",
-        "HEAD",
-        check=False,
-    )
+    result = sandbox.git("rev-list", "-1", f"--before={days} days ago", "HEAD")
     return result.stdout.strip()
 
 
-def get_file_at_commit(repo_path: str, sha: str, file_path: str) -> str:
-    result = _git(repo_path, "show", f"{sha}:{file_path}", check=False)
-    return result.stdout if result.returncode == 0 else ""
+def get_file_at_commit(sandbox: Sandbox, sha: str, file_path: str) -> str:
+    result = sandbox.git("show", f"{sha}:{file_path}")
+    return result.stdout if result.exit_code == 0 else ""
 
 
-def first_commit(repo_path: str) -> str:
+def first_commit(sandbox: Sandbox) -> str:
     """Return the SHA of the very first commit in the repo."""
-    result = _git(repo_path, "rev-list", "--max-parents=0", "HEAD", check=False)
-    return result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+    result = sandbox.git("rev-list", "--max-parents=0", "HEAD")
+    lines = result.stdout.strip().splitlines()
+    return lines[0] if lines else ""
 
 
-def unshallow(repo_path: str) -> None:
+def unshallow(sandbox: Sandbox) -> None:
     """Convert a shallow clone to full history (needed for deep bisects)."""
-    _git(repo_path, "fetch", "--unshallow", check=False)
+    sandbox.git("fetch", "--unshallow")
+
+
+def checkout(sandbox: Sandbox, ref: str) -> None:
+    sandbox.git("checkout", "--force", ref)

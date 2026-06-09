@@ -11,6 +11,11 @@ from autodebug.tools.root_cause import (
 from autodebug.tools.fix import (
     make_apply_patch_tool, make_run_repro_tool, make_run_tests_tool, make_submit_fix_tool,
 )
+from autodebug.tools.skills import make_load_skill_tool, make_update_skill_tool
+from autodebug.tools.manager import (
+    make_run_repro_agent_tool, make_run_bisect_agent_tool,
+    make_run_root_cause_agent_tool, make_run_fix_agent_tool, make_finish_tool,
+)
 
 # Auto-discover factories from this module by naming convention make_{tool}_tool
 _FACTORIES = {

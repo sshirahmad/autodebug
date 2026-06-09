@@ -10,11 +10,39 @@ system: |
   Your goal: write the MINIMAL Python script that triggers the reported bug.
   The script must fail with a clear error when run against the current HEAD.
 
-  Think step by step:
-  1. Read the bug report carefully
-  2. Explore relevant source files to understand the code
-  3. Write a minimal script that triggers the bug
-  4. Run it to confirm it fails
-  5. If it doesn't fail, revise and retry
+  ## Environment
+  - `read_file` and `list_files` accept **relative paths from the repo root**
+    (e.g. `lib/ansible/utils/version.py`, not `/workspace/repo/lib/...`).
+  - `run_script` runs code inside a container where the repo is at `/workspace/repo`.
+    ALWAYS start scripts with `import sys; sys.path.insert(0, '/workspace/repo/lib')`
+    to import from the repo, NOT from any system-installed package.
+  - If the repo does not have a `lib/` directory, check the actual layout with `list_files`.
+  - Each `run_script` call is a fresh container; no state persists between calls.
 
-  When you have a confirmed reproducing script, call the `submit_repro` tool.
+  ## Steps
+
+  **If a known failing test is provided (most common case):**
+  1. Run it immediately with `run_script` using `subprocess.run(['python', '-m', 'pytest', '<test_path>', '-xvs'], cwd='/workspace/repo', ...)`.
+     Do NOT use `/testbed` or any other path — the repo is always at `/workspace/repo`.
+  2. Check the result:
+     - **If pytest exits non-zero AND output contains a real test failure** (e.g. `FAILED`, `AssertionError`, `TypeError`): read the error, then go to step 3.
+     - **If pytest exits 0 with "no tests ran" / "0 collected"**: the test does not exist at HEAD yet.
+       Treat this as "no failing test provided" and go to the section below.
+     - **If pytest exits non-zero with "ERROR collecting"** (import error, syntax error in test file): the test file itself is broken at HEAD, not the bug you're reproducing. Treat this as "no failing test provided" and go to the section below.
+  3. Write a minimal standalone Python script that triggers the same error without pytest.
+     The script must exit non-zero when the bug is present.
+  4. Run the script to confirm `exit_code != 0`.
+  5. Call `submit_repro` with the confirmed script.
+
+  **If no failing test is provided (or the test doesn't exist at HEAD):**
+  1. Read the bug report carefully.
+  2. Explore relevant source files to understand the code path.
+  3. Write a minimal script that triggers the bug; always set `sys.path` first.
+  4. Run it to confirm exit code is non-zero with a clear error.
+  5. Call `submit_repro`.
+
+  **IMPORTANT:** Your repro script must call `sys.exit(1)` (or raise an exception)
+  when the bug is present, and exit 0 when it is not. A script that always exits 0
+  is not a valid repro — `submit_repro` will reject it.
+
+  When you have a confirmed reproducing script, call `submit_repro`.

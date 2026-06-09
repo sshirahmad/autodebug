@@ -35,11 +35,32 @@ def repo(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def fake_sandbox():
+    """A MagicMock that mimics the Sandbox API just enough for tests.
+
+    All sandbox methods return successful RunResults so submit_* tools that
+    re-run a script during validation accept the result.
+    """
+    from unittest.mock import MagicMock
+    from autodebug.sandbox import RunResult
+
+    sb = MagicMock()
+    ok = RunResult(exit_code=0, stdout="", stderr="")
+    sb.run_script.return_value = ok
+    sb.exec.return_value = ok
+    sb.git.return_value = ok
+    sb.read_file.return_value = "(fake file)"
+    sb.list_files.return_value = "calc.py"
+    sb.write_file.return_value = ok
+    return sb
+
+
+@pytest.fixture
 def base_state(repo: Path) -> DebugState:
     return DebugState(
         repo_url="https://github.com/fake/repo",
         bug_report="add(1, 2) returns -1 instead of 3",
-        repo_local_path=str(repo),
+        repo_volume="autodebug_test_volume",
     )
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from langchain_core.tools import tool
 
+from autodebug.sandbox import Sandbox
 from autodebug.state import BisectResult
 
 
@@ -48,7 +49,7 @@ def make_submit_result_tool(sha: str, info, result: list, **_):
     return submit_result
 
 
-def make_submit_culprit_tool(repo: str, result: list, **_):
+def make_submit_culprit_tool(sandbox: Sandbox, result: list, **_):
     from autodebug.tools import git_utils as _gu
 
     @tool
@@ -59,7 +60,7 @@ def make_submit_culprit_tool(repo: str, result: list, **_):
             sha: The full or short commit SHA of the culprit commit.
             explanation: Brief explanation of why this commit is the culprit.
         """
-        info = _gu.get_commit_info(repo, sha)
+        info = _gu.get_commit_info(sandbox, sha)
         result.append(BisectResult(
             culprit_commit=info.sha,
             commit_message=info.message,

@@ -1,143 +1,307 @@
-"""Base class for all AutoDebug agents.
+"""Shared infrastructure: budget tracking, middleware, and model factory.
 
-Model selection via environment variables:
-    AUTODEBUG_MODEL          — model ID (default: claude-sonnet-4-6)
-    AUTODEBUG_MODEL_PROVIDER — provider hint passed to init_chat_model
-                               (anthropic | openai | ollama | ...)
-                               Leave unset to let LangChain auto-detect.
-
-OpenRouter example:
-    AUTODEBUG_MODEL=anthropic/claude-3.5-sonnet
-    AUTODEBUG_MODEL_PROVIDER=openai
-    OPENAI_API_KEY=sk-or-v1-...
-    OPENAI_API_BASE=https://openrouter.ai/api/v1
+Each agent is built with LangChain's `create_agent` — see autodebug/agents/{repro,bisect,...}.py.
+The agent's tool-execution loop is handled by create_agent; budgets are enforced
+via the `budget_middleware` (a pair of before_model/after_model hooks).
 """
 
 from __future__ import annotations
 
 import os
 import time
-from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
+from langchain.agents.middleware import (
+    AgentState,
+    ToolCallLimitMiddleware,
+    TodoListMiddleware,
+    SummarizationMiddleware,
+    after_model,
+    before_model,
+)
 from langchain.chat_models import init_chat_model
+from langgraph.runtime import Runtime
 
-load_dotenv()  # load .env from cwd or any parent directory
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+load_dotenv()
 
-_DEFAULT_MODEL    = "claude-sonnet-4-6"
+_DEFAULT_MODEL = "claude-sonnet-4-6"
 _DEFAULT_PROVIDER = "anthropic"
 
 
 class BudgetExceeded(Exception):
-    """Raised when an agent exhausts its time or token budget."""
+    """Raised by budget_middleware when any limit is hit."""
 
 
+@dataclass
 class Budget:
-    """Tracks elapsed time and token spend; raises BudgetExceeded when either limit is hit."""
+    """Time + cost budget. Tokens are counted (so we can compute cost and
+    populate state.total_tokens) but never used as a limit."""
 
-    def __init__(self, time_seconds: int | None, tokens: int | None) -> None:
-        self._deadline = time.monotonic() + time_seconds if time_seconds else None
-        self._token_limit = tokens
-        self._tokens_used = 0
+    time_seconds: int | None = None
+    cost_usd: float | None = None
+    cost_per_1k_input: float = 0.0
+    cost_per_1k_output: float = 0.0
 
-    def add_tokens(self, n: int) -> None:
-        self._tokens_used += n
+    tokens_used: int = field(default=0, init=False)
+    cost_used: float = field(default=0.0, init=False)
+    _start: float = field(default=0.0, init=False, repr=False)
+    _deadline: float | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._start = time.monotonic()
+        self._deadline = (self._start + self.time_seconds) if self.time_seconds else None
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return time.monotonic() - self._start
+
+    def add_tokens(self, input_tokens: int, output_tokens: int = 0) -> float:
+        self.tokens_used += input_tokens + output_tokens
+        cost = (
+            input_tokens * self.cost_per_1k_input / 1000
+            + output_tokens * self.cost_per_1k_output / 1000
+        )
+        self.cost_used += cost
+        return cost
 
     def check(self) -> None:
         if self._deadline and time.monotonic() > self._deadline:
             raise BudgetExceeded(
-                f"Time budget exceeded ({self._tokens_used} tokens used so far)"
+                f"Time budget exceeded ({self.elapsed_seconds:.1f}s > {self.time_seconds}s; "
+                f"{self.tokens_used} tokens, ${self.cost_used:.4f})"
             )
-        if self._token_limit and self._tokens_used > self._token_limit:
+        if self.cost_usd is not None and self.cost_used > self.cost_usd:
             raise BudgetExceeded(
-                f"Token budget exceeded ({self._tokens_used} > {self._token_limit})"
+                f"Cost budget exceeded (${self.cost_used:.4f} > ${self.cost_usd}; "
+                f"{self.elapsed_seconds:.1f}s, {self.tokens_used} tokens)"
             )
 
+    @classmethod
+    def from_config(cls, cfg) -> "Budget":
+        return cls(
+            time_seconds=cfg.time_budget_seconds,
+            cost_usd=cfg.cost_budget_usd,
+            cost_per_1k_input=cfg.cost_per_1k_input_tokens or 0.0,
+            cost_per_1k_output=cfg.cost_per_1k_output_tokens or 0.0,
+        )
 
-def _build_model(
+
+def budget_middleware(budget: Budget) -> list:
+    """Two-piece middleware: check budget before each model call, track tokens after."""
+
+    @before_model
+    def _check_budget(state: AgentState, runtime: Runtime) -> None:
+        budget.check()
+        return None
+
+    @after_model
+    def _track_tokens(state: AgentState, runtime: Runtime) -> None:
+        msg = state["messages"][-1]
+        meta = getattr(msg, "usage_metadata", None) or {}
+        budget.add_tokens(meta.get("input_tokens", 0), meta.get("output_tokens", 0))
+        return None
+
+    return [_check_budget, _track_tokens]
+
+
+def tool_call_limit_middleware(limits: dict[str, int]) -> list:
+    """Cap how many times each named tool can be called in a single agent run.
+
+    When a tool's limit is reached, further calls to that tool are blocked
+    (the model gets a notice) but the agent continues — so it can fall back
+    to a different tool. Force the fix agent to attempt `apply_patch` instead
+    of endlessly re-reading the same files, force bisect to submit after
+    enough exploration, etc.
+    """
+    return [
+        ToolCallLimitMiddleware(
+            tool_name=name, run_limit=limit, exit_behavior="continue",
+        )
+        for name, limit in (limits or {}).items()
+    ]
+
+
+def planning_middleware() -> list:
+    """TodoListMiddleware: a `write_todos` tool so the agent can plan multi-step work.
+
+    The agent maintains a structured task list (plan, mark in-progress, complete),
+    which helps long multi-tool runs (bisect, fix) stay on track instead of looping.
+    """
+    return [TodoListMiddleware()]
+
+
+# Absolute token trigger for summarization. A fractional trigger needs per-model
+# profile metadata (max_input_tokens) that isn't reliably available, so we use an
+# absolute count that fits comfortably under a 200k-context model and still leaves
+# room for the summary + continued work. Override via env if needed.
+_SUMMARIZE_TRIGGER_TOKENS = int(os.getenv("AUTODEBUG_SUMMARIZE_TRIGGER_TOKENS", "120000"))
+_SUMMARIZE_KEEP_MESSAGES = int(os.getenv("AUTODEBUG_SUMMARIZE_KEEP_MESSAGES", "20"))
+
+
+def summarization_middleware(
+    model_id: str | None = None, provider: str | None = None
+) -> list:
+    """SummarizationMiddleware: compress old turns when context grows large.
+
+    Once the running history exceeds the token trigger, older messages are
+    summarized while the most recent turns are kept verbatim (AI/Tool pairs
+    preserved). This keeps long agent runs from blowing the context window — a
+    failure mode behind stalled fix attempts.
+    """
+    model = build_model(model_id=model_id, provider=provider)
+    return [
+        SummarizationMiddleware(
+            model=model,
+            trigger=("tokens", _SUMMARIZE_TRIGGER_TOKENS),
+            keep=("messages", _SUMMARIZE_KEEP_MESSAGES),
+        )
+    ]
+
+
+def require_tool_calls_middleware() -> list:
+    """Reject text-only AI responses and force the model to retry with a tool call.
+
+    Modern reasoning models will happily emit thousands of tokens of analysis
+    text without ever calling a tool — burning budget without making progress.
+    After every model call, if the response has no tool_calls, we append a
+    short corrective message and jump back to the model node so it tries
+    again. The budget middleware naturally bounds the loop.
+    """
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    @after_model(can_jump_to=["model"])
+    def _require_tool(state: AgentState, runtime: Runtime):
+        msg = state["messages"][-1]
+        if not isinstance(msg, AIMessage):
+            return None
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        if tool_calls:
+            return None
+        return {
+            "messages": [
+                HumanMessage(content=(
+                    "Your last response had no tool call. Every response MUST "
+                    "be a tool call. Make a tool call now — do not write text."
+                ))
+            ],
+            "jump_to": "model",
+        }
+
+    return [_require_tool]
+
+
+# Cap how much trajectory we feed the optimizer — long fix runs can be 100+
+# messages and the optimizer sends them all to an LLM. Keep the opening (task
+# framing) plus the most recent turns, where the failure actually shows up.
+_TRAJ_HEAD = 4
+_TRAJ_TAIL = 56
+
+
+def retry_feedback(goal: str) -> str:
+    """Feedback string handed to the optimizer describing why a retry happened."""
+    return (
+        f"The previous attempt FAILED: it exhausted its time/cost budget before "
+        f"{goal}. Study the trajectory for wasted effort — repeated file reads, "
+        f"loops, unproductive tangents, or missing tool calls — and revise the "
+        f"system prompt so the next attempt avoids those failure modes and reaches "
+        f"its submission faster. Preserve the prompt's required tools, output "
+        f"contract, and any STOP/format rules."
+    )
+
+
+def attempt_trajectory(agent, config) -> list:
+    """Recover the message history of an attempt from its checkpointer.
+
+    Works even when the attempt ended by raising BudgetExceeded — the last
+    completed super-step is still persisted to the in-memory checkpoint.
+    """
+    try:
+        return list(agent.get_state(config).values.get("messages", []))
+    except Exception:
+        return []
+
+
+def _trim_trajectory(messages: list) -> list:
+    if len(messages) <= _TRAJ_HEAD + _TRAJ_TAIL:
+        return messages
+    return messages[:_TRAJ_HEAD] + messages[-_TRAJ_TAIL:]
+
+
+def maybe_optimize_prompt(
+    current_prompt: str,
+    messages: list,
+    feedback: str,
+    *,
+    model_id: str | None = None,
+    provider: str | None = None,
+) -> str:
+    """Improve `current_prompt` from a failed attempt's trajectory via LangMem.
+
+    Uses the gradient prompt optimizer: it reflects on the trajectory + feedback
+    and rewrites the prompt to avoid the observed failure mode. Best-effort — any
+    error (missing dep, optimizer failure, empty trajectory) returns the original
+    prompt so the retry loop is never blocked. Disable with AUTODEBUG_PROMPT_OPTIM=0.
+    """
+    if os.getenv("AUTODEBUG_PROMPT_OPTIM", "1") == "0" or not messages:
+        return current_prompt
+    try:
+        from langmem import create_prompt_optimizer
+        from langmem.prompts.types import AnnotatedTrajectory
+
+        model = build_model(model_id=model_id, provider=provider)
+        optimizer = create_prompt_optimizer(model, kind="gradient")
+        trajectory = AnnotatedTrajectory(
+            messages=_trim_trajectory(messages), feedback=feedback
+        )
+        improved = optimizer.invoke(
+            {"trajectories": [trajectory], "prompt": current_prompt}
+        )
+        if isinstance(improved, str) and improved.strip():
+            return improved
+    except Exception:
+        pass
+    return current_prompt
+
+
+def submission_middleware(result: list) -> list:
+    """Stop the agent loop as soon as a submit_* tool populates `result`.
+
+    Without this, the agent keeps making LLM calls (and burning budget) after
+    its final tool answer is already on the result list — verifying its
+    candidate, re-reading code, or re-submitting the same answer. This
+    middleware checks the result list before each model invocation and jumps
+    to the agent's end node when it sees a result.
+    """
+
+    @before_model(can_jump_to=["end"])
+    def _check_submitted(state: AgentState, runtime: Runtime):
+        if result:
+            return {"jump_to": "end"}
+        return None
+
+    return [_check_submitted]
+
+
+def build_model(
     model_id: str | None = None,
     provider: str | None = None,
     temperature: float | None = None,
     base_url: str | None = None,
 ):
+    """Construct a chat model from env vars / explicit overrides.
+
+    OpenRouter example:
+        AUTODEBUG_MODEL=openrouter/owl-alpha
+        AUTODEBUG_MODEL_PROVIDER=openai
+        OPENAI_API_BASE=https://openrouter.ai/api/v1
+    """
     mid = model_id or os.getenv("AUTODEBUG_MODEL", _DEFAULT_MODEL)
     prv = provider or os.getenv("AUTODEBUG_MODEL_PROVIDER", _DEFAULT_PROVIDER)
     kwargs: dict = {}
-    # base_url: explicit arg wins over env var (for OpenRouter / Ollama)
     resolved_base = base_url or os.getenv("OPENAI_API_BASE") or os.getenv("OPENROUTER_BASE_URL")
     if resolved_base and prv == "openai":
         kwargs["base_url"] = resolved_base
     if temperature is not None:
         kwargs["temperature"] = temperature
     return init_chat_model(mid, model_provider=prv, **kwargs)
-
-
-class BaseAgent(ABC):
-    def __init__(
-        self,
-        model_id: str | None = None,
-        provider: str | None = None,
-        temperature: float | None = None,
-        base_url: str | None = None,
-        time_budget_seconds: int | None = None,
-        token_budget: int | None = None,
-        max_retries: int = 0,
-    ):
-        self.llm = _build_model(model_id, provider, temperature, base_url)
-        self._time_budget_seconds = time_budget_seconds
-        self._token_budget = token_budget
-        self._max_retries = max_retries
-
-    def _new_budget(self) -> Budget:
-        return Budget(self._time_budget_seconds, self._token_budget)
-
-    # ------------------------------------------------------------------
-    # Unified chat helper — hides LangChain message types from subclasses
-    # ------------------------------------------------------------------
-
-    def _chat(
-        self,
-        messages: list[BaseMessage],
-        tools: list[dict] | None = None,
-        system: str = "",
-    ) -> AIMessage:
-        model = self.llm.bind_tools(tools) if tools else self.llm
-        all_messages: list[BaseMessage] = (
-            [SystemMessage(content=system)] + messages if system else messages
-        )
-        response = model.invoke(all_messages)
-        assert isinstance(response, AIMessage)
-        return response
-
-    # ------------------------------------------------------------------
-    # Convenience constructors for message types
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def human(content: str) -> HumanMessage:
-        return HumanMessage(content=content)
-
-    @staticmethod
-    def tool_result(tool_call_id: str, content: str) -> ToolMessage:
-        return ToolMessage(content=content, tool_call_id=tool_call_id)
-
-    @staticmethod
-    def invoke_tool(tool_map: dict, tc: dict) -> ToolMessage:
-        name = tc["name"]
-        if name not in tool_map:
-            available = ", ".join(sorted(tool_map))
-            content = f"Error: unknown tool '{name}'. Available tools: {available}"
-        else:
-            content = str(tool_map[name].invoke(tc["args"]))
-        return ToolMessage(content=content, tool_call_id=tc["id"])
-
-    @staticmethod
-    def count_tokens(response: AIMessage) -> int:
-        meta = response.usage_metadata or {}
-        return meta.get("input_tokens", 0) + meta.get("output_tokens", 0)
-
-    @abstractmethod
-    def run(self, state) -> object:
-        """Execute this agent and return updated state."""
-        ...

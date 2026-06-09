@@ -1,183 +1,280 @@
-"""Tests for agent run() loops with a mocked LLM."""
+"""Tests for agent runner functions (run_repro, run_bisect, run_root_cause, run_fix).
 
-import pytest
+We mock `create_agent` so its `.invoke()` either populates the runner's `result`
+list (success path) or raises `BudgetExceeded` (budget path) without ever touching
+a real LLM. We also mock `Sandbox` so the runner's context-manager block returns
+our fake without spinning up a real container.
+"""
+
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
-from autodebug.agents.repro import ReproAgent
-from autodebug.agents.root_cause import RootCauseAgent
-from autodebug.agents.fix import FixAgent
-from autodebug.state import DebugState, PipelineStage
-from tests.conftest import ai_with_tool_call, ai_text
+import pytest
 
-
-def _mock_sandbox(success=False, exit_code=1, stdout="err", stderr=""):
-    sandbox = MagicMock()
-    sandbox.run_script.return_value = MagicMock(
-        success=success, exit_code=exit_code,
-        stdout=stdout, stderr=stderr,
-        output=stderr or stdout,
-    )
-    sandbox.run.return_value = MagicMock(
-        success=True, exit_code=0, stdout="", stderr="", output=""
-    )
-    return sandbox
-
-
-def _tool_builder(sandbox):
-    from autodebug.tools import build_tools
-
-    def build(result, patches=None, **ctx):
-        return build_tools(
-            list(ctx.pop("_names", [])),
-            sandbox=sandbox, result=result,
-            patches=patches or [],
-            **ctx,
-        )
-    return build
+from autodebug.agents.base import BudgetExceeded
+from autodebug.sandbox import RunResult
+from autodebug.state import (
+    DebugState,
+    FixResult,
+    PipelineStage,
+    ReproResult,
+    RootCauseResult,
+)
 
 
 # ---------------------------------------------------------------------------
-# ReproAgent
+# Mocking helpers
 # ---------------------------------------------------------------------------
 
-class TestReproAgent:
-    def _make_agent(self, responses, sandbox):
-        def tool_builder(**ctx):
-            from autodebug.tools import build_tools
-            return build_tools(
-                ["read_file", "list_files", "run_script", "submit_repro"],
-                **ctx,
+class FakeAgent:
+    """Replacement for the CompiledStateGraph returned by create_agent."""
+
+    def __init__(self, on_invoke):
+        self._on_invoke = on_invoke
+
+    def invoke(self, *args, **kwargs):
+        return self._on_invoke()
+
+
+def patch_create_agent(module_path: str, behavior):
+    def fake_create_agent(**kwargs):
+        return FakeAgent(behavior)
+    return patch(f"{module_path}.create_agent", new=fake_create_agent)
+
+
+def _make_fake_sandbox() -> MagicMock:
+    """Sandbox mock that supports the `with` protocol and the methods runners call."""
+    sb = MagicMock()
+    ok = RunResult(exit_code=0, stdout="", stderr="")
+    sb.run_script.return_value = ok
+    sb.exec.return_value = ok
+    sb.git.return_value = ok
+    sb.read_file.return_value = "(fake)"
+    sb.list_files.return_value = ""
+    sb.write_file.return_value = ok
+    # context manager protocol — `with Sandbox(...) as s:` yields the same mock
+    sb.__enter__.return_value = sb
+    sb.__exit__.return_value = None
+    return sb
+
+
+def patch_sandbox(module_path: str, fake: MagicMock):
+    """Patch `Sandbox(volume=...)` to return our fake instance in that module."""
+    return patch(f"{module_path}.Sandbox", return_value=fake)
+
+
+@pytest.fixture
+def capture_result_list(monkeypatch):
+    """Capture the `result` list kwarg as each agent's tools are built."""
+    holder: list = []
+
+    from autodebug.registry import AutoDebugRegistry
+    original = AutoDebugRegistry.build_tools
+
+    def patched(self, agent_name, **ctx):
+        if "result" in ctx:
+            holder.append(ctx["result"])
+        return original(self, agent_name, **ctx)
+
+    monkeypatch.setattr(AutoDebugRegistry, "build_tools", patched)
+    return holder
+
+
+@contextmanager
+def _patched_bisect_helpers():
+    """Mock git_utils calls bisect makes before agent.invoke (unshallow, current_sha, get_commit_info)."""
+    from autodebug.tools.git_utils import CommitInfo
+    info = CommitInfo(sha="deadbeef", short_sha="dead", message="initial",
+                      author="x", date="2024-01-01", diff="")
+    with patch("autodebug.agents.bisect.git_utils.unshallow") as un, \
+         patch("autodebug.agents.bisect.git_utils.current_sha", return_value="deadbeef") as cs, \
+         patch("autodebug.agents.bisect.git_utils.get_commit_info", return_value=info) as ci:
+        yield un, cs, ci
+
+
+# ---------------------------------------------------------------------------
+# run_repro
+# ---------------------------------------------------------------------------
+
+class TestRunRepro:
+    def test_advances_to_bisect_when_result_populated(self, base_state, capture_result_list):
+        def behavior():
+            capture_result_list[0].append(
+                ReproResult(repro_script="x", error_output="boom", confirmed=True)
             )
-        agent = ReproAgent(tool_builder=tool_builder)
-        agent._chat = MagicMock(side_effect=responses)
-        agent.llm = MagicMock()
-        return agent
+        sb = _make_fake_sandbox()
+        with patch_sandbox("autodebug.agents.repro", sb), \
+             patch_create_agent("autodebug.agents.repro", behavior):
+            from autodebug.registry import AutoDebugRegistry
+            from autodebug.agents.repro import run_repro
+            state = run_repro(base_state, registry=AutoDebugRegistry.from_file())
 
-    def test_succeeds_on_first_submit(self, base_state, repo):
-        sandbox = _mock_sandbox(success=False, exit_code=1)
-        response = ai_with_tool_call("submit_repro", {
-            "script": "raise ValueError()",
-            "error_output": "ValueError",
-        })
-        agent = self._make_agent([response], sandbox)
+        assert state.stage == PipelineStage.BISECT
+        assert state.repro is not None
+        assert state.repro.confirmed is True
 
-        with patch("autodebug.agents.repro.Sandbox", return_value=sandbox):
-            result = agent.run(base_state)
+    def test_fails_when_no_result_after_retries(self, base_state, capture_result_list):
+        def behavior():
+            pass
+        sb = _make_fake_sandbox()
+        with patch_sandbox("autodebug.agents.repro", sb), \
+             patch_create_agent("autodebug.agents.repro", behavior):
+            from autodebug.registry import AutoDebugRegistry
+            from autodebug.agents.repro import run_repro
+            state = run_repro(base_state, registry=AutoDebugRegistry.from_file())
 
-        assert result.stage == PipelineStage.BISECT
-        assert result.repro.confirmed is True
-        assert result.total_llm_calls == 1
-        assert result.total_tokens == 150
+        assert state.stage == PipelineStage.FAILED
+        assert "reproduce" in (state.error or "").lower()
 
-    def test_retries_when_script_passes(self, base_state, repo):
-        sandbox = _mock_sandbox(success=True, exit_code=0)
-        bad_submit = ai_with_tool_call("submit_repro", {
-            "script": "print('ok')", "error_output": ""
-        })
-        agent = self._make_agent([bad_submit, ai_text("giving up")], sandbox)
+    def test_fails_when_budget_exceeded_on_every_attempt(self, base_state, capture_result_list):
+        def behavior():
+            raise BudgetExceeded("token budget hit")
+        sb = _make_fake_sandbox()
+        with patch_sandbox("autodebug.agents.repro", sb), \
+             patch_create_agent("autodebug.agents.repro", behavior):
+            from autodebug.registry import AutoDebugRegistry
+            from autodebug.agents.repro import run_repro
+            state = run_repro(base_state, registry=AutoDebugRegistry.from_file())
 
-        with patch("autodebug.agents.repro.Sandbox", return_value=sandbox):
-            result = agent.run(base_state)
-
-        assert result.stage == PipelineStage.FAILED
-        assert result.total_llm_calls == 2
-
-    def test_stops_when_no_tool_calls(self, base_state):
-        sandbox = _mock_sandbox()
-        agent = self._make_agent([ai_text("I give up")], sandbox)
-
-        with patch("autodebug.agents.repro.Sandbox", return_value=sandbox):
-            result = agent.run(base_state)
-
-        assert result.stage == PipelineStage.FAILED
-        assert result.total_llm_calls == 1
+        assert state.stage == PipelineStage.FAILED
+        assert "budget exceeded" in (state.error or "").lower()
 
 
 # ---------------------------------------------------------------------------
-# RootCauseAgent
+# run_root_cause
 # ---------------------------------------------------------------------------
 
-class TestRootCauseAgent:
-    def _make_agent(self, responses, sandbox):
-        def tool_builder(**ctx):
-            from autodebug.tools import build_tools
-            return build_tools(
-                ["read_file", "run_repro_with_traceback", "submit_root_cause"],
-                **ctx,
+class TestRunRootCause:
+    def test_advances_to_fix_when_result_populated(self, bisect_state, capture_result_list):
+        def behavior():
+            capture_result_list[-1].append(
+                RootCauseResult(
+                    summary="op bug",
+                    relevant_lines=["calc.py:2"],
+                    hypothesis="- was used instead of +",
+                )
             )
-        agent = RootCauseAgent(tool_builder=tool_builder)
-        agent._chat = MagicMock(side_effect=responses)
-        agent.llm = MagicMock()
-        return agent
+        sb = _make_fake_sandbox()
+        sb.run_script.return_value = RunResult(exit_code=1, stdout="", stderr="AssertionError")
+        with patch_sandbox("autodebug.agents.root_cause", sb), \
+             patch_create_agent("autodebug.agents.root_cause", behavior):
+            from autodebug.registry import AutoDebugRegistry
+            from autodebug.agents.root_cause import run_root_cause
+            state = run_root_cause(bisect_state, registry=AutoDebugRegistry.from_file())
 
-    def test_submits_root_cause(self, bisect_state):
-        sandbox = _mock_sandbox(success=False, exit_code=1, stdout="", stderr="AssertionError")
-        response = ai_with_tool_call("submit_root_cause", {
-            "summary": "Operator bug",
-            "relevant_lines": ["calc.py:2"],
-            "hypothesis": "- was used instead of +",
-        })
-        agent = self._make_agent([response], sandbox)
-
-        with patch("autodebug.agents.root_cause.Sandbox", return_value=sandbox):
-            result = agent.run(bisect_state)
-
-        assert result.stage == PipelineStage.FIX
-        assert result.root_cause.hypothesis == "- was used instead of +"
-        assert result.total_llm_calls == 1
+        assert state.stage == PipelineStage.FIX
+        assert state.root_cause.hypothesis == "- was used instead of +"
 
 
 # ---------------------------------------------------------------------------
-# FixAgent
+# run_fix
 # ---------------------------------------------------------------------------
 
-class TestFixAgent:
-    def _make_agent(self, responses, sandbox):
-        def tool_builder(**ctx):
-            from autodebug.tools import build_tools
-            return build_tools(
-                ["read_file", "apply_patch", "run_repro", "run_tests", "submit_fix"],
-                **ctx,
-            )
-        agent = FixAgent(tool_builder=tool_builder)
-        agent._chat = MagicMock(side_effect=responses)
-        agent.llm = MagicMock()
-        return agent
+class TestRunFix:
+    def test_advances_to_done_when_result_populated(self, root_cause_state, capture_result_list):
+        def behavior():
+            results = [lst for lst in capture_result_list if isinstance(lst, list)]
+            results[-1].append(FixResult(patch="x", attempts=1, test_output="all passed"))
+        sb = _make_fake_sandbox()
+        with patch_sandbox("autodebug.agents.fix", sb), \
+             patch_create_agent("autodebug.agents.fix", behavior):
+            from autodebug.registry import AutoDebugRegistry
+            from autodebug.agents.fix import run_fix
+            state = run_fix(root_cause_state, registry=AutoDebugRegistry.from_file())
 
-    def test_submits_fix_when_both_pass(self, root_cause_state, repo):
-        sandbox = MagicMock()
-        sandbox.run_script.return_value = MagicMock(
-            success=True, exit_code=0, stdout="", stderr="", output=""
+        assert state.stage == PipelineStage.DONE
+        assert state.fix is not None
+
+
+# ---------------------------------------------------------------------------
+# Budget tracking via middleware (unit-level)
+# ---------------------------------------------------------------------------
+
+class TestBudgetMiddleware:
+    def test_check_raises_when_cost_threshold_exceeded(self):
+        from autodebug.agents.base import Budget, BudgetExceeded
+        b = Budget(time_seconds=None, cost_usd=0.01,
+                   cost_per_1k_input=0.003, cost_per_1k_output=0.015)
+        b.add_tokens(1000, 200)
+        b.check()
+        b.add_tokens(500, 200)
+        with pytest.raises(BudgetExceeded, match="Cost budget"):
+            b.check()
+
+    def test_cost_tracking(self):
+        from autodebug.agents.base import Budget
+        b = Budget(cost_per_1k_input=0.003, cost_per_1k_output=0.015)
+        cost = b.add_tokens(1000, 500)
+        assert abs(cost - 0.0105) < 1e-9
+        assert abs(b.cost_used - 0.0105) < 1e-9
+
+    def test_middleware_returns_pair(self):
+        from autodebug.agents.base import Budget, budget_middleware
+        mw = budget_middleware(Budget())
+        assert len(mw) == 2
+
+
+class TestSubmissionMiddleware:
+    def test_jumps_to_end_when_result_populated(self):
+        from autodebug.agents.base import submission_middleware
+        result = ["submitted"]
+        mw = submission_middleware(result)
+        assert len(mw) == 1
+        # Call the underlying hook function directly (decorated as before_model)
+        out = mw[0].before_model(state={"messages": []}, runtime=None)
+        assert out == {"jump_to": "end"}
+
+    def test_returns_none_when_result_empty(self):
+        from autodebug.agents.base import submission_middleware
+        result: list = []
+        mw = submission_middleware(result)
+        out = mw[0].before_model(state={"messages": []}, runtime=None)
+        assert out is None
+
+    def test_combined_with_budget_middleware(self):
+        from autodebug.agents.base import Budget, budget_middleware, submission_middleware
+        budget = Budget()
+        combined = budget_middleware(budget) + submission_middleware([])
+        assert len(combined) == 3  # check_budget + track_tokens + check_submitted
+
+
+class TestRequireToolCallsMiddleware:
+    def test_jumps_back_to_model_when_no_tool_calls(self):
+        from langchain_core.messages import AIMessage
+        from autodebug.agents.base import require_tool_calls_middleware
+
+        mw = require_tool_calls_middleware()
+        assert len(mw) == 1
+
+        ai_msg = AIMessage(content="Some analysis text", tool_calls=[])
+        out = mw[0].after_model(
+            state={"messages": [ai_msg]}, runtime=None,
         )
-        sandbox.run.return_value = MagicMock(
-            success=True, exit_code=0, stdout="", stderr="", output=""
+        assert out is not None
+        assert out["jump_to"] == "model"
+        appended = out["messages"][0]
+        assert "tool call" in appended.content.lower()
+
+    def test_passes_through_when_tool_calls_present(self):
+        from langchain_core.messages import AIMessage
+        from autodebug.agents.base import require_tool_calls_middleware
+
+        mw = require_tool_calls_middleware()
+        ai_msg = AIMessage(
+            content="",
+            tool_calls=[{"name": "read_file", "args": {"path": "x"}, "id": "1", "type": "tool_call"}],
         )
-
-        response = ai_with_tool_call("submit_fix", {"summary": "Changed - to +"})
-        agent = self._make_agent([response], sandbox)
-
-        with patch("autodebug.agents.fix.Sandbox", return_value=sandbox):
-            result = agent.run(root_cause_state)
-
-        assert result.stage == PipelineStage.DONE
-        assert result.fix is not None
-
-    def test_cannot_submit_when_repro_still_fails(self, root_cause_state, repo):
-        sandbox = MagicMock()
-        sandbox.run_script.return_value = MagicMock(
-            success=False, exit_code=1, stdout="", stderr="still failing", output="still failing"
+        out = mw[0].after_model(
+            state={"messages": [ai_msg]}, runtime=None,
         )
-        sandbox.run.return_value = MagicMock(
-            success=True, exit_code=0, stdout="", stderr="", output=""
+        assert out is None
+
+    def test_passes_through_when_last_message_is_not_ai(self):
+        from langchain_core.messages import HumanMessage
+        from autodebug.agents.base import require_tool_calls_middleware
+
+        mw = require_tool_calls_middleware()
+        out = mw[0].after_model(
+            state={"messages": [HumanMessage(content="hi")]}, runtime=None,
         )
-
-        responses = [
-            ai_with_tool_call("submit_fix", {"summary": "attempted fix"}),
-            ai_text("giving up"),
-        ]
-        agent = self._make_agent(responses, sandbox)
-
-        with patch("autodebug.agents.fix.Sandbox", return_value=sandbox):
-            result = agent.run(root_cause_state)
-
-        assert result.stage == PipelineStage.FAILED
+        assert out is None

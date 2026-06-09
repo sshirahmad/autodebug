@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from datetime import datetime
@@ -23,12 +24,35 @@ STATUS_MID = "[~]"
 STATUS_ERR = "[x]"
 
 
+_DIFF_FILE_RE = re.compile(r"^diff --git a/(\S+) b/\S+", re.MULTILINE)
+
+
+def _files_in_diff(diff: str) -> set[str]:
+    """Return the set of paths a unified diff touches."""
+    return set(_DIFF_FILE_RE.findall(diff or ""))
+
+
 def bisect_correct(state, instance: dict) -> bool:
+    """Bisect is correct if either:
+      1. The submitted SHA matches `buggy_commit_id` (BugsInPy's `fixed_commit~1`), OR
+      2. The submitted commit's diff touches at least one file the fix patch touches.
+
+    Rule 2 accepts the more useful answer "the commit that introduced the buggy
+    code" — which is what our bisect prompt actually asks for — instead of only
+    BugsInPy's checkout-reference SHA, which is often a completely unrelated
+    commit that happened to land just before the fix PR.
+    """
     if state.bisect is None:
         return False
+
     truth = instance.get("buggy_commit_id", "")
     found = state.bisect.culprit_commit
-    return bool(truth and (found.startswith(truth) or truth.startswith(found)))
+    if truth and (found.startswith(truth) or truth.startswith(found)):
+        return True
+
+    fix_files = _files_in_diff(instance.get("ground_truth_patch", ""))
+    culprit_files = _files_in_diff(state.bisect.commit_diff or "")
+    return bool(fix_files and culprit_files and (fix_files & culprit_files))
 
 
 def fix_correct(state, instance: dict) -> bool:
@@ -42,7 +66,10 @@ def run_on_instance(instance: dict) -> dict:
             repo_url=instance["repo_url"],
             bug_report=instance["bug_report"],
             pre_fix_commit=instance.get("pre_fix_commit"),
+            fixed_commit_id=instance.get("fixed_commit_id"),
             known_good_commit=instance.get("known_good_commit"),
+            test_file=instance.get("test_file"),
+            test_command=instance.get("test_command"),
         )
         return {
             "instance_id": instance["id"],
@@ -52,6 +79,7 @@ def run_on_instance(instance: dict) -> dict:
             "fix_success": fix_correct(state, instance),
             "stage_reached": state.stage,
             "total_tokens": state.total_tokens,
+            "total_cost": round(state.total_cost, 4),
             "llm_calls": state.total_llm_calls,
             "wall_seconds": round(time.time() - start, 1),
             "error": state.error,
@@ -79,6 +107,7 @@ def compute_metrics(results: list[dict]) -> dict[str, Any]:
         "bisect_accuracy": sum(r["bisect_correct"] for r in results) / n,
         "fix_rate": sum(r["fix_success"] for r in results) / n,
         "avg_tokens": sum(r.get("total_tokens", 0) for r in results) / n,
+        "avg_cost_usd": sum(r.get("total_cost", 0) for r in results) / n,
         "avg_wall_seconds": sum(r.get("wall_seconds", 0) for r in results) / n,
     }
 

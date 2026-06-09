@@ -1,7 +1,15 @@
 {
   "system_prompt": "config/prompts/repro.yaml",
   "tools": ["search_memory", "read_file", "list_files", "run_script", "submit_repro"],
-  "time_budget_seconds": 180,
-  "token_budget": 50000,
-  "max_retries": 2
+  "time_budget_seconds": 1800,
+  "cost_budget_usd": 2.00,
+  "cost_per_1k_input_tokens": 0.003,
+  "cost_per_1k_output_tokens": 0.015,
+  "max_retries": 2,
+  "tool_call_limits": {
+    "read_file": 10,
+    "list_files": 5,
+    "run_script": 20,
+    "search_memory": 2
+  }
 }
