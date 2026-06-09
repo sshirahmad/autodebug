@@ -1,4 +1,9 @@
-import urllib.request, json
+import sys, urllib.request, json
+
+# Reconfigure stdout to use UTF-8 so non-ASCII characters in trace content
+# (commit messages, file content, etc.) don't crash the print stream.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 url = 'http://localhost:6006/graphql'
 
@@ -11,7 +16,7 @@ def gql(query, variables=None):
         data=json.dumps(body).encode(),
         headers={'Content-Type': 'application/json'},
     )
-    resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
+    resp = json.loads(urllib.request.urlopen(req, timeout=90).read())
     if resp.get('errors'):
         raise RuntimeError(resp['errors'])
     return resp['data']
@@ -35,7 +40,7 @@ data = gql('''
           input  { value }
           output { value }
           events { name message }
-          descendants(first: 500) {
+          descendants(first: 20000) {
             edges {
               node {
                 name

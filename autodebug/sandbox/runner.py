@@ -29,6 +29,13 @@ from docker.errors import ImageNotFound, NotFound
 
 REPO_DIR = "/workspace/repo"
 
+# Source roots prepended to PYTHONPATH so the checked-out repo shadows any
+# same-named distribution pre-installed in site-packages (the sandbox image
+# pip-installs many benchmark subjects — ansible, django, flask, etc.). Covers
+# flat (repo root), src-layout, and lib-layout (ansible) projects.
+_SRC_ROOTS = (REPO_DIR, f"{REPO_DIR}/src", f"{REPO_DIR}/lib")
+_PYTHONPATH = ":".join(_SRC_ROOTS)
+
 
 @dataclass
 class RunResult:
@@ -116,6 +123,7 @@ class Sandbox:
             cmd=["bash", "-c", command],
             workdir=workdir or REPO_DIR,
             demux=True,
+            environment={"PYTHONPATH": _PYTHONPATH},
         )
         stdout_bytes, stderr_bytes = (
             result.output if isinstance(result.output, tuple) else (result.output, b"")
@@ -215,13 +223,53 @@ def remove_repo_volume(name: str) -> None:
         pass
 
 
-def clone_into_volume(volume: str, repo_url: str, ref: str | None) -> None:
-    """One-shot container that clones repo_url into /workspace/repo on the volume."""
+_TEST_PATHSPECS = ("test/", "tests/", "*/test/", "*/tests/", "test_*", "*_test.py")
+
+
+def clone_into_volume(
+    volume: str,
+    repo_url: str,
+    ref: str | None,
+    *,
+    test_patch: str | None = None,
+    fixed_commit: str | None = None,
+) -> None:
+    """One-shot container that clones repo_url into /workspace/repo on the volume.
+
+    Two ways to sync the test files into a self-consistent state at the
+    checkout point:
+      - `test_patch`: explicit unified diff (e.g. from SWE-Bench's
+        pre-split format) applied via `git apply`.
+      - `fixed_commit`: the SHA where the fix landed. The diff between
+        the checkout point (`ref`) and `fixed_commit`, restricted to test
+        paths, is computed inside the container and applied. Use this for
+        benchmarks like BugsInPy where bug_patch.txt only contains the
+        source fix and the new tests live in the fix commit itself.
+
+    If both are supplied, `test_patch` wins.
+    """
+    import base64
+
     client = docker.from_env()
     image = os.getenv("SANDBOX_IMAGE", "autodebug-sandbox:latest")
     cmd = f"git clone {shlex.quote(repo_url)} {shlex.quote(REPO_DIR)}"
     if ref:
         cmd += f" && cd {shlex.quote(REPO_DIR)} && git checkout {shlex.quote(ref)}"
+
+    if test_patch:
+        encoded = base64.b64encode(test_patch.encode("utf-8")).decode("ascii")
+        cmd += (
+            f" && cd {shlex.quote(REPO_DIR)} && "
+            f"echo {encoded} | base64 -d | git apply --whitespace=nowarn -"
+        )
+    elif fixed_commit:
+        pathspecs = " ".join(shlex.quote(p) for p in _TEST_PATHSPECS)
+        cmd += (
+            f" && cd {shlex.quote(REPO_DIR)} && "
+            f"git diff HEAD {shlex.quote(fixed_commit)} -- {pathspecs} "
+            f"| git apply --whitespace=nowarn - || true"
+        )
+
     client.containers.run(
         image=image,
         command=["bash", "-c", cmd],
