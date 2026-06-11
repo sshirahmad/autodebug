@@ -10,9 +10,9 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from autodebug.agents.base import (
     Budget, BudgetExceeded, attempt_trajectory, build_model, budget_middleware,
-    maybe_optimize_prompt, planning_middleware, require_tool_calls_middleware,
-    retry_feedback, submission_middleware, summarization_middleware,
-    tool_call_limit_middleware,
+    maybe_optimize_prompt, model_retry_middleware, planning_middleware,
+    require_tool_calls_middleware, retry_feedback, submission_middleware,
+    summarization_middleware, tool_call_limit_middleware,
 )
 from autodebug.sandbox import Sandbox
 from autodebug.state import DebugState, PipelineStage
@@ -24,33 +24,36 @@ def run_repro(state: DebugState, *, registry) -> DebugState:
     cfg = registry.get_config("repro")
     result: list = []
 
-    test_cmd_hint = (
-        f"\nKnown failing test (run this first to see the failure):\n"
-        f"  `{state.test_command}`\n"
-        if state.test_command else ""
-    )
-    initial_text = (
-        f"Bug report:\n\n{state.bug_report}\n"
-        f"{test_cmd_hint}\n"
-        + (
-            "Start by running the failing test above to observe the error output, "
-            "then write a minimal Python script that reproduces the same failure.\n"
-            if state.test_command else
-            "Please reproduce this bug.\n"
+    # Refine rather than regenerate: if a reproduction already exists, we're being
+    # re-invoked (the manager looped back from a failed fix). Hand the agent the
+    # prior script so it corrects it instead of inventing a different one each time.
+    refine_note = ""
+    if state.repro is not None:
+        refine_note = (
+            "\nNOTE: a previous reproduction was confirmed but the downstream fix "
+            "could not be verified against it — it may be imprecise or target the "
+            "wrong failure. Previous reproduction:\n"
+            f"```python\n{state.repro.repro_script}\n```\n"
+            f"Previous observed failure:\n{state.repro.error_output[:1000]}\n"
+            "Refine THIS reproduction so it precisely targets the bug described "
+            "above; do not start from an unrelated angle.\n"
         )
+    initial_text = (
+        f"Bug report:\n\n{state.bug_report}\n\n"
+        f"{refine_note}"
+        "Reproduce this bug: explore the repository, then write a minimal Python "
+        "script that triggers the failure described above and confirm it fails.\n"
     )
 
     system_prompt = registry.system_prompt("repro")
     llm = build_model(model_id=cfg.model, provider=cfg.provider)
 
     crashed = False
+    run_error: str | None = None
     with Sandbox(volume=state.repo_volume) as sandbox:
         for attempt in range(cfg.max_retries + 1):
             budget = Budget.from_config(cfg)
-            tools = registry.build_tools(
-                "repro", sandbox=sandbox, result=result,
-                test_command=state.test_command or "",
-            )
+            tools = registry.build_tools("repro", sandbox=sandbox, result=result)
             saver = InMemorySaver()
             agent = create_agent(
                 model=llm,
@@ -59,6 +62,7 @@ def run_repro(state: DebugState, *, registry) -> DebugState:
                 checkpointer=saver,
                 middleware=(
                     budget_middleware(budget)
+                    + model_retry_middleware()
                     + planning_middleware()
                     + summarization_middleware(cfg.model, cfg.provider)
                     + submission_middleware(result)
@@ -79,9 +83,13 @@ def run_repro(state: DebugState, *, registry) -> DebugState:
                 )
             except BudgetExceeded:
                 crashed = True
+            except Exception as exc:  # noqa: BLE001 — degrade, don't abort the pipeline
+                crashed = True
+                run_error = f"{type(exc).__name__}: {str(exc)[:300]}"
 
             state.total_tokens += budget.tokens_used
             state.total_cost += budget.cost_used
+            state.total_llm_calls += budget.calls
 
             # Accept a submission even if the attempt later crashed.
             if result:
@@ -102,7 +110,8 @@ def run_repro(state: DebugState, *, registry) -> DebugState:
 
     state.stage = PipelineStage.FAILED
     state.error = (
-        "ReproAgent: budget exceeded with no submission"
-        if crashed else "ReproAgent: failed to reproduce the bug"
+        f"ReproAgent: {run_error}" if run_error else
+        "ReproAgent: budget exceeded with no submission" if crashed else
+        "ReproAgent: failed to reproduce the bug"
     )
     return state

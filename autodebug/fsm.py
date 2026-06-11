@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
-from langchain.agents.middleware import dynamic_prompt, wrap_model_call
+from langchain.agents.middleware import dynamic_prompt, wrap_model_call, wrap_tool_call
 
 
 class ManagerPhase(str, Enum):
@@ -97,17 +97,32 @@ def select_prompt(fsm: FSM, prompts: dict, progress_fn=None) -> str:
 _ALWAYS_ALLOWED: frozenset[str] = frozenset({"write_todos"})
 
 
+def allowed_tool_names(fsm: FSM, allowed: dict) -> set | None:
+    """The set of tool names permitted in the current phase (incl. always-allowed),
+    or None when the phase imposes no restriction."""
+    names = allowed.get(fsm.phase)
+    if names is None:
+        return None
+    return set(names) | _ALWAYS_ALLOWED
+
+
 def filter_tools(fsm: FSM, tools: list, allowed: dict) -> list:
     """Return only the tools whose name is allowed in the current phase.
 
     A phase missing from `allowed` (or mapped to None) leaves the list as-is.
     Infrastructure tools in `_ALWAYS_ALLOWED` are kept regardless of phase.
     """
-    names = allowed.get(fsm.phase)
+    names = allowed_tool_names(fsm, allowed)
     if names is None:
         return tools
-    names = set(names) | _ALWAYS_ALLOWED
     return [t for t in tools if getattr(t, "name", None) in names]
+
+
+def _tool_call_field(tool_call, key: str):
+    """Read a field from a tool_call that may be a dict or an object."""
+    if isinstance(tool_call, dict):
+        return tool_call.get(key)
+    return getattr(tool_call, key, None)
 
 
 # ----------------------------------------------------------------------
@@ -143,3 +158,38 @@ def fsm_tool_gate(fsm: FSM, allowed: dict):
         return handler(request)
 
     return _gate
+
+
+def fsm_tool_enforce(fsm: FSM, allowed: dict):
+    """`wrap_tool_call` middleware: *enforce* the phase gate at execution time.
+
+    `fsm_tool_gate` only controls which tools are advertised to the model — the
+    agent's tool node is still built with the full toolset, so a tool call that
+    slips through (hallucinated name, cached history, parallel calls) would still
+    run. This hook intercepts every tool execution and, if the tool isn't allowed
+    in the current phase, short-circuits with an error ToolMessage instead of
+    running it. The model receives that as the tool's result and retries with a
+    permitted tool — and because we return a real ToolMessage, the conversation
+    stays valid (no dangling tool_use).
+    """
+    from langchain_core.messages import ToolMessage
+
+    @wrap_tool_call
+    def _enforce(request, handler):
+        names = allowed_tool_names(fsm, allowed)
+        if names is not None:
+            tool_name = _tool_call_field(request.tool_call, "name")
+            if tool_name not in names:
+                return ToolMessage(
+                    content=(
+                        f"Tool '{tool_name}' is not available in phase "
+                        f"'{fsm.phase}'. Allowed now: {sorted(names)}. "
+                        f"Call one of those instead."
+                    ),
+                    tool_call_id=_tool_call_field(request.tool_call, "id"),
+                    name=tool_name,
+                    status="error",
+                )
+        return handler(request)
+
+    return _enforce

@@ -10,9 +10,13 @@ from autodebug.tools import git_utils
 
 
 def make_read_file_at_parent_tool(sandbox: Sandbox, parent_sha: str, **_):
-    @tool
+    @tool(parse_docstring=True)
     def read_file_at_parent(path: str) -> str:
-        """Read a file as it was BEFORE the culprit commit (to compare)."""
+        """Read a file as it was BEFORE the culprit commit (to compare).
+
+        Args:
+            path: Relative path from the repo root to read at the parent commit.
+        """
         content = git_utils.get_file_at_commit(sandbox, parent_sha, path)
         return content or f"File not found at parent commit: {path}"
     return read_file_at_parent
@@ -36,15 +40,15 @@ def make_run_repro_with_traceback_tool(sandbox: Sandbox, repro_script: str, **_)
 
 
 def make_submit_root_cause_tool(result: list, **_):
-    @tool
+    @tool(parse_docstring=True)
     def submit_root_cause(summary: str, relevant_lines: str | list[str], hypothesis: str) -> str:
         """Submit the root cause analysis.
 
         Args:
             summary: One-paragraph description of the root cause.
-            relevant_lines: List of relevant file:line references, e.g.
-                ["lib/foo/bar.py:42", "lib/foo/bar.py:55"]. May also be
-                passed as a newline-separated string.
+            relevant_lines: The responsible code locations as path-then-line
+                references (for example lib/foo/bar.py line 42). Pass a list of
+                such strings, or a single newline-separated string.
             hypothesis: Explanation of why the change caused the bug.
         """
         if isinstance(relevant_lines, str):

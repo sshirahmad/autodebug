@@ -11,9 +11,9 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from autodebug.agents.base import (
     Budget, BudgetExceeded, attempt_trajectory, build_model, budget_middleware,
-    maybe_optimize_prompt, planning_middleware, require_tool_calls_middleware,
-    retry_feedback, submission_middleware, summarization_middleware,
-    tool_call_limit_middleware,
+    maybe_optimize_prompt, model_retry_middleware, planning_middleware,
+    require_tool_calls_middleware, retry_feedback, submission_middleware,
+    summarization_middleware, tool_call_limit_middleware,
 )
 from autodebug.sandbox import Sandbox
 from autodebug.state import DebugState, PipelineStage
@@ -30,10 +30,6 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
     patches: list[dict] = []
     result: list = []
 
-    test_cmd_note = (
-        f"\nTest command to verify fix: `{state.test_command}`\n"
-        if state.test_command else ""
-    )
     initial_text = (
         f"Root cause:\n{state.root_cause.hypothesis}\n\n"
         f"{state.root_cause.summary}\n\n"
@@ -43,8 +39,7 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
           f"after your fix; read it carefully to see what the fix must produce):\n"
           f"```python\n{state.repro.repro_script}\n```\n"
         + f"\nCulprit commit diff:\n```diff\n{state.bisect.commit_diff}\n```\n"
-        + test_cmd_note
-        + "\nPlease fix this bug."
+        + "\nPlease fix this bug by patching the source so the reproduction passes."
     )
 
     model_id = cfg.model or os.getenv("AUTODEBUG_FIX_MODEL")
@@ -53,6 +48,7 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
     llm = build_model(model_id=model_id, provider=provider)
 
     crashed = False
+    run_error: str | None = None
     with Sandbox(volume=state.repo_volume) as sandbox:
         for attempt in range(cfg.max_retries + 1):
             budget = Budget.from_config(cfg)
@@ -60,7 +56,6 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
                 "fix",
                 sandbox=sandbox,
                 repro_script=state.repro.repro_script,
-                test_command=state.test_command or "",
                 patches=patches,
                 result=result,
             )
@@ -72,6 +67,7 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
                 checkpointer=saver,
                 middleware=(
                     budget_middleware(budget)
+                    + model_retry_middleware()
                     + planning_middleware()
                     + summarization_middleware(model_id, provider)
                     + submission_middleware(result)
@@ -92,9 +88,13 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
                 )
             except BudgetExceeded:
                 crashed = True
+            except Exception as exc:  # noqa: BLE001 — degrade, don't abort the pipeline
+                crashed = True
+                run_error = f"{type(exc).__name__}: {str(exc)[:300]}"
 
             state.total_tokens += budget.tokens_used
             state.total_cost += budget.cost_used
+            state.total_llm_calls += budget.calls
 
             if result:
                 state.fix = result[0]
@@ -114,7 +114,8 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
 
     state.stage = PipelineStage.FAILED
     state.error = (
-        "FixAgent: budget exceeded with no submission"
-        if crashed else "FixAgent: could not produce a valid fix"
+        f"FixAgent: {run_error}" if run_error else
+        "FixAgent: budget exceeded with no submission" if crashed else
+        "FixAgent: could not produce a valid fix"
     )
     return state

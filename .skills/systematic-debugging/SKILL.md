@@ -11,6 +11,11 @@ description: Four-phase debugging process for the fix and root_cause agents. Iro
 
 Symptom fixes create whack-a-mole. Find the root cause, then fix it.
 
+**And anchor on the bug report.** The root cause must explain the *reported*
+symptom. An error you see in the sandbox that the report doesn't mention —
+especially `ModuleNotFoundError`/`ImportError`/"package not installed" — is
+almost always an environment artifact, not the bug. Don't chase it.
+
 ---
 
 ## AutoDebug Context
@@ -54,7 +59,16 @@ Now connect it to the diff:
 - The diff removed the `version=None` default from line 312 → **that's the root cause**
 - The test at line 89 calls with no version → **that's what triggers it**
 
-The root cause is always **the diff-introduced change that started the failure chain**.
+The root cause is **usually** the diff-introduced change that started the failure
+chain — but not always. Two important exceptions:
+
+- **Missing behavior.** The defect is the *absence* of handling (no `try/except`,
+  no fallback, no edge-case guard). The culprit may have only *exposed* it. A
+  valid root cause is "the code doesn't handle `<condition from the report>`; it
+  should `<do Y>`" — the responsible line is where the guard is missing, not
+  necessarily a line the diff changed.
+- **Misidentified culprit.** Bisect can land on a neighbour. If the reported
+  symptom doesn't trace to the culprit's diff, say so and find the real site.
 
 ---
 
@@ -86,6 +100,9 @@ Stop and re-analyze if:
 - You're guessing what the root cause is instead of reading the diff.
 - Each fix reveals a new problem elsewhere — you're fixing the wrong layer.
 - You've tried 3+ fixes and none worked — wrong mental model, start over.
+- **Your candidate cause is a `ModuleNotFoundError`/import error the bug report
+  never mentions** — you're chasing a sandbox artifact, not the bug. Re-anchor
+  on the reported symptom and confirm the real code path runs.
 
 ---
 
@@ -97,7 +114,8 @@ Stop and re-analyze if:
 | `AttributeError: no attribute 'X'` | Rename, move, or deletion of attribute |
 | `KeyError` in registry/dict | Import side effect removed, registration missing |
 | `TypeError: 'X' is not iterable` | Return type changed |
-| `ImportError` / `ModuleNotFoundError` | Module reorganization in the diff |
+| `ImportError` / `ModuleNotFoundError` in the sandbox | **Usually an environment artifact (missing dependency), NOT the bug** — unless the report is about imports. Only blame the diff if it actually reorganized modules. |
+| Unhandled `OSError`/`IOError`/network error the report says should degrade gracefully | Missing `try/except` + fallback (the root cause is the absent guard) |
 | Test passes but wrong value | Logic branch changed, edge case not covered |
 | Works in isolation, fails in suite | State pollution, global modified in culprit |
 
@@ -106,8 +124,13 @@ Stop and re-analyze if:
 ## Output Checklist
 
 Before submitting root cause:
+- [ ] My hypothesis explains the symptom in the BUG REPORT (not just any repro error)
+- [ ] It is not blaming a sandbox/import artifact the report never mentions
 - [ ] I read the culprit diff completely
-- [ ] I can name the exact file and line where the contract broke
-- [ ] I can trace the path from the diff change to the traceback error
+- [ ] I can name the exact file and line responsible (a changed line, or the missing guard)
+- [ ] I can trace the path from that line to the reported failure
 - [ ] I verified by running the repro that the error matches my theory (root_cause agent: use `run_repro_with_traceback`; fix agent: use `run_repro`)
 - [ ] My hypothesis is one specific, falsifiable sentence
+
+When you learn a durable technique or hit a pattern these notes miss, record it
+with `update_skill` so the next run starts smarter.

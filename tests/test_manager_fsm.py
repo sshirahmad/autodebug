@@ -18,7 +18,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from autodebug.fsm import (  # noqa: E402
-    FSM, MANAGER_ALLOWED_TOOLS, ManagerPhase, filter_tools, select_prompt,
+    FSM, MANAGER_ALLOWED_TOOLS, ManagerPhase, allowed_tool_names, filter_tools,
+    fsm_tool_enforce, select_prompt,
 )
 from autodebug.state import DebugState, ReproResult, BisectResult, RootCauseResult, FixResult  # noqa: E402
 
@@ -92,6 +93,50 @@ class TestToolGate:
         }
         for names in MANAGER_ALLOWED_TOOLS.values():
             assert set(names) <= real
+
+
+class TestToolEnforcement:
+    """The wrap_tool_call guard blocks out-of-phase tools at EXECUTION time —
+    the model-side gate only controls what's advertised, not what runs."""
+
+    def _run(self, fsm, name):
+        from types import SimpleNamespace
+        from langchain_core.messages import ToolMessage
+
+        mw = fsm_tool_enforce(fsm, MANAGER_ALLOWED_TOOLS)
+        ran = {"n": 0}
+
+        def handler(req):
+            ran["n"] += 1
+            return ToolMessage(content="EXECUTED", tool_call_id=req.tool_call["id"],
+                               name=req.tool_call["name"])
+
+        req = SimpleNamespace(tool_call={"name": name, "id": "x"}, tool=None,
+                              state={}, runtime=None)
+        return mw.wrap_tool_call(req, handler), ran["n"]
+
+    def test_blocks_disallowed_tool_without_running_it(self):
+        msg, ran = self._run(FSM(), "run_fix_agent")  # init -> fix not allowed
+        assert msg.status == "error" and ran == 0
+        assert "not available in phase" in msg.content
+
+    def test_allows_permitted_tool(self):
+        msg, ran = self._run(FSM(), "run_repro_agent")  # init -> repro allowed
+        assert msg.content == "EXECUTED" and ran == 1
+
+    def test_always_allows_write_todos(self):
+        msg, ran = self._run(FSM(), "write_todos")
+        assert msg.content == "EXECUTED" and ran == 1
+
+    def test_permission_tracks_phase(self):
+        msg, ran = self._run(FSM(phase=ManagerPhase.ANALYZED), "run_fix_agent")
+        assert msg.content == "EXECUTED" and ran == 1
+
+    def test_allowed_tool_names_matches_gate(self):
+        fsm = FSM(phase=ManagerPhase.ANALYZED)
+        assert allowed_tool_names(fsm, MANAGER_ALLOWED_TOOLS) == {
+            "run_fix_agent", "run_root_cause_agent", "write_todos",
+        }
 
 
 class TestPromptSelection:
@@ -208,6 +253,21 @@ class TestManagerTools:
         tool = m.make_run_repro_agent_tool(state=state, registry=None, fsm=fsm)
         tool.invoke({})
         assert fsm.phase == ManagerPhase.REVISING
+
+    def test_subagent_crash_returns_signal_not_exception(self, fake_agents, state):
+        """A sub-agent raising (e.g. a transient provider error) must not abort the
+        manager — the tool catches it and returns a retryable failure signal."""
+        m = _import_manager_tools()
+        fsm = FSM()
+
+        def boom(s, *, registry=None):
+            raise RuntimeError("provider returned error 400")
+
+        fake_agents.run_repro = boom
+        tool = m.make_run_repro_agent_tool(state=state, registry=None, fsm=fsm)
+        out = tool.invoke({})  # must not raise
+        assert "crashed" in out.lower() and "provider returned error 400" in out
+        assert fsm.phase == ManagerPhase.INIT  # phase unchanged — manager can retry
 
     def test_finish_success_and_failure(self, fake_agents, state):
         m = _import_manager_tools()

@@ -10,7 +10,7 @@ _SKILLS_ROOT = Path(__file__).resolve().parents[2] / ".skills"
 
 
 def make_load_skill_tool(**_):
-    @tool
+    @tool(parse_docstring=True)
     def load_skill(name: str) -> str:
         """Load a skill's full documentation by name.
 
@@ -35,7 +35,7 @@ def make_load_skill_tool(**_):
 
 
 def make_update_skill_tool(agent_name: str = "", **_):
-    @tool
+    @tool(parse_docstring=True)
     def update_skill(name: str, content: str, mode: str = "append") -> str:
         """Persist a new or updated skill to .skills/<name>/SKILL.md.
 

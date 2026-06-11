@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 from langchain.agents.middleware import (
     AgentState,
+    ModelRetryMiddleware,
     ToolCallLimitMiddleware,
     TodoListMiddleware,
     SummarizationMiddleware,
@@ -45,6 +46,7 @@ class Budget:
 
     tokens_used: int = field(default=0, init=False)
     cost_used: float = field(default=0.0, init=False)
+    calls: int = field(default=0, init=False)  # number of model calls made
     _start: float = field(default=0.0, init=False, repr=False)
     _deadline: float | None = field(default=None, init=False, repr=False)
 
@@ -97,12 +99,42 @@ def budget_middleware(budget: Budget) -> list:
 
     @after_model
     def _track_tokens(state: AgentState, runtime: Runtime) -> None:
+        budget.calls += 1
         msg = state["messages"][-1]
         meta = getattr(msg, "usage_metadata", None) or {}
         budget.add_tokens(meta.get("input_tokens", 0), meta.get("output_tokens", 0))
         return None
 
     return [_check_budget, _track_tokens]
+
+
+def session_budget_middleware(state, max_cost: float | None, max_seconds: int | None) -> list:
+    """Global ceiling across an orchestrated session (manager + all sub-agents).
+
+    Per-agent budgets only bound a single sub-agent run; a manager that loops
+    through REVISING can rack up many full sub-agent runs (black-1 hit ~$31).
+    This before_model hook runs on each *manager* turn and inspects the cumulative
+    `state.total_cost` (sub-agent costs are added to it as each sub-agent finishes)
+    plus wall-clock time, raising BudgetExceeded once either ceiling is crossed —
+    which stops the manager from delegating further.
+    """
+    start = time.monotonic()
+
+    # NB: the hook arg is the agent's graph state — deliberately *not* named
+    # `state` so it doesn't shadow the captured DebugState we're measuring.
+    @before_model
+    def _check_session(_graph_state: AgentState, runtime: Runtime) -> None:
+        if max_cost is not None and state.total_cost > max_cost:
+            raise BudgetExceeded(
+                f"Session cost budget exceeded (${state.total_cost:.4f} > ${max_cost})"
+            )
+        if max_seconds is not None and (time.monotonic() - start) > max_seconds:
+            raise BudgetExceeded(
+                f"Session time budget exceeded ({time.monotonic() - start:.0f}s > {max_seconds}s)"
+            )
+        return None
+
+    return [_check_session]
 
 
 def tool_call_limit_middleware(limits: dict[str, int]) -> list:
@@ -120,6 +152,19 @@ def tool_call_limit_middleware(limits: dict[str, int]) -> list:
         )
         for name, limit in (limits or {}).items()
     ]
+
+
+def model_retry_middleware() -> list:
+    """Retry transient model-call failures with exponential backoff.
+
+    Provider hiccups (HTTP 400 "provider returned error", 429 rate limits, 5xx,
+    timeouts) are common on long runs. Without this, a single failed model call
+    propagates out of agent.invoke and aborts the entire pipeline — we saw a
+    27-minute run discarded by one 400. After retries are exhausted, `on_failure
+    ='continue'` returns an error AIMessage instead of raising, so the agent
+    degrades rather than crashing.
+    """
+    return [ModelRetryMiddleware(max_retries=3, on_failure="continue")]
 
 
 def planning_middleware() -> list:

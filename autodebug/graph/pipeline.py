@@ -32,13 +32,10 @@ def clone_repo(state: DebugState) -> DebugState:
     """Provision a Docker volume and clone the repo into it via a one-shot container."""
     volume = create_repo_volume()
     try:
-        clone_into_volume(
-            volume,
-            state.repo_url,
-            state.pre_fix_commit,
-            test_patch=state.test_patch,
-            fixed_commit=state.fixed_commit_id,
-        )
+        # Production clone: just the repo at the given ref (default HEAD). No test
+        # files are injected — the benchmark's FAIL_TO_PASS test is applied only in
+        # the eval harness's separate scoring sandbox, never in the agents' repo.
+        clone_into_volume(volume, state.repo_url, state.ref)
     except Exception:
         remove_repo_volume(volume)
         raise
@@ -104,6 +101,14 @@ def run_pipeline(repo_url: str, bug_report: str, **kwargs) -> DebugState:
                     store_agent_run(name, state)
 
             span.set_attribute("final_stage", str(state.stage))
+            return state
+        except Exception as e:  # noqa: BLE001 — surface as a FAILED state, don't crash
+            # Infra/transient failures (e.g. Docker not running, an unhandled
+            # provider error) should produce a clean FAILED result, not abort the
+            # caller. Record the span error for observability, then return state.
+            span.record_exception(e)
+            state.stage = PipelineStage.FAILED
+            state.error = state.error or f"Pipeline: {type(e).__name__}: {str(e)[:300]}"
             return state
         finally:
             # Always release the volume so dangling state doesn't accumulate.

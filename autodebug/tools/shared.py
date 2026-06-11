@@ -25,7 +25,7 @@ def _to_repo_relative(path: str) -> str:
 
 
 def make_read_file_tool(sandbox: Sandbox, **_):
-    @tool
+    @tool(parse_docstring=True)
     def read_file(path: str, offset: int = 0, limit: int = 500) -> str:
         """Read a file from the repository.
 
@@ -39,9 +39,13 @@ def make_read_file_tool(sandbox: Sandbox, **_):
 
 
 def make_list_files_tool(sandbox: Sandbox, **_):
-    @tool
+    @tool(parse_docstring=True)
     def list_files(path: str) -> str:
-        """List files in a directory of the repository."""
+        """List files in a directory of the repository.
+
+        Args:
+            path: Relative directory path from the repo root ("" or "." for the root).
+        """
         rel = _to_repo_relative(path) if path not in ("", ".") else "."
         return sandbox.list_files(rel or ".")
     return list_files

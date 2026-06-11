@@ -44,16 +44,13 @@ class FixResult(BaseModel):
 class DebugState(BaseModel):
     """Single state object threaded through the entire LangGraph pipeline."""
 
-    # --- Input ---
+    # --- Input (production-real only; benchmark/test metadata lives in the eval
+    # harness, never here — the agents must run as they would in production) ---
     repo_url: str
     bug_report: str
-    known_good_commit: Optional[str] = None
+    known_good_commit: Optional[str] = None  # optional real hint: a version where it worked
     github_issue_url: Optional[str] = None
-    pre_fix_commit: Optional[str] = None     # fixed_commit_id~1; clone is checked out here
-    fixed_commit_id: Optional[str] = None    # the commit where the fix landed (for test-file sync)
-    test_file: Optional[str] = None          # path to the relevant test file
-    test_command: Optional[str] = None       # command to run targeted regression tests
-    test_patch: Optional[str] = None         # explicit test-only diff to apply at clone
+    ref: Optional[str] = None                # commit/branch to check out (defaults to HEAD)
 
     # --- Runtime ---
     stage: PipelineStage = PipelineStage.INIT

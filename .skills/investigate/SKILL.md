@@ -19,6 +19,23 @@ Your job: explain precisely **what changed** and **why it broke**.
 
 ## The Process
 
+### Step 0 — Anchor on the bug report
+
+Before the diff, re-read the **bug report**. That symptom is what your hypothesis
+must explain — the whole analysis is judged against it, not against whatever the
+repro happens to print.
+
+Write the target in one line: *"the reported failure is `<symptom>` when `<X>`."*
+Everything you conclude must connect back to it. If a candidate cause does not
+explain the reported symptom, it is the wrong cause — keep looking.
+
+> **Environment artifacts ≠ the bug.** In the sandbox, `ModuleNotFoundError`,
+> `ImportError`, "package not installed", or version mismatches are almost always
+> environment problems, NOT the defect — *unless the bug report is about imports/
+> packaging*. If `import <project>` itself fails, confirm whether that's expected
+> from the report; if not, the import error is noise masking the real code path.
+> Do not submit "package X is not installed" as a root cause for a behavioral bug.
+
 ### Step 1 — Read the culprit diff first
 
 The diff tells you exactly what changed. Before reading any other file, read and understand every line of it.
@@ -47,11 +64,30 @@ Read the file(s) changed in the culprit diff and the files that the traceback to
 - What it does now (use `read_file` for the current version)
 - The exact place the contract was broken
 
+### Step 3b — When the culprit isn't the cause
+
+The "diff → error" chain assumes the bug is something the culprit **changed**.
+That's the common case, but not the only one:
+
+- **Missing behavior.** The defect is the *absence* of handling — no `try/except`,
+  no fallback, no guard for an edge case. The culprit may have *exposed* it (e.g.
+  by adding the code path) without literally introducing the wrong line. A valid
+  root cause here is *"the code does not handle `<condition>`; it should `<do Y>`."*
+  Look for the operation in the bug report that fails and ask "what should catch
+  or guard this, and doesn't?"
+- **Misidentified culprit.** Bisect can land on a neighbouring commit. If the
+  reported symptom does not trace to the culprit's diff, say so explicitly in the
+  hypothesis and point at the code actually responsible — don't force-fit the diff.
+
 ### Step 4 — Form a precise hypothesis
 
-Write one sentence in this form:
+For a diff-introduced regression:
 
 > "The culprit removed/changed `X` in `file:line`, which broke the assumption in `file:line` that `Y`, causing `Z` when `W`."
+
+For a missing-behavior bug:
+
+> "`file:func` calls `<operation>` which can raise `<error>` under `<condition from the report>`; there is no handler/fallback, so it propagates as `<symptom>`. The fix belongs at `file:line`."
 
 Concrete example:
 > "The culprit changed `verify_collection` in `galaxy/collection.py:312` to require an explicit `version` parameter, breaking callers in `test_collection.py:89` that relied on the default `None` value, causing `TypeError: verify_collection() missing 1 required argument` when running `test_verify_collections_no_version`."
@@ -112,6 +148,11 @@ The culprit removed an import that had a side effect (registering a handler, set
 
 Look for: subtle behavior changes, missing registrations, `KeyError` in a registry lookup.
 
+### Missing error handling / fallback
+An operation that can fail under some environment or input (e.g. `ProcessPoolExecutor` with no `/dev/shm`, a network call, a missing optional file) is not wrapped in `try/except` and has no fallback. The bug report usually states the failing condition and the desired graceful behavior.
+
+Look for: an unhandled exception type named in the report; "should fall back / degrade gracefully / not crash when …". The root cause is the **absent** guard, and the fix adds it.
+
 ---
 
 ## Output Format
@@ -133,8 +174,10 @@ When you call `submit_root_cause`, provide:
 
 ## Rules
 
-1. **Read the diff before anything else.** The diff is the ground truth for what changed.
-2. **Trace the call chain.** The error site in the traceback is a symptom; the culprit diff is the cause. Connect them.
-3. **Use `read_file_at_parent`** to see what the code looked like before — don't guess.
-4. **Be specific.** "Something changed in galaxy" is not a root cause. "Line 312 removed the default value" is.
-5. **One root cause.** If you find multiple issues, report the one that directly causes the repro failure.
+1. **Anchor on the bug report.** The hypothesis must explain the reported symptom. A cause that doesn't is wrong, however real it looks.
+2. **Ignore sandbox/import artifacts.** `ModuleNotFoundError`/missing-package errors are environment noise unless the report is about imports.
+3. **Read the diff early** — it's usually the cause — but accept that the bug may be a *missing* behavior outside the diff, or that the culprit is misidentified.
+4. **Trace the call chain.** Connect the traceback's error site back to either the diff-introduced change or the missing guard.
+5. **Use `read_file_at_parent`** to compare pre/post — don't guess.
+6. **Be specific and single.** Name the exact file:line. Report the one cause that produces the reported failure.
+7. **Capture what you learn.** If you hit a pattern these notes don't cover, add it with `update_skill` so the next run starts smarter.

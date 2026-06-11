@@ -11,9 +11,13 @@ from autodebug.state import ReproResult
 
 
 def make_run_script_tool(sandbox: Sandbox, **_):
-    @tool
+    @tool(parse_docstring=True)
     def run_script(script: str) -> str:
-        """Run a Python script in the sandbox against the repository."""
+        """Run a Python script in the sandbox against the repository.
+
+        Args:
+            script: The Python source to execute (cwd is the repo root).
+        """
         result = sandbox.run_script(script)
         return json.dumps({
             "exit_code": result.exit_code,
@@ -23,29 +27,25 @@ def make_run_script_tool(sandbox: Sandbox, **_):
     return run_script
 
 
-def make_submit_repro_tool(sandbox: Sandbox, result: list, test_command: str = "", **_):
-    @tool
+def make_submit_repro_tool(sandbox: Sandbox, result: list, **_):
+    @tool(parse_docstring=True)
     def submit_repro(script: str, error_output: str) -> str:
-        """Submit the confirmed reproduction script when the bug is reproduced."""
+        """Submit the confirmed reproduction script when the bug is reproduced.
+
+        Args:
+            script: The minimal Python script that reproduces the bug. It must
+                exit non-zero and the failure must match the reported symptom
+                (not an unrelated import/dependency error in the sandbox).
+            error_output: The failure output you observed running the script.
+        """
         final_run = sandbox.run_script(script)
         if final_run.success:
             return "Script exited 0 — bug NOT reproduced. Revise the script so it fails."
 
-        # A non-zero exit alone is weak evidence — an unrelated crash (missing
-        # dependency, import error, typo) also exits non-zero. When the benchmark
-        # gives us a known failing test, require it to actually fail; that ties the
-        # repro to the target bug rather than to an environment artifact.
-        if test_command:
-            test_run = sandbox.exec(test_command)
-            if test_run.success:
-                return (
-                    f"The script failed, but the known failing test passed "
-                    f"(`{test_command}` exited 0), so this isn't reproducing the target "
-                    f"bug. Revise the script so that test fails.\n{test_run.output[-2000:]}"
-                )
-
-        # Store the *observed* failure from this verifying run, not the agent's
-        # claimed `error_output` — downstream stages must see what actually happened.
+        # The reproduction IS the oracle for the rest of the pipeline (there is no
+        # benchmark test in production). Store the *observed* failure from this
+        # verifying run, not the agent's claimed string, so downstream stages and
+        # the fixer see what actually happened.
         result.append(ReproResult(
             repro_script=script,
             error_output=final_run.output[-4000:],

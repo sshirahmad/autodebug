@@ -36,9 +36,14 @@ def make_mark_skip_tool(verdict: list, **_):
 
 
 def make_submit_result_tool(sha: str, info, result: list, **_):
-    @tool
+    @tool(parse_docstring=True)
     def submit_result(culprit_sha: str, explanation: str) -> str:
-        """Submit the final culprit commit when bisect is complete."""
+        """Submit the final culprit commit when bisect is complete.
+
+        Args:
+            culprit_sha: SHA of the commit that introduced the bug.
+            explanation: Brief explanation of why this commit is the culprit.
+        """
         result.append(BisectResult(
             culprit_commit=sha,
             commit_message=info.message,
@@ -52,7 +57,7 @@ def make_submit_result_tool(sha: str, info, result: list, **_):
 def make_submit_culprit_tool(sandbox: Sandbox, result: list, **_):
     from autodebug.tools import git_utils as _gu
 
-    @tool
+    @tool(parse_docstring=True)
     def submit_culprit(sha: str, explanation: str) -> str:
         """Submit the SHA of the commit that introduced the bug.
 

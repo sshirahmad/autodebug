@@ -7,10 +7,45 @@ the level each tool uses (read_file / list_files / exec / write_file / run_scrip
 import json
 from unittest.mock import MagicMock
 
+import pytest
+
 from autodebug.sandbox import RunResult
 from autodebug.tools.shared import make_read_file_tool, make_list_files_tool
 from autodebug.tools.repro import make_run_script_tool, make_submit_repro_tool
-from autodebug.tools.fix import make_apply_patch_tool
+from autodebug.tools.fix import make_apply_patch_tool, make_submit_fix_tool
+
+
+# ---------------------------------------------------------------------------
+# Tool metadata visibility (descriptions + per-argument descriptions)
+# ---------------------------------------------------------------------------
+
+def _build_all_tools():
+    """Instantiate every registered tool factory with mocked context."""
+    from autodebug.registry import _TOOL_FACTORIES
+    from autodebug.fsm import FSM
+    ctx = dict(sandbox=MagicMock(), result=[], patches=[], verdict=[], info=MagicMock(),
+               sha="x", parent_sha="x", repro_script="x", test_command="x",
+               state=MagicMock(), registry=MagicMock(), fsm=FSM(), agent_name="root_cause")
+    return {name: factory(**ctx) for name, factory in _TOOL_FACTORIES.items()}
+
+
+def test_every_tool_has_a_description():
+    for name, t in _build_all_tools().items():
+        assert t.description and t.description.strip(), f"{name} has no description"
+
+
+def test_every_tool_argument_has_a_description():
+    """Guards against adding a tool without parse_docstring=True / Args: — the
+    model can't see arg descriptions otherwise."""
+    missing = {}
+    for name, t in _build_all_tools().items():
+        if not t.args_schema:
+            continue
+        props = t.args_schema.model_json_schema().get("properties", {})
+        undocumented = [a for a, v in props.items() if not v.get("description")]
+        if undocumented:
+            missing[name] = undocumented
+    assert not missing, f"tools with undocumented args (add parse_docstring + Args:): {missing}"
 
 
 # ---------------------------------------------------------------------------
@@ -144,3 +179,54 @@ def test_apply_patch_file_not_found():
     tool = make_apply_patch_tool(sandbox=sandbox, patches=[])
     result = tool.invoke({"path": "ghost.py", "old_content": "x", "new_content": "y"})
     assert "not found" in result.lower()
+
+
+def test_submit_fix_uses_repro_as_oracle_and_captures_git_diff():
+    """No benchmark test in production: submit_fix accepts when the reproduction
+    passes, and records the real `git diff` as the patch."""
+    sandbox = MagicMock()
+    sandbox.run_script.return_value = RunResult(exit_code=0, stdout="ok", stderr="")  # repro passes
+    sandbox.git.return_value = RunResult(exit_code=0, stdout="THE REAL DIFF", stderr="")
+    result, patches = [], [{"path": "a.py"}]
+    tool = make_submit_fix_tool(sandbox=sandbox, repro_script="s", patches=patches, result=result)
+    out = tool.invoke({"summary": "fixed it"})
+    assert "submitted" in out.lower()
+    # Patch is normalized to end with a newline (git apply requires it).
+    assert len(result) == 1 and result[0].patch == "THE REAL DIFF\n"
+    sandbox.git.assert_called_once_with("diff")
+
+
+def test_submit_fix_rejected_when_diff_is_empty():
+    """A passing repro with no source change isn't a fix — reject the empty diff."""
+    sandbox = MagicMock()
+    sandbox.run_script.return_value = RunResult(exit_code=0, stdout="ok", stderr="")
+    sandbox.git.return_value = RunResult(exit_code=0, stdout="  \n", stderr="")  # empty diff
+    result = []
+    tool = make_submit_fix_tool(sandbox=sandbox, repro_script="s", patches=[], result=result)
+    out = tool.invoke({"summary": "x"})
+    assert "no source changes" in out.lower()
+    assert result == []
+
+
+def test_submit_fix_rejected_when_repro_still_fails():
+    sandbox = MagicMock()
+    sandbox.run_script.return_value = RunResult(exit_code=1, stdout="", stderr="boom")  # repro fails
+    result = []
+    tool = make_submit_fix_tool(sandbox=sandbox, repro_script="s", patches=[], result=result)
+    out = tool.invoke({"summary": "x"})
+    assert "cannot submit" in out.lower()
+    assert result == []
+    sandbox.git.assert_not_called()
+
+
+def test_apply_patch_refuses_test_files():
+    """The fix agent must not edit the test that serves as its success oracle."""
+    sandbox = MagicMock()
+    patches = []
+    tool = make_apply_patch_tool(sandbox=sandbox, patches=patches)
+    for path in ("test/units/test_x.py", "tests/test_foo.py", "pkg/foo/bar_test.py"):
+        result = tool.invoke({"path": path, "old_content": "a", "new_content": "b"})
+        assert "refused" in result.lower() and "test" in result.lower()
+    assert patches == []
+    sandbox.exec.assert_not_called()       # rejected before any filesystem access
+    sandbox.write_file.assert_not_called()

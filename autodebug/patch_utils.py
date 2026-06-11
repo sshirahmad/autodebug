@@ -12,13 +12,17 @@ import re
 _DIFF_HEADER_RE = re.compile(r"^diff --git a/(\S+) b/\S+", re.MULTILINE)
 
 
-def _is_test_path(path: str) -> bool:
+def is_test_path(path: str) -> bool:
     """Heuristic: does this path belong to test code rather than source?"""
     parts = path.split("/")
     if any(p in ("test", "tests", "testing") for p in parts):
         return True
     filename = parts[-1] if parts else ""
     return filename.startswith("test_") or filename.endswith("_test.py")
+
+
+# Backwards-compatible private alias.
+_is_test_path = is_test_path
 
 
 def split_patch(unified_diff: str) -> tuple[str, str]:

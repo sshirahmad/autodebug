@@ -10,9 +10,9 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from autodebug.agents.base import (
     Budget, BudgetExceeded, attempt_trajectory, build_model, budget_middleware,
-    maybe_optimize_prompt, planning_middleware, require_tool_calls_middleware,
-    retry_feedback, submission_middleware, summarization_middleware,
-    tool_call_limit_middleware,
+    maybe_optimize_prompt, model_retry_middleware, planning_middleware,
+    require_tool_calls_middleware, retry_feedback, submission_middleware,
+    summarization_middleware, tool_call_limit_middleware,
 )
 from autodebug.sandbox import Sandbox
 from autodebug.state import BisectResult, DebugState, PipelineStage
@@ -49,6 +49,7 @@ def run_bisect(state: DebugState, *, registry) -> DebugState:
         )
 
         crashed = False
+        run_error: str | None = None
         for attempt in range(cfg.max_retries + 1):
             budget = Budget.from_config(cfg)
             tools = registry.build_tools("bisect", sandbox=sandbox, result=result)
@@ -60,6 +61,7 @@ def run_bisect(state: DebugState, *, registry) -> DebugState:
                 checkpointer=saver,
                 middleware=(
                     budget_middleware(budget)
+                    + model_retry_middleware()
                     + planning_middleware()
                     + summarization_middleware(cfg.model, cfg.provider)
                     + submission_middleware(result)
@@ -80,9 +82,13 @@ def run_bisect(state: DebugState, *, registry) -> DebugState:
                 )
             except BudgetExceeded:
                 crashed = True
+            except Exception as exc:  # noqa: BLE001 — degrade, don't abort the pipeline
+                crashed = True
+                run_error = f"{type(exc).__name__}: {str(exc)[:300]}"
 
             state.total_tokens += budget.tokens_used
             state.total_cost += budget.cost_used
+            state.total_llm_calls += budget.calls
 
             # Accept a submitted result even if the attempt later crashed —
             # the agent often submits then keeps over-investigating until the
@@ -106,7 +112,8 @@ def run_bisect(state: DebugState, *, registry) -> DebugState:
 
         state.stage = PipelineStage.FAILED
         state.error = (
-            "BisectAgent: budget exceeded with no submission"
-            if crashed else "BisectAgent: could not identify culprit commit"
+            f"BisectAgent: {run_error}" if run_error else
+            "BisectAgent: budget exceeded with no submission" if crashed else
+            "BisectAgent: could not identify culprit commit"
         )
         return state

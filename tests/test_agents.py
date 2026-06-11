@@ -42,6 +42,23 @@ def patch_create_agent(module_path: str, behavior):
     return patch(f"{module_path}.create_agent", new=fake_create_agent)
 
 
+class _CapturingAgent:
+    """Records the initial human-message content; satisfies get_state()."""
+    def __init__(self, sink):
+        self._sink = sink
+
+    def invoke(self, payload, **kwargs):
+        self._sink["text"] = payload["messages"][0].content
+        return {}
+
+    def get_state(self, config):
+        return type("S", (), {"values": {"messages": []}})()
+
+
+def patch_capturing_create_agent(module_path: str, sink: dict):
+    return patch(f"{module_path}.create_agent", new=lambda **kw: _CapturingAgent(sink))
+
+
 def _make_fake_sandbox() -> MagicMock:
     """Sandbox mock that supports the `with` protocol and the methods runners call."""
     sb = MagicMock()
@@ -139,6 +156,21 @@ class TestRunRepro:
         assert state.stage == PipelineStage.FAILED
         assert "budget exceeded" in (state.error or "").lower()
 
+    def test_degrades_to_failed_on_unexpected_error(self, base_state, capture_result_list):
+        """A non-budget exception (transient provider/tool error) must degrade to a
+        FAILED state with the cause recorded — not propagate and crash the pipeline."""
+        def behavior():
+            raise RuntimeError("Provider returned error 400")
+        sb = _make_fake_sandbox()
+        with patch_sandbox("autodebug.agents.repro", sb), \
+             patch_create_agent("autodebug.agents.repro", behavior):
+            from autodebug.registry import AutoDebugRegistry
+            from autodebug.agents.repro import run_repro
+            state = run_repro(base_state, registry=AutoDebugRegistry.from_file())
+
+        assert state.stage == PipelineStage.FAILED
+        assert "Provider returned error 400" in (state.error or "")
+
 
 # ---------------------------------------------------------------------------
 # run_root_cause
@@ -212,6 +244,90 @@ class TestBudgetMiddleware:
         from autodebug.agents.base import Budget, budget_middleware
         mw = budget_middleware(Budget())
         assert len(mw) == 2
+
+
+class TestReviseRefinement:
+    """When re-invoked with a prior artifact (manager looped back from a failed
+    fix), repro/root_cause refine the previous result instead of regenerating."""
+
+    def test_repro_includes_prior_script_on_rerun(self):
+        from autodebug.registry import AutoDebugRegistry
+        from autodebug.state import DebugState, ReproResult
+        sink: dict = {}
+        st = DebugState(repo_url="u", bug_report="THE BUG", repo_volume="v")
+        st.repro = ReproResult(repro_script="PRIOR_SCRIPT", error_output="PRIOR_FAIL", confirmed=True)
+        with patch_capturing_create_agent("autodebug.agents.repro", sink), \
+             patch_sandbox("autodebug.agents.repro", _make_fake_sandbox()):
+            from autodebug.agents.repro import run_repro
+            run_repro(st, registry=AutoDebugRegistry.from_file())
+        assert "PRIOR_SCRIPT" in sink["text"]
+        assert "Refine THIS reproduction" in sink["text"]
+
+    def test_repro_has_no_refine_note_when_fresh(self):
+        from autodebug.registry import AutoDebugRegistry
+        from autodebug.state import DebugState
+        sink: dict = {}
+        st = DebugState(repo_url="u", bug_report="THE BUG", repo_volume="v")
+        with patch_capturing_create_agent("autodebug.agents.repro", sink), \
+             patch_sandbox("autodebug.agents.repro", _make_fake_sandbox()):
+            from autodebug.agents.repro import run_repro
+            run_repro(st, registry=AutoDebugRegistry.from_file())
+        assert "Refine THIS reproduction" not in sink["text"]
+
+    def test_root_cause_includes_prior_hypothesis_on_rerun(self):
+        from autodebug.registry import AutoDebugRegistry
+        from autodebug.state import DebugState, ReproResult, BisectResult, RootCauseResult
+        sink: dict = {}
+        st = DebugState(repo_url="u", bug_report="b", repo_volume="v")
+        st.repro = ReproResult(repro_script="s", error_output="e", confirmed=True)
+        st.bisect = BisectResult(culprit_commit="abc", commit_message="m", commit_diff="d", steps_taken=1)
+        st.root_cause = RootCauseResult(summary="S", relevant_lines=[], hypothesis="PRIOR_HYPOTHESIS")
+        with patch_capturing_create_agent("autodebug.agents.root_cause", sink), \
+             patch_sandbox("autodebug.agents.root_cause", _make_fake_sandbox()):
+            from autodebug.agents.root_cause import run_root_cause
+            run_root_cause(st, registry=AutoDebugRegistry.from_file())
+        assert "PRIOR_HYPOTHESIS" in sink["text"]
+        assert "got wrong" in sink["text"]
+
+
+class TestSessionBudgetMiddleware:
+    """Global ceiling across the whole orchestrated session (manager + sub-agents)."""
+
+    def _hook(self, state, max_cost=None, max_seconds=None):
+        from autodebug.agents.base import session_budget_middleware
+        return session_budget_middleware(state, max_cost, max_seconds)[0]
+
+    def test_passes_under_cost_cap(self):
+        from autodebug.state import DebugState
+        st = DebugState(repo_url="u", bug_report="b")
+        st.total_cost = 5.0
+        assert self._hook(st, max_cost=8.0).before_model(state={"messages": []}, runtime=None) is None
+
+    def test_raises_over_cost_cap(self):
+        from autodebug.agents.base import BudgetExceeded
+        from autodebug.state import DebugState
+        st = DebugState(repo_url="u", bug_report="b")
+        st.total_cost = 9.5
+        with pytest.raises(BudgetExceeded, match="Session cost budget"):
+            self._hook(st, max_cost=8.0).before_model(state={"messages": []}, runtime=None)
+
+    def test_no_caps_never_raises(self):
+        from autodebug.state import DebugState
+        st = DebugState(repo_url="u", bug_report="b")
+        st.total_cost = 9999
+        assert self._hook(st).before_model(state={"messages": []}, runtime=None) is None
+
+    def test_cap_reads_cumulative_state_cost_live(self):
+        # The hook closes over the DebugState, so later sub-agent spend is seen.
+        from autodebug.agents.base import BudgetExceeded
+        from autodebug.state import DebugState
+        st = DebugState(repo_url="u", bug_report="b")
+        hook = self._hook(st, max_cost=2.0)
+        st.total_cost = 1.0
+        assert hook.before_model(state={"messages": []}, runtime=None) is None
+        st.total_cost = 2.5  # a sub-agent finished and pushed cost over the cap
+        with pytest.raises(BudgetExceeded):
+            hook.before_model(state={"messages": []}, runtime=None)
 
 
 class TestSubmissionMiddleware:

@@ -6,14 +6,30 @@ import shlex
 
 from langchain_core.tools import tool
 
+from autodebug.patch_utils import is_test_path
 from autodebug.sandbox import REPO_DIR, Sandbox
 from autodebug.state import FixResult
 
 
 def make_apply_patch_tool(sandbox: Sandbox, patches: list, **_):
-    @tool
+    @tool(parse_docstring=True)
     def apply_patch(path: str, old_content: str, new_content: str) -> str:
-        """Apply a code change by replacing old content with new content in a file."""
+        """Apply a code change by replacing old content with new content in a file.
+
+        Args:
+            path: Relative path from the repo root to the file to edit (not a test file).
+            old_content: Exact text to replace — must match the file verbatim,
+                whitespace included.
+            new_content: Replacement text.
+        """
+        # Never let the fix touch test files: the targeted test is the success
+        # oracle (submit_fix runs it), so editing it would let the agent "pass"
+        # by changing the test instead of fixing the source.
+        if is_test_path(path):
+            return (
+                f"Refused: '{path}' is a test file. Patch the source code, not the "
+                "test — the test is the success criterion and must stay unchanged."
+            )
         full = f"{REPO_DIR}/{path.lstrip('/')}"
         check = sandbox.exec(f"test -f {shlex.quote(full)}")
         if check.exit_code != 0:
@@ -40,46 +56,54 @@ def make_run_repro_tool(sandbox: Sandbox, repro_script: str, **_):
     return run_repro
 
 
-def make_run_tests_tool(sandbox: Sandbox, test_command: str = "", **_):
-    @tool
+def make_run_tests_tool(sandbox: Sandbox, **_):
+    @tool(parse_docstring=True)
     def run_tests(test_path: str = "") -> str:
-        """Run the targeted test suite to check for regressions.
+        """Run the project's own tests with pytest to check for regressions.
 
         Args:
-            test_path: Optional path to a test file or directory. If omitted,
-                       uses the benchmark test command if one was provided.
+            test_path: Path to a test file or directory to run (relative to the
+                repo root). Omit to run the whole suite (may be slow).
         """
-        if not test_path and test_command:
-            cmd = test_command
-        else:
-            cmd = f"python -m pytest {test_path} -x --tb=short -q"
+        cmd = f"python -m pytest {test_path} -x --tb=short -q"
         run = sandbox.exec(cmd)
         return f"exit_code={run.exit_code}\n{run.output[-4000:]}"
     return run_tests
 
 
 def make_submit_fix_tool(
-    sandbox: Sandbox, repro_script: str, test_command: str,
-    patches: list, result: list, **_,
+    sandbox: Sandbox, repro_script: str, patches: list, result: list, **_,
 ):
-    @tool
+    @tool(parse_docstring=True)
     def submit_fix(summary: str) -> str:
-        """Submit the final validated fix once the repro passes and targeted tests pass."""
+        """Submit the fix once the reproduction passes.
+
+        The reproduction is the success criterion: there is no benchmark test in
+        production, so a fix is accepted when the repro script exits 0.
+
+        Args:
+            summary: One-line description of the fix you applied.
+        """
         repro_run = sandbox.run_script(repro_script)
         if not repro_run.success:
-            return f"Cannot submit: repro still fails.\n{repro_run.output[-2000:]}"
-        test_output = ""
-        if test_command:
-            test_run = sandbox.exec(test_command)
-            test_output = test_run.output[-2000:]
-            if not test_run.success:
-                return f"Cannot submit: targeted tests failing.\n{test_output}"
+            return f"Cannot submit: the reproduction still fails.\n{repro_run.output[-2000:]}"
+        # Capture the actual source changes as a real, applicable diff so the fix
+        # can be validated independently later — not just a textual summary.
+        diff = sandbox.git("diff").stdout
+        if not diff.strip():
+            return (
+                "Cannot submit: there are no source changes (empty diff). The "
+                "reproduction passing without a code change means it isn't testing "
+                "the bug — revise the fix (or the reproduction) before submitting."
+            )
+        # git apply requires a trailing newline; normalize so the patch is valid.
+        diff = diff.rstrip("\n") + "\n"
         result.append(FixResult(
-            patch=_build_patch_summary(patches),
+            patch=diff,
             attempts=len(patches),
-            test_output=test_output,
+            test_output="",
         ))
-        return "Fix validated and submitted."
+        return "Fix validated against the reproduction and submitted."
     return submit_fix
 
 

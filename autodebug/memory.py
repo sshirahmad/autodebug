@@ -97,8 +97,8 @@ def memory_store() -> SqliteStore:
 # ---------------------------------------------------------------------------
 
 def _get_manager(namespace: tuple[str, ...]):
-    from autodebug.agents.base import _build_model
-    model = _build_model(model_id=_MEMORY_MODEL)
+    from autodebug.agents.base import build_model
+    model = build_model(model_id=_MEMORY_MODEL)
     return create_memory_store_manager(
         model,
         schemas=[DebugAction, DebugObservation, DebugResult],
@@ -201,7 +201,7 @@ def make_search_memory_tool(agent_name: str = "unknown", **_):
         instructions=instructions,
     )
 
-    @tool
+    @tool(parse_docstring=True)
     def search_memory(query: str) -> str:
         """Search past debugging sessions for relevant patterns.
 

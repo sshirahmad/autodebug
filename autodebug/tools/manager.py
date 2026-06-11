@@ -18,6 +18,17 @@ from langchain_core.tools import tool
 from autodebug.fsm import FSM, ManagerPhase
 
 
+def _delegate(driver, state, registry) -> str | None:
+    """Run a sub-agent driver, swallowing any exception so a single sub-agent
+    crash (transient provider error, tool failure, etc.) can't kill the whole
+    manager session. Returns an error string on crash, else None."""
+    try:
+        driver(state, registry=registry)
+        return None
+    except Exception as exc:  # noqa: BLE001 — resilience boundary
+        return f"{type(exc).__name__}: {str(exc)[:300]}"
+
+
 def make_run_repro_agent_tool(state, registry, fsm: FSM, **_):
     @tool
     def run_repro_agent() -> str:
@@ -26,7 +37,10 @@ def make_run_repro_agent_tool(state, registry, fsm: FSM, **_):
         existing reproduction is wrong."""
         from autodebug.agents import run_repro
 
-        run_repro(state, registry=registry)
+        err = _delegate(run_repro, state, registry)
+        if err:
+            return (f"REPRO sub-agent crashed: {err}. This may be transient — "
+                    "retry run_repro_agent, or finish('failed', ...) if it persists.")
         if state.repro and state.repro.confirmed:
             # Re-reproducing during REVISING keeps us in REVISING; otherwise advance.
             if fsm.phase != ManagerPhase.REVISING:
@@ -52,7 +66,10 @@ def make_run_bisect_agent_tool(state, registry, fsm: FSM, **_):
 
         if not (state.repro and state.repro.confirmed):
             return "Cannot bisect yet — reproduce the bug first (run_repro_agent)."
-        run_bisect(state, registry=registry)
+        err = _delegate(run_bisect, state, registry)
+        if err:
+            return (f"BISECT sub-agent crashed: {err}. This may be transient — "
+                    "retry run_bisect_agent, or finish('failed', ...) if it persists.")
         if state.bisect:
             fsm.to(ManagerPhase.BISECTED)
             return (
@@ -74,7 +91,10 @@ def make_run_root_cause_agent_tool(state, registry, fsm: FSM, **_):
 
         if not state.bisect:
             return "Cannot analyze yet — find the culprit first (run_bisect_agent)."
-        run_root_cause(state, registry=registry)
+        err = _delegate(run_root_cause, state, registry)
+        if err:
+            return (f"ROOT CAUSE sub-agent crashed: {err}. This may be transient — "
+                    "retry run_root_cause_agent, or finish('failed', ...) if it persists.")
         if state.root_cause:
             fsm.to(ManagerPhase.ANALYZED)
             return f"ROOT CAUSE: {state.root_cause.hypothesis}"
@@ -93,7 +113,10 @@ def make_run_fix_agent_tool(state, registry, fsm: FSM, **_):
 
         if not state.root_cause:
             return "Cannot fix yet — determine the root cause first (run_root_cause_agent)."
-        run_fix(state, registry=registry)
+        err = _delegate(run_fix, state, registry)
+        if err:
+            return (f"FIX sub-agent crashed: {err}. This may be transient — "
+                    "retry run_fix_agent, or finish('failed', ...) if it persists.")
         if state.fix:
             fsm.to(ManagerPhase.DONE)
             return (
@@ -113,7 +136,7 @@ def make_run_fix_agent_tool(state, registry, fsm: FSM, **_):
 
 
 def make_finish_tool(state, result: list, fsm: FSM, **_):
-    @tool
+    @tool(parse_docstring=True)
     def finish(outcome: str, summary: str = "") -> str:
         """Conclude the debugging session.
 

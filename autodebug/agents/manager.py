@@ -18,13 +18,15 @@ import sys
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage
 
+import os
+
 from autodebug.agents.base import (
-    Budget, BudgetExceeded, build_model, budget_middleware, planning_middleware,
-    require_tool_calls_middleware, submission_middleware, summarization_middleware,
-    tool_call_limit_middleware,
+    Budget, BudgetExceeded, build_model, budget_middleware, model_retry_middleware,
+    planning_middleware, require_tool_calls_middleware, session_budget_middleware,
+    submission_middleware, summarization_middleware, tool_call_limit_middleware,
 )
 from autodebug.fsm import (
-    FSM, MANAGER_ALLOWED_TOOLS, fsm_prompt, fsm_tool_gate,
+    FSM, MANAGER_ALLOWED_TOOLS, fsm_prompt, fsm_tool_enforce, fsm_tool_gate,
 )
 from autodebug.state import DebugState, PipelineStage
 
@@ -56,16 +58,23 @@ def run_manager(state: DebugState, *, registry) -> DebugState:
 
     llm = build_model(model_id=cfg.model, provider=cfg.provider)
 
-    test_hint = (
-        f"\nKnown failing test (the fix must make this pass): `{state.test_command}`\n"
-        if state.test_command else ""
-    )
     initial_text = (
-        f"Bug report:\n\n{state.bug_report}\n"
-        f"{test_hint}\n"
+        f"Bug report:\n\n{state.bug_report}\n\n"
         "Orchestrate the sub-agents to reproduce, locate, explain, and fix this "
-        "bug. Begin by reproducing it."
+        "bug. The reproduction your repro agent builds is the success criterion — "
+        "there is no provided test. Begin by reproducing it."
     )
+
+    # Session-wide ceiling across the manager + every sub-agent it delegates to.
+    # Per-agent budgets don't bound the REVISING loop, so cap the whole session.
+    session_cost = float(os.getenv(
+        "AUTODEBUG_SESSION_COST_BUDGET",
+        cfg.extra.get("session_cost_budget_usd", 8.0),
+    ))
+    session_secs = int(os.getenv(
+        "AUTODEBUG_SESSION_TIME_BUDGET",
+        cfg.extra.get("session_time_budget_seconds", 2400),
+    ))
 
     budget = Budget.from_config(cfg)
     tools = registry.build_tools(
@@ -76,26 +85,33 @@ def run_manager(state: DebugState, *, registry) -> DebugState:
         tools=tools,
         middleware=(
             budget_middleware(budget)
+            + model_retry_middleware()
+            + session_budget_middleware(state, session_cost, session_secs)
             + planning_middleware()
             + summarization_middleware(cfg.model, cfg.provider)
             + [fsm_prompt(fsm, prompts, progress_fn=lambda: _progress_block(state, fsm))]
             + [fsm_tool_gate(fsm, MANAGER_ALLOWED_TOOLS)]
+            + [fsm_tool_enforce(fsm, MANAGER_ALLOWED_TOOLS)]
             + submission_middleware(result)
             + require_tool_calls_middleware()
             + tool_call_limit_middleware(cfg.tool_call_limits)
         ),
     )
 
+    session_error = ""
     try:
         agent.invoke(
             {"messages": [HumanMessage(content=initial_text)]},
             config={"recursion_limit": sys.maxsize},
         )
-    except BudgetExceeded:
-        pass
+    except BudgetExceeded as e:
+        session_error = str(e)
+    except Exception as e:  # noqa: BLE001 — never let one error abort the pipeline
+        session_error = f"{type(e).__name__}: {str(e)[:300]}"
 
     state.total_tokens += budget.tokens_used
     state.total_cost += budget.cost_used
+    state.total_llm_calls += budget.calls
     state.manager_phase = str(fsm.phase)
 
     # Outcome: trust an explicit finish('success'); otherwise a verified fix on
@@ -108,7 +124,9 @@ def run_manager(state: DebugState, *, registry) -> DebugState:
         state.error = None
     else:
         state.stage = PipelineStage.FAILED
-        if not state.error:
+        if session_error:
+            state.error = f"ManagerAgent: {session_error}"
+        elif not state.error:
             reason = result[0]["summary"] if result else "no verified fix produced"
             state.error = f"ManagerAgent: {reason}"
     return state
