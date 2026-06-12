@@ -60,9 +60,14 @@ def _b64(s: str) -> str:
 class Sandbox:
     """Long-lived container that owns the repo and runs commands via docker exec."""
 
-    def __init__(self, volume: str, image: str | None = None):
+    def __init__(self, volume: str, image: str | None = None, exec_timeout: int | None = None):
         self.volume = volume
         self.image = image or os.getenv("SANDBOX_IMAGE", "autodebug-sandbox:latest")
+        # Hard wall-clock cap for EVERY command. Budgets are only checked between
+        # LLM turns, so without this a single hanging/slow tool call (e.g. black's
+        # ProcessPoolExecutor blocking with no /dev/shm) runs unbounded and blows
+        # past every time budget. timeout(1) kills the command at this limit.
+        self.exec_timeout = exec_timeout or int(os.getenv("SANDBOX_TIMEOUT_SECONDS", "300"))
         self._client = docker.from_env()
         self._ensure_image()
         self.container = None
@@ -119,8 +124,10 @@ class Sandbox:
         """Execute a shell command in the container. workdir defaults to REPO_DIR."""
         if self.container is None:
             raise RuntimeError("Sandbox not started; call start() or use a `with` block")
+        # Wrap in `timeout` so no single command can hang the pipeline. SIGTERM at
+        # the limit, SIGKILL 10s later; a timed-out command exits 124.
         result = self.container.exec_run(
-            cmd=["bash", "-c", command],
+            cmd=["timeout", "-k", "10", str(self.exec_timeout), "bash", "-c", command],
             workdir=workdir or REPO_DIR,
             demux=True,
             environment={"PYTHONPATH": _PYTHONPATH},
@@ -128,10 +135,16 @@ class Sandbox:
         stdout_bytes, stderr_bytes = (
             result.output if isinstance(result.output, tuple) else (result.output, b"")
         )
+        exit_code = result.exit_code or 0
+        stderr = (stderr_bytes or b"").decode(errors="replace")
+        if exit_code == 124:
+            stderr = (
+                f"[command timed out after {self.exec_timeout}s and was killed]\n" + stderr
+            )
         return RunResult(
-            exit_code=result.exit_code or 0,
+            exit_code=exit_code,
             stdout=(stdout_bytes or b"").decode(errors="replace"),
-            stderr=(stderr_bytes or b"").decode(errors="replace"),
+            stderr=stderr,
         )
 
     # ------------------------------------------------------------------
