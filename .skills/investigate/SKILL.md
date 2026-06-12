@@ -107,11 +107,26 @@ read_file_at_parent(path="lib/foo/bar.py")
 ```
 This reads the file as it was BEFORE the culprit commit. Compare with the current version to understand what changed.
 
-### Run the repro with traceback
+### Run the repro with traceback + frame state
 ```
 run_repro_with_traceback()
 ```
-Runs the repro script and captures the full traceback. Use this to confirm your hypothesis — does the error match your theory?
+Runs the repro (or a script you pass) and, on any uncaught exception, returns the
+full traceback PLUS the local variables at every frame. This shows you the real
+failure state — exception type, values, which branch — not just the message.
+**Use it to confirm your hypothesis against actual runtime state, not a guess.**
+
+### Probe state at a specific line (don't guess — observe)
+```
+inspect_at(location="lib/ansible/galaxy/collection.py:670",
+           expressions="local_collection, os.path.isfile(manifest_path)")
+```
+Sets a tracepoint at `file:line`, runs the reproduction (or a `driver` snippet you
+provide to feed specific inputs), and reports the value of each expression — plus
+the frame's locals — every time that line runs. Use this to see exactly what the
+code computes at the suspect spot before committing to a root cause. The search
+space is huge; **inspect, don't speculate.** Your final hypothesis should cite the
+runtime evidence you observed.
 
 ### Search memory for prior bugs
 ```
@@ -157,18 +172,26 @@ Look for: an unhandled exception type named in the report; "should fall back / d
 
 ## Output Format
 
-When you call `submit_root_cause`, provide:
+You return a **structured report** (not a tool call). Only return it once you
+have OBSERVED the failure with `run_repro_with_traceback` or `inspect_at`:
 
 **summary**: 1-2 sentences. What broke and why.
-> "The `verify_collection` function now requires an explicit `version` argument. Callers passing no version hit a TypeError."
+> "`verify_collection` raises before the missing-MANIFEST case is handled."
 
 **hypothesis**: The causal chain.
-> "Commit abc123 removed the `version=None` default from `verify_collection()` (collection.py:312). The test `test_verify_collections_no_version` calls it without a version argument (test_collection.py:89), triggering `TypeError: missing required argument`."
+> "Commit abc123 added `verify_collections` (collection.py:668) which calls
+> `from_path` without first checking for MANIFEST.json; with no manifest it
+> raises before the intended error."
 
 **relevant_lines**: File + line references where the break occurs.
-```
-["lib/ansible/galaxy/collection.py:312", "test/units/galaxy/test_collection.py:89"]
-```
+> ["lib/ansible/galaxy/collection.py:670"]
+
+**evidence**: What you actually observed at runtime — REQUIRED. Quote the tool
+output: the exception type, the failing line, the values.
+> "run_repro_with_traceback: AttributeError at collection.py:670, local_collection=None,
+> os.path.isfile('.../MANIFEST.json')=False."
+
+A report whose `evidence` was not observed at runtime is rejected.
 
 ---
 

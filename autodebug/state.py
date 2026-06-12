@@ -32,6 +32,32 @@ class RootCauseResult(BaseModel):
     summary: str
     relevant_lines: list[str]
     hypothesis: str
+    evidence: str = ""   # runtime evidence the agent observed (postmortem/inspect_at)
+
+
+class RootCauseReport(BaseModel):
+    """Structured output the root_cause agent must return (response_format).
+
+    All fields required, with descriptions that steer the model — in particular
+    `evidence` forces it to actually observe the failure rather than speculate.
+    """
+    summary: str = Field(
+        description="One or two sentences: what is broken and where."
+    )
+    hypothesis: str = Field(
+        description="The causal chain that explains the REPORTED symptom — "
+        "'the culprit changed X at file:line, breaking Y, causing Z when W', or "
+        "'the code does not handle condition C at file:line'."
+    )
+    relevant_lines: list[str] = Field(
+        description="The responsible code locations, each as a 'path:line' string."
+    )
+    evidence: str = Field(
+        description="Concrete runtime evidence you OBSERVED by running "
+        "run_repro_with_traceback or inspect_at: the exception type, the failing "
+        "line, and the variable values you saw. Quote the tool output. Do NOT "
+        "fabricate — a hypothesis with no observed evidence is unacceptable."
+    )
 
 
 class FixResult(BaseModel):

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from langchain_core.tools import tool
 
+import re
+
 from autodebug.sandbox import Sandbox
 from autodebug.state import RootCauseResult
 from autodebug.tools import git_utils
+from autodebug.tools.introspect import inspect_harness, postmortem_harness
 
 
 def make_read_file_at_parent_tool(sandbox: Sandbox, parent_sha: str, **_):
@@ -23,20 +26,56 @@ def make_read_file_at_parent_tool(sandbox: Sandbox, parent_sha: str, **_):
 
 
 def make_run_repro_with_traceback_tool(sandbox: Sandbox, repro_script: str, **_):
-    @tool
-    def run_repro_with_traceback() -> str:
-        """Run the reproduction script and capture the full Python traceback."""
-        wrapper = (
-            "import traceback, sys\n"
-            "try:\n"
-            f"    exec(compile({repro_script!r}, '<repro>', 'exec'))\n"
-            "except Exception:\n"
-            "    traceback.print_exc()\n"
-            "    sys.exit(1)\n"
-        )
-        run = sandbox.run_script(wrapper)
-        return run.output[-4000:]
+    @tool(parse_docstring=True)
+    def run_repro_with_traceback(script: str = "") -> str:
+        """Run a script (default: the reproduction) and, on any uncaught exception,
+        return the full traceback PLUS the local variables at every stack frame —
+        so you see the real failure state (values, types), not just the message.
+
+        Args:
+            script: Python to run. Omit to run the reproduction script.
+        """
+        run = sandbox.run_script(postmortem_harness(script or repro_script))
+        out = run.output[:4000]  # keep the head: exception + innermost frames
+        return out or "Script completed with no uncaught exception (exit 0)."
     return run_repro_with_traceback
+
+
+def make_inspect_at_tool(sandbox: Sandbox, repro_script: str, **_):
+    @tool(parse_docstring=True)
+    def inspect_at(location: str, expressions: str, driver: str = "") -> str:
+        """Probe program state at a specific source line — set a tracepoint, run,
+        and see the actual values there instead of guessing.
+
+        Runs `driver` (default: the reproduction) and, each time `location` is
+        reached, evaluates your expressions in that frame and reports them along
+        with the frame's local variables (first few hits).
+
+        Args:
+            location: Where to probe — a repo-relative file path and a line
+                number separated by a colon, for example
+                lib/ansible/galaxy/collection.py then 670.
+            expressions: Expressions to evaluate at that line, comma- or
+                newline-separated (for example worker_count, then a dev-shm check).
+            driver: Python that triggers the code path (sets up inputs and calls
+                it). Omit to use the reproduction script.
+        """
+        try:
+            file_part, line_part = location.rsplit(":", 1)
+            target_line = int(line_part.strip())
+        except Exception:
+            return "location must be 'relative/path/to/file.py:LINE'."
+        exprs = [e.strip() for e in re.split(r"[,\n]", expressions) if e.strip()]
+        harness = inspect_harness(file_part.strip(), target_line, exprs, driver or repro_script)
+        run = sandbox.run_script(harness)
+        out = run.output.strip()
+        if out in ("", "[]"):
+            return (
+                f"No hits — {file_part}:{target_line} was never reached. Check the "
+                "path/line and that the driver actually triggers that code path."
+            )
+        return out[-4000:]
+    return inspect_at
 
 
 def make_submit_root_cause_tool(result: list, **_):

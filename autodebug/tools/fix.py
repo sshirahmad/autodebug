@@ -9,6 +9,7 @@ from langchain_core.tools import tool
 from autodebug.patch_utils import is_test_path
 from autodebug.sandbox import REPO_DIR, Sandbox
 from autodebug.state import FixResult
+from autodebug.tools.introspect import postmortem_harness
 
 
 def make_apply_patch_tool(sandbox: Sandbox, patches: list, **_):
@@ -50,9 +51,16 @@ def make_apply_patch_tool(sandbox: Sandbox, patches: list, **_):
 def make_run_repro_tool(sandbox: Sandbox, repro_script: str, **_):
     @tool
     def run_repro() -> str:
-        """Run the reproduction script — should PASS after fix is applied."""
-        run = sandbox.run_script(repro_script)
-        return f"exit_code={run.exit_code}\n{run.output[-3000:]}"
+        """Run the reproduction script — should PASS (exit 0) after the fix.
+
+        On failure it returns the full traceback and the local variables at each
+        frame, so you can see *why* the patch didn't work instead of guessing.
+        """
+        run = sandbox.run_script(postmortem_harness(repro_script))
+        if run.success:
+            return "exit_code=0 — reproduction PASSES (no exception). The fix works."
+        # keep the head: exception + innermost frames (where the patch went wrong)
+        return f"exit_code={run.exit_code} — reproduction still FAILS:\n{run.output[:3500]}"
     return run_repro
 
 
