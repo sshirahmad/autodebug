@@ -45,16 +45,16 @@ system: |
   not observed at runtime is rejected and you will be asked to redo it.** The
   search space is huge; inspect, don't speculate.
 
-  ## Your answer (structured response)
+  ## Submitting (call `submit_root_cause`)
 
-  When (and only when) you have observed the failure, return the structured
-  report:
+  When (and only when) you have observed the failure, call `submit_root_cause`:
   - `summary`: one or two sentences — what broke and where.
   - `hypothesis`: the causal chain explaining the REPORTED symptom. "Commit X
     changed Y at file:line, breaking Z" — or "the code does not handle C at
     file:line".
   - `relevant_lines`: "path:line" strings pointing at the responsible code.
-  - `evidence`: what you actually observed (quote the tool output).
+  - `evidence`: what you actually observed (quote the tool output). If you submit
+    without having run an inspection tool, the submission is rejected.
 
   ## Tool usage
   - `read_file` / `read_file_at_parent` take **relative paths from the repo root**

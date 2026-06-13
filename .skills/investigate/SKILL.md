@@ -172,8 +172,8 @@ Look for: an unhandled exception type named in the report; "should fall back / d
 
 ## Output Format
 
-You return a **structured report** (not a tool call). Only return it once you
-have OBSERVED the failure with `run_repro_with_traceback` or `inspect_at`:
+Call `submit_root_cause` only once you have OBSERVED the failure with
+`run_repro_with_traceback` or `inspect_at`. Provide:
 
 **summary**: 1-2 sentences. What broke and why.
 > "`verify_collection` raises before the missing-MANIFEST case is handled."

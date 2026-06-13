@@ -9,7 +9,7 @@ EXPECTED_TOOLS = {
     "read_file", "list_files",
     "run_script", "submit_repro",
     "mark_bad", "mark_good", "mark_skip", "submit_result", "submit_culprit",
-    "read_file_at_parent", "run_repro_with_traceback", "inspect_at",
+    "read_file_at_parent", "run_repro_with_traceback", "inspect_at", "submit_root_cause",
     "apply_patch", "run_repro", "run_tests", "submit_fix",
     "search_memory", "load_skill", "update_skill",
     # Manager (FSM brain) delegates to the sub-agents via these tools.

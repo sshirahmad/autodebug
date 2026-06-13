@@ -80,8 +80,10 @@ def make_inspect_at_tool(sandbox: Sandbox, repro_script: str, **_):
 
 def make_submit_root_cause_tool(result: list, **_):
     @tool(parse_docstring=True)
-    def submit_root_cause(summary: str, relevant_lines: str | list[str], hypothesis: str) -> str:
-        """Submit the root cause analysis.
+    def submit_root_cause(
+        summary: str, relevant_lines: str | list[str], hypothesis: str, evidence: str,
+    ) -> str:
+        """Submit the root cause analysis once you have OBSERVED the failure.
 
         Args:
             summary: One-paragraph description of the root cause.
@@ -89,6 +91,9 @@ def make_submit_root_cause_tool(result: list, **_):
                 references (for example lib/foo/bar.py line 42). Pass a list of
                 such strings, or a single newline-separated string.
             hypothesis: Explanation of why the change caused the bug.
+            evidence: The runtime evidence you OBSERVED via run_repro_with_traceback
+                or inspect_at — the exception, the failing line, the values you saw.
+                Quote the tool output; do not fabricate.
         """
         if isinstance(relevant_lines, str):
             relevant_lines = [l.strip() for l in relevant_lines.splitlines() if l.strip()]
@@ -96,6 +101,7 @@ def make_submit_root_cause_tool(result: list, **_):
             summary=summary,
             relevant_lines=relevant_lines,
             hypothesis=hypothesis,
+            evidence=evidence,
         ))
         return "Root cause submitted."
     return submit_root_cause

@@ -7,10 +7,8 @@ from autodebug.tools.bisect import (
 )
 from autodebug.tools.root_cause import (
     make_read_file_at_parent_tool, make_run_repro_with_traceback_tool,
-    make_inspect_at_tool,
+    make_inspect_at_tool, make_submit_root_cause_tool,
 )
-# Note: root_cause no longer has a submit tool — it returns a structured
-# RootCauseReport via create_agent(response_format=...). See agents/root_cause.py.
 from autodebug.tools.fix import (
     make_apply_patch_tool, make_run_repro_tool, make_run_tests_tool, make_submit_fix_tool,
 )

@@ -176,54 +176,58 @@ class TestRunRepro:
 # run_root_cause
 # ---------------------------------------------------------------------------
 
-class TestRunRootCause:
-    def test_advances_to_fix_on_evidence_backed_report(self, bisect_state):
-        # New mechanism: the agent returns a structured RootCauseReport AND must
-        # have called an inspection tool — the driver enforces both.
-        from langchain_core.messages import AIMessage
-        from autodebug.state import RootCauseReport
+def _patch_root_cause_agent(behavior, inspected: bool):
+    """Fake create_agent whose get_state reports whether an inspection tool ran."""
+    from langchain_core.messages import AIMessage
 
+    class _Fake:
+        def invoke(self, *a, **k):
+            return behavior() or {}
+
+        def get_state(self, config):
+            msgs = []
+            if inspected:
+                msgs = [AIMessage(content="", tool_calls=[
+                    {"name": "inspect_at", "args": {}, "id": "1", "type": "tool_call"}])]
+            return type("S", (), {"values": {"messages": msgs}})()
+
+    return patch("autodebug.agents.root_cause.create_agent", new=lambda **kw: _Fake())
+
+
+class TestRunRootCause:
+    def test_advances_to_fix_when_inspected_and_submitted(self, bisect_state, capture_result_list):
         def behavior():
-            return {
-                "structured_response": RootCauseReport(
-                    summary="op bug", hypothesis="- was used instead of +",
-                    relevant_lines=["calc.py:2"], evidence="observed at calc.py:2",
-                ),
-                "messages": [AIMessage(content="", tool_calls=[
-                    {"name": "inspect_at", "args": {}, "id": "1", "type": "tool_call"}])],
-            }
+            capture_result_list[-1].append(RootCauseResult(
+                summary="op bug", relevant_lines=["calc.py:2"],
+                hypothesis="- used instead of +", evidence="observed at calc.py:2"))
         sb = _make_fake_sandbox()
         sb.run_script.return_value = RunResult(exit_code=1, stdout="", stderr="AssertionError")
         with patch_sandbox("autodebug.agents.root_cause", sb), \
-             patch_create_agent("autodebug.agents.root_cause", behavior):
+             _patch_root_cause_agent(behavior, inspected=True):
             from autodebug.registry import AutoDebugRegistry
             from autodebug.agents.root_cause import run_root_cause
             state = run_root_cause(bisect_state, registry=AutoDebugRegistry.from_file())
 
         assert state.stage == PipelineStage.FIX
-        assert state.root_cause.hypothesis == "- was used instead of +"
+        assert state.root_cause.hypothesis == "- used instead of +"
         assert state.root_cause.evidence == "observed at calc.py:2"
 
-    def test_rejected_when_report_lacks_observed_evidence(self, bisect_state):
-        # A report with NO inspection tool call must be rejected (not advance).
-        from autodebug.state import RootCauseReport
-
+    def test_does_not_hard_fail_without_inspection(self, bisect_state, capture_result_list):
+        # No inspection tool used: rejected on early attempts but ACCEPTED on the
+        # final one — the pipeline degrades gracefully instead of failing outright
+        # (the regression that response_format introduced).
         def behavior():
-            return {  # structured report but never called inspect_at/postmortem
-                "structured_response": RootCauseReport(
-                    summary="guess", hypothesis="speculation", relevant_lines=[], evidence="made up"),
-                "messages": [],
-            }
+            capture_result_list[-1].append(RootCauseResult(
+                summary="s", relevant_lines=["f:1"], hypothesis="h", evidence="e"))
         sb = _make_fake_sandbox()
         sb.run_script.return_value = RunResult(exit_code=1, stdout="", stderr="x")
         with patch_sandbox("autodebug.agents.root_cause", sb), \
-             patch_create_agent("autodebug.agents.root_cause", behavior):
+             _patch_root_cause_agent(behavior, inspected=False):
             from autodebug.registry import AutoDebugRegistry
             from autodebug.agents.root_cause import run_root_cause
             state = run_root_cause(bisect_state, registry=AutoDebugRegistry.from_file())
 
-        assert state.stage == PipelineStage.FAILED
-        assert "without observing" in (state.error or "")
+        assert state.stage == PipelineStage.FIX  # graceful accept, not FAILED
 
 
 # ---------------------------------------------------------------------------

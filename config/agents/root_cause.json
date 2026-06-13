@@ -1,6 +1,6 @@
 {
   "system_prompt": "config/prompts/root_cause.yaml",
-  "tools": ["search_memory", "read_file", "read_file_at_parent", "run_repro_with_traceback", "inspect_at", "load_skill", "update_skill"],
+  "tools": ["search_memory", "read_file", "read_file_at_parent", "run_repro_with_traceback", "inspect_at", "load_skill", "update_skill", "submit_root_cause"],
   "skills": ["investigate", "systematic-debugging"],
   "time_budget_seconds": 600,
   "cost_budget_usd": 2.00,
