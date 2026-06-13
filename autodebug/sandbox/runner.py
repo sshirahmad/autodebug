@@ -29,11 +29,15 @@ from docker.errors import ImageNotFound, NotFound
 
 REPO_DIR = "/workspace/repo"
 
-# Source roots prepended to PYTHONPATH so the checked-out repo shadows any
-# same-named distribution pre-installed in site-packages (the sandbox image
-# pip-installs many benchmark subjects — ansible, django, flask, etc.). Covers
-# flat (repo root), src-layout, and lib-layout (ansible) projects.
-_SRC_ROOTS = (REPO_DIR, f"{REPO_DIR}/src", f"{REPO_DIR}/lib")
+# PYTHONPATH for every sandbox command:
+#   - the checked-out repo's source roots FIRST, so the checkout shadows any
+#     same-named distribution pre-installed in the image (ansible, black, ...)
+#     and stays patchable. Covers flat / src-layout / lib-layout projects.
+#   - /workspace/deps LAST: a volume-backed dir where the checkout's own
+#     dependencies are installed at clone time (see clone_into_volume). Old
+#     checkouts need deps the image lacks — e.g. old black imports `regex`.
+_DEPS_DIR = "/workspace/deps"
+_SRC_ROOTS = (REPO_DIR, f"{REPO_DIR}/src", f"{REPO_DIR}/lib", _DEPS_DIR)
 _PYTHONPATH = ":".join(_SRC_ROOTS)
 
 
@@ -96,6 +100,9 @@ class Sandbox:
             working_dir=REPO_DIR,
             mem_limit=os.getenv("SANDBOX_MEM_LIMIT", "1g"),
             nano_cpus=int(os.getenv("SANDBOX_NANO_CPUS", "2000000000")),
+            # Cap process count so a runaway/forkbomb command (now that agents have
+            # a general shell) can't exhaust the host; the container is disposable.
+            pids_limit=int(os.getenv("SANDBOX_PIDS_LIMIT", "512")),
             network_disabled=False,
             detach=True,
             auto_remove=False,
@@ -130,7 +137,11 @@ class Sandbox:
             cmd=["timeout", "-k", "10", str(self.exec_timeout), "bash", "-c", command],
             workdir=workdir or REPO_DIR,
             demux=True,
-            environment={"PYTHONPATH": _PYTHONPATH},
+            # PYTHONDONTWRITEBYTECODE: never write .pyc. Otherwise the first import
+            # caches bytecode and a later apply_patch to the .py is masked by the
+            # stale .pyc (Python reuses it when mtimes collide on the volume) — so
+            # the fixer's patches silently never execute.
+            environment={"PYTHONPATH": _PYTHONPATH, "PYTHONDONTWRITEBYTECODE": "1"},
         )
         stdout_bytes, stderr_bytes = (
             result.output if isinstance(result.output, tuple) else (result.output, b"")
@@ -268,6 +279,41 @@ def clone_into_volume(
     cmd = f"git clone {shlex.quote(repo_url)} {shlex.quote(REPO_DIR)}"
     if ref:
         cmd += f" && cd {shlex.quote(REPO_DIR)} && git checkout {shlex.quote(ref)}"
+
+    # Install the CHECKED-OUT project's own dependencies into a VOLUME-backed dir
+    # so they persist to the long-lived per-stage Sandbox containers (site-packages
+    # in this one-shot container is discarded). The image pip-installs the latest
+    # version of each subject, but the checkout is usually older with different
+    # deps — e.g. old black does `import regex as re` and `regex` isn't present, so
+    # `import black` dies before the bug is reached. _DEPS_DIR is on PYTHONPATH.
+    if os.getenv("AUTODEBUG_PIP_INSTALL", "1") != "0":
+        deps = shlex.quote(_DEPS_DIR)
+        # Wrapped in a subshell that always exits 0 so a missing optional dep never
+        # aborts the rest of the setup chain (test sync, pyc cleanup).
+        cmd += (
+            f" && cd {shlex.quote(REPO_DIR)} && ( "
+            # 1) the checkout's own RUNTIME deps (the image pins a newer version; the
+            #    older checkout often needs different deps — e.g. old black imports `regex`).
+            f"(timeout 600 pip install --target={deps} . "
+            f"|| timeout 300 pip install --target={deps} -r requirements.txt || true) ; "
+            # 2) TEST/dev deps layered on top. The official FAIL_TO_PASS test routinely
+            #    imports test-only deps (pytest plugins, hypothesis, aiohttp for black's
+            #    blackd tests, ...). Without them the test MODULE fails to import, which
+            #    the eval would otherwise misread as a failed fix rather than a broken
+            #    env. Best-effort across the common extra names and dev-requirement files.
+            f"for e in d test tests dev testing; do "
+            f"timeout 300 pip install --target={deps} \".[$e]\" >/dev/null 2>&1 || true; done ; "
+            f"for f in test-requirements.txt requirements-test.txt requirements-dev.txt "
+            f"dev-requirements.txt requirements/test.txt requirements/dev.txt; do "
+            f"if [ -f \"$f\" ]; then timeout 300 pip install --target={deps} -r \"$f\" || true; fi; done ; "
+            f"true )"
+        )
+    # Clear any compiled bytecode so the agents always execute the live source
+    # (a stale .pyc would mask their patches).
+    cmd += (
+        f" && find {shlex.quote(REPO_DIR)} -name '__pycache__' -type d -prune "
+        "-exec rm -rf {} + 2>/dev/null || true"
+    )
 
     if test_patch:
         encoded = base64.b64encode(test_patch.encode("utf-8")).decode("ascii")

@@ -1,6 +1,6 @@
 {
   "system_prompt": "config/prompts/bisect.yaml",
-  "tools": ["search_memory", "run_script", "read_file", "load_skill", "update_skill", "submit_culprit"],
+  "tools": ["search_memory", "run_script", "read_file", "shell", "load_skill", "update_skill", "submit_culprit"],
   "skills": ["git-advanced-workflows", "sandbox-scripting"],
   "time_budget_seconds": 600,
   "cost_budget_usd": 2.00,

@@ -7,7 +7,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from eval.run_eval import bisect_signals, compute_metrics, validate_fix, _source_files  # noqa: E402
+from eval.run_eval import (  # noqa: E402
+    bisect_signals, compute_metrics, validate_fix, _source_files, _HARNESS_ERROR_RE,
+)
 
 
 class TestValidateFixGuards:
@@ -18,12 +20,30 @@ class TestValidateFixGuards:
     def test_empty_patch_is_false(self):
         r = validate_fix({"test_command": "pytest x", "repo_url": "u"}, "")
         assert r["passed"] is False and "no patch" in r["reason"]
+        assert r["category"] == "no_patch"
         assert validate_fix({"test_command": "pytest x", "repo_url": "u"}, "   ")["passed"] is False
 
     def test_missing_test_command_is_false(self):
-        # No FAIL_TO_PASS test to validate against -> cannot score a pass.
+        # No FAIL_TO_PASS test to validate against -> cannot score a pass. An
+        # instance with no test_command is unscoreable, i.e. harness_invalid.
         r = validate_fix({"repo_url": "u"}, "diff --git a/x b/x")
         assert r["passed"] is False and "test_command" in r["reason"]
+        assert r["category"] == "harness_invalid"
+
+
+class TestHarnessErrorClassifier:
+    """The fallback heuristic (used only when no gold baseline is available) must
+    flag could-not-run signals while ignoring genuine assertion failures."""
+
+    def test_flags_import_and_collection_errors(self):
+        assert _HARNESS_ERROR_RE.search("NameError: name 'AioHTTPTestCase' is not defined")
+        assert _HARNESS_ERROR_RE.search("ModuleNotFoundError: No module named 'aiohttp'")
+        assert _HARNESS_ERROR_RE.search("ImportError: cannot import name 'foo'")
+        assert _HARNESS_ERROR_RE.search("collected 0 items")
+
+    def test_ignores_plain_assertion_failure(self):
+        out = "AssertionError: 1 != 2\nFAILED tests/test_x.py::test_y - AssertionError"
+        assert not _HARNESS_ERROR_RE.search(out)
 
 
 class TestProductionStateHasNoBenchmarkFields:
@@ -110,6 +130,39 @@ class TestComputeMetrics:
 
     def test_empty_results_no_zero_division(self):
         assert compute_metrics([]) == {"total": 0}
+
+    def test_harness_invalid_excluded_from_fix_rate(self):
+        # A broken-harness instance must NOT count as a fix failure: it's dropped
+        # from the denominator and reported separately.
+        results = [
+            {"repro_success": True, "bisect_correct": False, "fix_success": False,
+             "fix_category": "harness_invalid"},
+            {"repro_success": True, "bisect_correct": False, "fix_success": True,
+             "fix_category": "fix_pass"},
+            {"repro_success": True, "bisect_correct": False, "fix_success": False,
+             "fix_category": "fix_fail"},
+        ]
+        m = compute_metrics(results)
+        assert m["harness_invalid"] == 1
+        assert m["fix_scoreable"] == 2
+        assert m["fix_rate"] == 0.5  # 1 pass / 2 scoreable; the invalid one dropped
+
+    def test_all_harness_invalid_is_zero_not_nan(self):
+        results = [{"repro_success": False, "bisect_correct": False, "fix_success": False,
+                    "fix_category": "harness_invalid"}]
+        m = compute_metrics(results)
+        assert m["fix_rate"] == 0.0 and m["fix_scoreable"] == 0 and m["harness_invalid"] == 1
+
+    def test_missing_category_treated_as_scoreable(self):
+        # Back-compat: results without fix_category (older runs) stay in the denominator.
+        results = [
+            {"repro_success": True, "bisect_correct": True, "bisect_sha_match": False,
+             "bisect_file_overlap": True, "fix_success": True},
+            {"repro_success": True, "bisect_correct": True, "bisect_sha_match": True,
+             "bisect_file_overlap": True, "fix_success": False},
+        ]
+        m = compute_metrics(results)
+        assert m["fix_rate"] == 0.5 and m["fix_scoreable"] == 2 and m["harness_invalid"] == 0
 
 
 class TestLlmCallTracking:

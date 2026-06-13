@@ -1,4 +1,4 @@
-from autodebug.tools.shared import make_read_file_tool, make_list_files_tool
+from autodebug.tools.shared import make_read_file_tool, make_list_files_tool, make_shell_tool
 from autodebug.memory import make_search_memory_tool
 from autodebug.tools.repro import make_run_script_tool, make_submit_repro_tool
 from autodebug.tools.bisect import (

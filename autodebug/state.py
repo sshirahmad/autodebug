@@ -33,6 +33,7 @@ class RootCauseResult(BaseModel):
     relevant_lines: list[str]
     hypothesis: str
     evidence: str = ""   # runtime evidence the agent observed (postmortem/inspect_at)
+    fix_plan: str = ""   # the concrete change the fixer should EXECUTE (not re-derive)
 
 
 class FixResult(BaseModel):

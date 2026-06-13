@@ -30,16 +30,27 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
     patches: list[dict] = []
     result: list = []
 
+    rc = state.root_cause
+    plan_block = (
+        f"## FIX PLAN — implement this exactly (root cause already determined it)\n"
+        f"{rc.fix_plan}\n\n"
+        if rc.fix_plan else
+        # Fallback if root cause produced no explicit plan.
+        f"## Root cause\n{rc.hypothesis}\n"
+        + "Relevant lines:\n" + "\n".join(f"  - {l}" for l in rc.relevant_lines) + "\n\n"
+    )
+    evidence_block = (
+        f"## Observed failure (from root cause)\n{rc.evidence}\n\n" if rc.evidence else ""
+    )
     initial_text = (
-        f"Root cause:\n{state.root_cause.hypothesis}\n\n"
-        f"{state.root_cause.summary}\n\n"
-        "Relevant lines:\n"
-        + "\n".join(f"  - {l}" for l in state.root_cause.relevant_lines)
-        + f"\n\nReproduction script (the success criterion — this MUST exit 0 "
-          f"after your fix; read it carefully to see what the fix must produce):\n"
-          f"```python\n{state.repro.repro_script}\n```\n"
-        + f"\nCulprit commit diff:\n```diff\n{state.bisect.commit_diff}\n```\n"
-        + "\nPlease fix this bug by patching the source so the reproduction passes."
+        plan_block
+        + evidence_block
+        + "## Success criterion — the reproduction MUST exit 0 after your fix\n"
+          f"```python\n{state.repro.repro_script}\n```\n\n"
+        + "Implement the FIX PLAN above with `apply_patch`, then run `run_repro` to "
+          "verify. Do NOT re-investigate the bug — the root cause is settled. Read a "
+          "file only to get the exact text for a patch. If `run_repro` still fails, "
+          "read its traceback/state and adjust your patch to match the plan."
     )
 
     model_id = cfg.model or os.getenv("AUTODEBUG_FIX_MODEL")

@@ -1,6 +1,6 @@
 {
   "system_prompt": "config/prompts/fix.yaml",
-  "tools": ["search_memory", "read_file", "list_files", "apply_patch", "run_repro", "run_tests", "load_skill", "update_skill", "submit_fix"],
+  "tools": ["search_memory", "read_file", "list_files", "apply_patch", "run_repro", "run_tests", "shell", "load_skill", "update_skill", "submit_fix"],
   "skills": ["systematic-debugging"],
   "time_budget_seconds": 900,
   "cost_budget_usd": 2.00,
@@ -8,8 +8,8 @@
   "cost_per_1k_output_tokens": 0.015,
   "max_retries": 2,
   "tool_call_limits": {
-    "read_file": 30,
-    "list_files": 10,
+    "read_file": 12,
+    "list_files": 4,
     "search_memory": 2,
     "load_skill": 2
   }

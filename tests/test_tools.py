@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from autodebug.sandbox import RunResult
-from autodebug.tools.shared import make_read_file_tool, make_list_files_tool
+from autodebug.tools.shared import make_read_file_tool, make_list_files_tool, make_shell_tool
 from autodebug.tools.repro import make_run_script_tool, make_submit_repro_tool
 from autodebug.tools.fix import make_apply_patch_tool, make_submit_fix_tool
 
@@ -217,6 +217,15 @@ def test_submit_fix_rejected_when_repro_still_fails():
     assert "cannot submit" in out.lower()
     assert result == []
     sandbox.git.assert_not_called()
+
+
+def test_shell_runs_command_and_returns_exit_code_and_output():
+    sandbox = MagicMock()
+    sandbox.exec.return_value = RunResult(exit_code=0, stdout="hello\n", stderr="")
+    tool = make_shell_tool(sandbox=sandbox)
+    out = tool.invoke({"command": "echo hello"})
+    sandbox.exec.assert_called_once_with("echo hello")
+    assert "exit_code=0" in out and "hello" in out
 
 
 def test_apply_patch_refuses_test_files():

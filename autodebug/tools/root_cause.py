@@ -81,7 +81,8 @@ def make_inspect_at_tool(sandbox: Sandbox, repro_script: str, **_):
 def make_submit_root_cause_tool(result: list, **_):
     @tool(parse_docstring=True)
     def submit_root_cause(
-        summary: str, relevant_lines: str | list[str], hypothesis: str, evidence: str,
+        summary: str, relevant_lines: str | list[str], hypothesis: str,
+        evidence: str, fix_plan: str,
     ) -> str:
         """Submit the root cause analysis once you have OBSERVED the failure.
 
@@ -94,6 +95,10 @@ def make_submit_root_cause_tool(result: list, **_):
             evidence: The runtime evidence you OBSERVED via run_repro_with_traceback
                 or inspect_at — the exception, the failing line, the values you saw.
                 Quote the tool output; do not fabricate.
+            fix_plan: The CONCRETE change the fixer must make to resolve the bug —
+                which file and function, the exact lines/block to change, and the
+                precise new logic (e.g. wrap which call in try/except, what the
+                fallback does). Specific enough to implement WITHOUT re-investigating.
         """
         if isinstance(relevant_lines, str):
             relevant_lines = [l.strip() for l in relevant_lines.splitlines() if l.strip()]
@@ -102,6 +107,7 @@ def make_submit_root_cause_tool(result: list, **_):
             relevant_lines=relevant_lines,
             hypothesis=hypothesis,
             evidence=evidence,
+            fix_plan=fix_plan,
         ))
         return "Root cause submitted."
     return submit_root_cause

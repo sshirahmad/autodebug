@@ -191,6 +191,12 @@ output: the exception type, the failing line, the values.
 > "run_repro_with_traceback: AttributeError at collection.py:670, local_collection=None,
 > os.path.isfile('.../MANIFEST.json')=False."
 
+**fix_plan**: The CONCRETE change the fixer will EXECUTE — be precise, it does not
+re-investigate. Name the file, the lines, and the exact new logic.
+> "In collection.py:670, before calling `from_path`, check
+> `os.path.isfile(os.path.join(b_search_path, 'MANIFEST.json'))`; if missing,
+> raise AnsibleError('Collection %s does not appear to have a MANIFEST.json...')."
+
 A report whose `evidence` was not observed at runtime is rejected.
 
 ---

@@ -249,6 +249,22 @@ class TestRunFix:
         assert state.stage == PipelineStage.DONE
         assert state.fix is not None
 
+    def test_prompt_leads_with_the_fix_plan(self, root_cause_state):
+        # Phase 2 handoff: the fixer is told to EXECUTE the root-cause plan.
+        root_cause_state.root_cause.fix_plan = "Wrap the pool in try/except OSError at black.py:614"
+        root_cause_state.root_cause.evidence = "OSError observed at black.py:632"
+        sink = {}
+        sb = _make_fake_sandbox()
+        with patch_sandbox("autodebug.agents.fix", sb), \
+             patch_capturing_create_agent("autodebug.agents.fix", sink):
+            from autodebug.registry import AutoDebugRegistry
+            from autodebug.agents.fix import run_fix
+            run_fix(root_cause_state, registry=AutoDebugRegistry.from_file())
+        text = sink["text"]
+        assert "FIX PLAN" in text and "try/except OSError at black.py:614" in text
+        assert "OSError observed at black.py:632" in text       # evidence forwarded
+        assert "Do NOT re-investigate" in text
+
 
 # ---------------------------------------------------------------------------
 # Budget tracking via middleware (unit-level)

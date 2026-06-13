@@ -6,7 +6,7 @@ from autodebug.tools import _FACTORIES
 
 
 EXPECTED_TOOLS = {
-    "read_file", "list_files",
+    "read_file", "list_files", "shell",
     "run_script", "submit_repro",
     "mark_bad", "mark_good", "mark_skip", "submit_result", "submit_culprit",
     "read_file_at_parent", "run_repro_with_traceback", "inspect_at", "submit_root_cause",

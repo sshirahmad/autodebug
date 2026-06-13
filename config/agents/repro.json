@@ -1,6 +1,6 @@
 {
   "system_prompt": "config/prompts/repro.yaml",
-  "tools": ["search_memory", "read_file", "list_files", "run_script", "submit_repro"],
+  "tools": ["search_memory", "read_file", "list_files", "run_script", "shell", "submit_repro"],
   "time_budget_seconds": 600,
   "cost_budget_usd": 2.00,
   "cost_per_1k_input_tokens": 0.003,

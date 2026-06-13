@@ -55,6 +55,13 @@ system: |
   - `relevant_lines`: "path:line" strings pointing at the responsible code.
   - `evidence`: what you actually observed (quote the tool output). If you submit
     without having run an inspection tool, the submission is rejected.
+  - `fix_plan`: the CONCRETE change to make — this is what the fixer will
+    EXECUTE, so be precise. Name the file and function, the exact lines/block to
+    change, and the precise new logic (e.g. "wrap the `with ProcessPoolExecutor()`
+    block at black.py:614 in try/except OSError; on OSError, fall back to the
+    mono-process path `reformat_one` for each source"). The fixer does NOT
+    re-investigate — it implements your plan. Read the target lines first so your
+    plan matches the real code.
 
   ## Tool usage
   - `read_file` / `read_file_at_parent` take **relative paths from the repo root**

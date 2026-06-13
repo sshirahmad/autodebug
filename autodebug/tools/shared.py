@@ -49,3 +49,22 @@ def make_list_files_tool(sandbox: Sandbox, **_):
         rel = _to_repo_relative(path) if path not in ("", ".") else "."
         return sandbox.list_files(rel or ".")
     return list_files
+
+
+def make_shell_tool(sandbox: Sandbox, **_):
+    @tool(parse_docstring=True)
+    def shell(command: str) -> str:
+        """Run a shell command in the repo sandbox and return its exit code + output.
+
+        A general-purpose terminal inside the container (cwd = repo root). Use it
+        for things the other tools don't cover — inspecting or setting up the
+        environment (e.g. `pip install <dep>`, `find . -name '*.pyc' -delete`,
+        `ls`, `grep`, running language-specific tooling). It runs in a disposable
+        per-run container, so it cannot affect the host; commands are time-limited.
+
+        Args:
+            command: The shell command to run (bash), e.g. "pip install regex".
+        """
+        run = sandbox.exec(command)
+        return f"exit_code={run.exit_code}\n{run.output[-4000:]}"
+    return shell
