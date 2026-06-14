@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import shlex
+from typing import Annotated
 
-from langchain_core.tools import tool
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import InjectedToolCallId, tool
+from langgraph.types import Command
 
 from autodebug.patch_utils import is_test_path
 from autodebug.sandbox import REPO_DIR, Sandbox
@@ -12,9 +15,12 @@ from autodebug.state import FixResult
 from autodebug.tools.introspect import postmortem_harness
 
 
-def make_apply_patch_tool(sandbox: Sandbox, patches: list, **_):
+def make_apply_patch_tool(sandbox: Sandbox, **_):
     @tool(parse_docstring=True)
-    def apply_patch(path: str, old_content: str, new_content: str) -> str:
+    def apply_patch(
+        path: str, old_content: str, new_content: str,
+        tool_call_id: Annotated[str, InjectedToolCallId],
+    ) -> Command | str:
         """Apply a code change by replacing old content with new content in a file.
 
         Args:
@@ -43,8 +49,11 @@ def make_apply_patch_tool(sandbox: Sandbox, patches: list, **_):
             )
         updated = original.replace(old_content, new_content, 1)
         sandbox.write_file(path, updated)
-        patches.append({"path": path, "old": old_content, "new": new_content})
-        return f"Patch applied to {path}"
+        # `patches` has an `add` reducer — this record is appended to the running list.
+        return Command(update={
+            "patches": [{"path": path, "old": old_content, "new": new_content}],
+            "messages": [ToolMessage(f"Patch applied to {path}", tool_call_id=tool_call_id)],
+        })
     return apply_patch
 
 
@@ -79,11 +88,12 @@ def make_run_tests_tool(sandbox: Sandbox, **_):
     return run_tests
 
 
-def make_submit_fix_tool(
-    sandbox: Sandbox, repro_script: str, patches: list, result: list, **_,
-):
+def make_submit_fix_tool(sandbox: Sandbox, repro_script: str, **_):
     @tool(parse_docstring=True)
-    def submit_fix(summary: str) -> str:
+    def submit_fix(
+        summary: str,
+        tool_call_id: Annotated[str, InjectedToolCallId],
+    ) -> Command | str:
         """Submit the fix once the reproduction passes.
 
         The reproduction is the success criterion: there is no benchmark test in
@@ -106,12 +116,13 @@ def make_submit_fix_tool(
             )
         # git apply requires a trailing newline; normalize so the patch is valid.
         diff = diff.rstrip("\n") + "\n"
-        result.append(FixResult(
-            patch=diff,
-            attempts=len(patches),
-            test_output="",
-        ))
-        return "Fix validated against the reproduction and submitted."
+        # `attempts` is filled in by the driver from the patches channel.
+        fix = FixResult(patch=diff, attempts=0, test_output="")
+        return Command(update={
+            "fix": fix.model_dump(),
+            "messages": [ToolMessage("Fix validated against the reproduction and submitted.",
+                                     tool_call_id=tool_call_id)],
+        })
     return submit_fix
 
 

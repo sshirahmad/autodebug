@@ -222,6 +222,35 @@ class TestManagerTools:
         assert "Cannot bisect" in out
         assert fsm.phase == ManagerPhase.REPRODUCED
 
+    def test_bisect_blank_culprit_is_rejected(self, fake_agents, state):
+        # A sub-agent that submits an empty SHA must NOT advance the FSM — that
+        # blank culprit caused a wasted repro+bisect redo in production.
+        m = _import_manager_tools()
+        fsm = FSM(phase=ManagerPhase.REPRODUCED)
+        state.repro = ReproResult(repro_script="x", error_output="boom", confirmed=True)
+        fake_agents.run_bisect = lambda s, *, registry=None: setattr(
+            s, "bisect", BisectResult(culprit_commit="   ", commit_message="",
+                                      commit_diff="", steps_taken=0)
+        )
+        tool = m.make_run_bisect_agent_tool(state=state, registry=None, fsm=fsm)
+        out = tool.invoke({})
+        assert "BISECT FAILED" in out
+        assert fsm.phase == ManagerPhase.REPRODUCED  # did NOT advance
+        assert state.bisect is None                  # cleared for a clean retry
+
+    def test_bisect_valid_culprit_advances(self, fake_agents, state):
+        m = _import_manager_tools()
+        fsm = FSM(phase=ManagerPhase.REPRODUCED)
+        state.repro = ReproResult(repro_script="x", error_output="boom", confirmed=True)
+        fake_agents.run_bisect = lambda s, *, registry=None: setattr(
+            s, "bisect", BisectResult(culprit_commit="abc123", commit_message="bad commit",
+                                      commit_diff="d", steps_taken=0)
+        )
+        tool = m.make_run_bisect_agent_tool(state=state, registry=None, fsm=fsm)
+        out = tool.invoke({})
+        assert fsm.phase == ManagerPhase.BISECTED
+        assert "CULPRIT FOUND: abc123" in out
+
     def test_fix_verified_advances_to_done(self, fake_agents, state):
         m = _import_manager_tools()
         fsm = FSM(phase=ManagerPhase.ANALYZED)
@@ -271,18 +300,20 @@ class TestManagerTools:
 
     def test_finish_success_and_failure(self, fake_agents, state):
         m = _import_manager_tools()
+
+        def _finish(fsm, outcome, summary):
+            tool = m.make_finish_tool(state=state, fsm=fsm)
+            res = tool.invoke({"name": "finish",
+                               "args": {"outcome": outcome, "summary": summary},
+                               "id": "c1", "type": "tool_call"})
+            return res.update["outcome"]   # the Command's outcome-channel write
+
         fsm = FSM(phase=ManagerPhase.REVISING)
-        res: list = []
-        tool = m.make_finish_tool(state=state, result=res, fsm=fsm)
-        tool.invoke({"outcome": "success", "summary": "done"})
-        assert res == [{"outcome": "success", "summary": "done"}]
+        assert _finish(fsm, "success", "done") == {"outcome": "success", "summary": "done"}
         assert fsm.phase == ManagerPhase.DONE
 
         fsm2 = FSM(phase=ManagerPhase.REVISING)
-        res2: list = []
-        tool2 = m.make_finish_tool(state=state, result=res2, fsm=fsm2)
-        tool2.invoke({"outcome": "failed", "summary": "stuck"})
-        assert res2[0]["outcome"] == "failed"
+        assert _finish(fsm2, "failed", "stuck")["outcome"] == "failed"
         assert fsm2.phase == ManagerPhase.FAILED
 
 

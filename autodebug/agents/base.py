@@ -309,19 +309,19 @@ def maybe_optimize_prompt(
     return current_prompt
 
 
-def submission_middleware(result: list) -> list:
-    """Stop the agent loop as soon as a submit_* tool populates `result`.
+def submission_middleware(channel: str) -> list:
+    """Stop the agent loop as soon as a submit_* tool writes its result `channel`.
 
     Without this, the agent keeps making LLM calls (and burning budget) after
-    its final tool answer is already on the result list — verifying its
-    candidate, re-reading code, or re-submitting the same answer. This
-    middleware checks the result list before each model invocation and jumps
-    to the agent's end node when it sees a result.
+    its final tool answer is already submitted — verifying its candidate,
+    re-reading code, or re-submitting the same answer. The submit tools record
+    their result into a graph-state channel (so the checkpointer persists it);
+    this before_model hook jumps to the agent's end node once that channel is set.
     """
 
     @before_model(can_jump_to=["end"])
     def _check_submitted(state: AgentState, runtime: Runtime):
-        if result:
+        if state.get(channel):
             return {"jump_to": "end"}
         return None
 

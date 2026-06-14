@@ -18,7 +18,6 @@ import sys
 
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage
-from langgraph.checkpoint.memory import InMemorySaver
 
 from autodebug.agents.base import (
     Budget, BudgetExceeded, attempt_trajectory, build_model, budget_middleware,
@@ -26,8 +25,10 @@ from autodebug.agents.base import (
     require_tool_calls_middleware, retry_feedback, submission_middleware,
     summarization_middleware, tool_call_limit_middleware,
 )
+from autodebug import resume
+from autodebug.agent_state import RootCauseAgentState
 from autodebug.sandbox import Sandbox
-from autodebug.state import DebugState, PipelineStage
+from autodebug.state import DebugState, PipelineStage, RootCauseResult
 
 _INSPECTION_TOOLS = {"run_repro_with_traceback", "inspect_at"}
 
@@ -49,7 +50,6 @@ def run_root_cause(state: DebugState, *, registry) -> DebugState:
     assert state.repro
 
     cfg = registry.get_config("root_cause")
-    result: list = []
 
     system_prompt = registry.system_prompt("root_cause")
     llm = build_model(model_id=cfg.model, provider=cfg.provider)
@@ -70,6 +70,18 @@ def run_root_cause(state: DebugState, *, registry) -> DebugState:
 
     crashed = False
     run_error: str | None = None
+    key = resume.bug_key(state)
+    saver = resume.get_saver()
+
+    # Resume: a prior run already produced a root cause (pure reasoning — no
+    # sandbox needed to rebuild it). Skip straight to the fix.
+    cached = resume.cached_root_cause(key, cfg.max_retries)
+    if cached is not None:
+        state.root_cause = cached
+        state.stage = PipelineStage.FIX
+        return state
+    resume.clear("root_cause", key, cfg.max_retries)
+
     with Sandbox(volume=state.repo_volume) as sandbox:
         initial_run = sandbox.run_script(state.repro.repro_script)
         initial_text = (
@@ -93,27 +105,26 @@ def run_root_cause(state: DebugState, *, registry) -> DebugState:
                 sandbox=sandbox,
                 parent_sha=f"{state.bisect.culprit_commit}^",
                 repro_script=state.repro.repro_script,
-                result=result,
             )
-            saver = InMemorySaver()
             agent = create_agent(
                 model=llm,
                 tools=tools,
                 system_prompt=system_prompt,
+                state_schema=RootCauseAgentState,
                 checkpointer=saver,
                 middleware=(
                     budget_middleware(budget)
                     + model_retry_middleware()
                     + planning_middleware()
                     + summarization_middleware(cfg.model, cfg.provider)
-                    + submission_middleware(result)
+                    + submission_middleware("root_cause")
                     + require_tool_calls_middleware()
                     + tool_call_limit_middleware(cfg.tool_call_limits)
                 ),
             )
             invoke_config = {
                 "recursion_limit": sys.maxsize,
-                "configurable": {"thread_id": f"root_cause-{attempt}"},
+                "configurable": {"thread_id": resume.thread_id("root_cause", key, attempt)},
             }
 
             crashed = False
@@ -132,17 +143,19 @@ def run_root_cause(state: DebugState, *, registry) -> DebugState:
             state.total_cost += budget.cost_used
             state.total_llm_calls += budget.calls
 
-            if result:
+            submitted = resume.read_live(agent, invoke_config, "root_cause")
+            if submitted:
                 messages = attempt_trajectory(agent, invoke_config)
                 last = attempt < cfg.max_retries
                 if _used_inspection_tool(messages) or not last:
                     # Accept if it observed the failure — or on the final attempt,
                     # accept anyway so the pipeline isn't blocked by a missing probe.
-                    state.root_cause = result[0]
+                    state.root_cause = RootCauseResult(**submitted)
                     state.stage = PipelineStage.FIX
                     return state
-                # Submitted without observing AND retries remain: reject, force a probe.
-                result.clear()
+                # Submitted without observing AND retries remain: reject and drop
+                # this attempt's thread so the unobserved hypothesis can't be resumed.
+                resume.clear_one("root_cause", key, attempt)
                 run_error = "submitted a hypothesis without observing the failure"
                 system_prompt += (
                     "\n\nYOU SUBMITTED WITHOUT OBSERVING THE FAILURE. Before calling "

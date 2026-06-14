@@ -14,6 +14,7 @@ import pytest
 from autodebug.agents.base import BudgetExceeded
 from autodebug.sandbox import RunResult
 from autodebug.state import (
+    BisectResult,
     DebugState,
     FixResult,
     PipelineStage,
@@ -27,19 +28,25 @@ from autodebug.state import (
 # ---------------------------------------------------------------------------
 
 class FakeAgent:
-    """Replacement for the CompiledStateGraph returned by create_agent."""
+    """Replacement for the compiled agent. A submit is simulated by `behavior`
+    writing into `self.state` (e.g. self.state["repro"] = {...}); the driver reads
+    it back via get_state(), mirroring the real result-channel flow."""
 
-    def __init__(self, on_invoke):
-        self._on_invoke = on_invoke
+    def __init__(self, behavior=None):
+        self.state = {"messages": []}
+        self._behavior = behavior
 
-    def invoke(self, *args, **kwargs):
-        return self._on_invoke()
+    def invoke(self, payload, **kwargs):
+        if self._behavior:
+            self._behavior(self)   # may write self.state[...] or raise
+        return self.state
+
+    def get_state(self, config):
+        return type("S", (), {"values": dict(self.state)})()
 
 
-def patch_create_agent(module_path: str, behavior):
-    def fake_create_agent(**kwargs):
-        return FakeAgent(behavior)
-    return patch(f"{module_path}.create_agent", new=fake_create_agent)
+def patch_create_agent(module_path: str, behavior=None):
+    return patch(f"{module_path}.create_agent", new=lambda **kw: FakeAgent(behavior))
 
 
 class _CapturingAgent:
@@ -80,21 +87,16 @@ def patch_sandbox(module_path: str, fake: MagicMock):
     return patch(f"{module_path}.Sandbox", return_value=fake)
 
 
-@pytest.fixture
-def capture_result_list(monkeypatch):
-    """Capture the `result` list kwarg as each agent's tools are built."""
-    holder: list = []
-
-    from autodebug.registry import AutoDebugRegistry
-    original = AutoDebugRegistry.build_tools
-
-    def patched(self, agent_name, **ctx):
-        if "result" in ctx:
-            holder.append(ctx["result"])
-        return original(self, agent_name, **ctx)
-
-    monkeypatch.setattr(AutoDebugRegistry, "build_tools", patched)
-    return holder
+@pytest.fixture(autouse=True)
+def _isolate_resume(monkeypatch, tmp_path):
+    """Keep unit tests hermetic: no cross-run resume short-circuit (so the mocked
+    agent actually runs) and a throwaway checkpoint dir."""
+    monkeypatch.setenv("AUTODEBUG_RESUME", "0")
+    monkeypatch.setenv("AUTODEBUG_CHECKPOINT_DIR", str(tmp_path))
+    from autodebug import resume
+    resume._saver = None
+    yield
+    resume._saver = None
 
 
 @contextmanager
@@ -114,11 +116,10 @@ def _patched_bisect_helpers():
 # ---------------------------------------------------------------------------
 
 class TestRunRepro:
-    def test_advances_to_bisect_when_result_populated(self, base_state, capture_result_list):
-        def behavior():
-            capture_result_list[0].append(
-                ReproResult(repro_script="x", error_output="boom", confirmed=True)
-            )
+    def test_advances_to_bisect_when_result_populated(self, base_state):
+        def behavior(agent):
+            agent.state["repro"] = ReproResult(
+                repro_script="x", error_output="boom", confirmed=True).model_dump()
         sb = _make_fake_sandbox()
         with patch_sandbox("autodebug.agents.repro", sb), \
              patch_create_agent("autodebug.agents.repro", behavior):
@@ -130,12 +131,10 @@ class TestRunRepro:
         assert state.repro is not None
         assert state.repro.confirmed is True
 
-    def test_fails_when_no_result_after_retries(self, base_state, capture_result_list):
-        def behavior():
-            pass
+    def test_fails_when_no_result_after_retries(self, base_state):
         sb = _make_fake_sandbox()
         with patch_sandbox("autodebug.agents.repro", sb), \
-             patch_create_agent("autodebug.agents.repro", behavior):
+             patch_create_agent("autodebug.agents.repro", behavior=None):
             from autodebug.registry import AutoDebugRegistry
             from autodebug.agents.repro import run_repro
             state = run_repro(base_state, registry=AutoDebugRegistry.from_file())
@@ -143,8 +142,8 @@ class TestRunRepro:
         assert state.stage == PipelineStage.FAILED
         assert "reproduce" in (state.error or "").lower()
 
-    def test_fails_when_budget_exceeded_on_every_attempt(self, base_state, capture_result_list):
-        def behavior():
+    def test_fails_when_budget_exceeded_on_every_attempt(self, base_state):
+        def behavior(agent):
             raise BudgetExceeded("token budget hit")
         sb = _make_fake_sandbox()
         with patch_sandbox("autodebug.agents.repro", sb), \
@@ -156,10 +155,10 @@ class TestRunRepro:
         assert state.stage == PipelineStage.FAILED
         assert "budget exceeded" in (state.error or "").lower()
 
-    def test_degrades_to_failed_on_unexpected_error(self, base_state, capture_result_list):
+    def test_degrades_to_failed_on_unexpected_error(self, base_state):
         """A non-budget exception (transient provider/tool error) must degrade to a
         FAILED state with the cause recorded — not propagate and crash the pipeline."""
-        def behavior():
+        def behavior(agent):
             raise RuntimeError("Provider returned error 400")
         sb = _make_fake_sandbox()
         with patch_sandbox("autodebug.agents.repro", sb), \
@@ -176,34 +175,31 @@ class TestRunRepro:
 # run_root_cause
 # ---------------------------------------------------------------------------
 
-def _patch_root_cause_agent(behavior, inspected: bool):
-    """Fake create_agent whose get_state reports whether an inspection tool ran."""
+def _patch_root_cause_agent(rc, inspected: bool):
+    """Fake create_agent: writes the root_cause channel and reports (via messages)
+    whether an inspection tool was used."""
     from langchain_core.messages import AIMessage
 
-    class _Fake:
-        def invoke(self, *a, **k):
-            return behavior() or {}
+    def behavior(agent):
+        agent.state["root_cause"] = rc.model_dump()
+        agent.state["messages"] = (
+            [AIMessage(content="", tool_calls=[
+                {"name": "inspect_at", "args": {}, "id": "1", "type": "tool_call"}])]
+            if inspected else []
+        )
 
-        def get_state(self, config):
-            msgs = []
-            if inspected:
-                msgs = [AIMessage(content="", tool_calls=[
-                    {"name": "inspect_at", "args": {}, "id": "1", "type": "tool_call"}])]
-            return type("S", (), {"values": {"messages": msgs}})()
-
-    return patch("autodebug.agents.root_cause.create_agent", new=lambda **kw: _Fake())
+    return patch("autodebug.agents.root_cause.create_agent", new=lambda **kw: FakeAgent(behavior))
 
 
 class TestRunRootCause:
-    def test_advances_to_fix_when_inspected_and_submitted(self, bisect_state, capture_result_list):
-        def behavior():
-            capture_result_list[-1].append(RootCauseResult(
-                summary="op bug", relevant_lines=["calc.py:2"],
-                hypothesis="- used instead of +", evidence="observed at calc.py:2"))
+    def test_advances_to_fix_when_inspected_and_submitted(self, bisect_state):
+        rc = RootCauseResult(
+            summary="op bug", relevant_lines=["calc.py:2"],
+            hypothesis="- used instead of +", evidence="observed at calc.py:2")
         sb = _make_fake_sandbox()
         sb.run_script.return_value = RunResult(exit_code=1, stdout="", stderr="AssertionError")
         with patch_sandbox("autodebug.agents.root_cause", sb), \
-             _patch_root_cause_agent(behavior, inspected=True):
+             _patch_root_cause_agent(rc, inspected=True):
             from autodebug.registry import AutoDebugRegistry
             from autodebug.agents.root_cause import run_root_cause
             state = run_root_cause(bisect_state, registry=AutoDebugRegistry.from_file())
@@ -212,17 +208,15 @@ class TestRunRootCause:
         assert state.root_cause.hypothesis == "- used instead of +"
         assert state.root_cause.evidence == "observed at calc.py:2"
 
-    def test_does_not_hard_fail_without_inspection(self, bisect_state, capture_result_list):
+    def test_does_not_hard_fail_without_inspection(self, bisect_state):
         # No inspection tool used: rejected on early attempts but ACCEPTED on the
         # final one — the pipeline degrades gracefully instead of failing outright
         # (the regression that response_format introduced).
-        def behavior():
-            capture_result_list[-1].append(RootCauseResult(
-                summary="s", relevant_lines=["f:1"], hypothesis="h", evidence="e"))
+        rc = RootCauseResult(summary="s", relevant_lines=["f:1"], hypothesis="h", evidence="e")
         sb = _make_fake_sandbox()
         sb.run_script.return_value = RunResult(exit_code=1, stdout="", stderr="x")
         with patch_sandbox("autodebug.agents.root_cause", sb), \
-             _patch_root_cause_agent(behavior, inspected=False):
+             _patch_root_cause_agent(rc, inspected=False):
             from autodebug.registry import AutoDebugRegistry
             from autodebug.agents.root_cause import run_root_cause
             state = run_root_cause(bisect_state, registry=AutoDebugRegistry.from_file())
@@ -235,10 +229,10 @@ class TestRunRootCause:
 # ---------------------------------------------------------------------------
 
 class TestRunFix:
-    def test_advances_to_done_when_result_populated(self, root_cause_state, capture_result_list):
-        def behavior():
-            results = [lst for lst in capture_result_list if isinstance(lst, list)]
-            results[-1].append(FixResult(patch="x", attempts=1, test_output="all passed"))
+    def test_advances_to_done_when_result_populated(self, root_cause_state):
+        def behavior(agent):
+            agent.state["fix"] = FixResult(
+                patch="x", attempts=1, test_output="all passed").model_dump()
         sb = _make_fake_sandbox()
         with patch_sandbox("autodebug.agents.fix", sb), \
              patch_create_agent("autodebug.agents.fix", behavior):
@@ -379,26 +373,24 @@ class TestSessionBudgetMiddleware:
 
 
 class TestSubmissionMiddleware:
-    def test_jumps_to_end_when_result_populated(self):
+    def test_jumps_to_end_when_channel_populated(self):
         from autodebug.agents.base import submission_middleware
-        result = ["submitted"]
-        mw = submission_middleware(result)
+        mw = submission_middleware("repro")
         assert len(mw) == 1
-        # Call the underlying hook function directly (decorated as before_model)
-        out = mw[0].before_model(state={"messages": []}, runtime=None)
+        # Call the underlying hook directly: the result channel is set -> jump to end.
+        out = mw[0].before_model(state={"messages": [], "repro": {"confirmed": True}}, runtime=None)
         assert out == {"jump_to": "end"}
 
-    def test_returns_none_when_result_empty(self):
+    def test_returns_none_when_channel_empty(self):
         from autodebug.agents.base import submission_middleware
-        result: list = []
-        mw = submission_middleware(result)
-        out = mw[0].before_model(state={"messages": []}, runtime=None)
+        mw = submission_middleware("repro")
+        out = mw[0].before_model(state={"messages": [], "repro": None}, runtime=None)
         assert out is None
 
     def test_combined_with_budget_middleware(self):
         from autodebug.agents.base import Budget, budget_middleware, submission_middleware
         budget = Budget()
-        combined = budget_middleware(budget) + submission_middleware([])
+        combined = budget_middleware(budget) + submission_middleware("repro")
         assert len(combined) == 3  # check_budget + track_tokens + check_submitted
 
 

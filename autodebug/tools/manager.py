@@ -13,7 +13,11 @@ the autodebug.agents package at import time — avoiding a circular import.
 
 from __future__ import annotations
 
-from langchain_core.tools import tool
+from typing import Annotated
+
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import InjectedToolCallId, tool
+from langgraph.types import Command
 
 from autodebug.fsm import FSM, ManagerPhase
 
@@ -70,12 +74,16 @@ def make_run_bisect_agent_tool(state, registry, fsm: FSM, **_):
         if err:
             return (f"BISECT sub-agent crashed: {err}. This may be transient — "
                     "retry run_bisect_agent, or finish('failed', ...) if it persists.")
-        if state.bisect:
+        # Defense in depth: a result with a blank culprit SHA is not a real
+        # find. Treat it as a failure (and clear it) so the FSM doesn't advance
+        # on a bogus culprit and a retry starts clean.
+        if state.bisect and state.bisect.culprit_commit.strip():
             fsm.to(ManagerPhase.BISECTED)
             return (
                 f"CULPRIT FOUND: {state.bisect.culprit_commit} — "
                 f"{state.bisect.commit_message}"
             )
+        state.bisect = None
         return "BISECT FAILED — no culprit commit identified. Retry or finish('failed', ...)."
 
     return run_bisect_agent
@@ -135,9 +143,13 @@ def make_run_fix_agent_tool(state, registry, fsm: FSM, **_):
     return run_fix_agent
 
 
-def make_finish_tool(state, result: list, fsm: FSM, **_):
+def make_finish_tool(state, fsm: FSM, **_):
     @tool(parse_docstring=True)
-    def finish(outcome: str, summary: str = "") -> str:
+    def finish(
+        outcome: str,
+        tool_call_id: Annotated[str, InjectedToolCallId],
+        summary: str = "",
+    ) -> Command:
         """Conclude the debugging session.
 
         Args:
@@ -145,8 +157,10 @@ def make_finish_tool(state, result: list, fsm: FSM, **_):
             summary: one-line explanation of the outcome.
         """
         ok = outcome.strip().lower() == "success"
-        result.append({"outcome": "success" if ok else "failed", "summary": summary})
         fsm.to(ManagerPhase.DONE if ok else ManagerPhase.FAILED)
-        return "Session concluded."
+        return Command(update={
+            "outcome": {"outcome": "success" if ok else "failed", "summary": summary},
+            "messages": [ToolMessage("Session concluded.", tool_call_id=tool_call_id)],
+        })
 
     return finish

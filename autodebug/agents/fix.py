@@ -7,7 +7,6 @@ import sys
 
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage
-from langgraph.checkpoint.memory import InMemorySaver
 
 from autodebug.agents.base import (
     Budget, BudgetExceeded, attempt_trajectory, build_model, budget_middleware,
@@ -15,8 +14,10 @@ from autodebug.agents.base import (
     require_tool_calls_middleware, retry_feedback, submission_middleware,
     summarization_middleware, tool_call_limit_middleware,
 )
+from autodebug import resume
+from autodebug.agent_state import FixAgentState
 from autodebug.sandbox import Sandbox
-from autodebug.state import DebugState, PipelineStage
+from autodebug.state import DebugState, FixResult, PipelineStage
 
 
 def run_fix(state: DebugState, *, registry) -> DebugState:
@@ -27,8 +28,6 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
     assert state.root_cause
 
     cfg = registry.get_config("fix")
-    patches: list[dict] = []
-    result: list = []
 
     rc = state.root_cause
     plan_block = (
@@ -60,6 +59,11 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
 
     crashed = False
     run_error: str | None = None
+    key = resume.bug_key(state)
+    saver = resume.get_saver()
+    # The fix is never resumed from cache — it's the stage we re-attempt — but its
+    # state is still persisted (durability). Drop stale threads before a fresh run.
+    resume.clear("fix", key, cfg.max_retries)
     with Sandbox(volume=state.repo_volume) as sandbox:
         for attempt in range(cfg.max_retries + 1):
             budget = Budget.from_config(cfg)
@@ -67,28 +71,26 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
                 "fix",
                 sandbox=sandbox,
                 repro_script=state.repro.repro_script,
-                patches=patches,
-                result=result,
             )
-            saver = InMemorySaver()
             agent = create_agent(
                 model=llm,
                 tools=tools,
                 system_prompt=system_prompt,
+                state_schema=FixAgentState,
                 checkpointer=saver,
                 middleware=(
                     budget_middleware(budget)
                     + model_retry_middleware()
                     + planning_middleware()
                     + summarization_middleware(model_id, provider)
-                    + submission_middleware(result)
+                    + submission_middleware("fix")
                     + require_tool_calls_middleware()
                     + tool_call_limit_middleware(cfg.tool_call_limits)
                 ),
             )
             invoke_config = {
                 "recursion_limit": sys.maxsize,
-                "configurable": {"thread_id": f"fix-{attempt}"},
+                "configurable": {"thread_id": resume.thread_id("fix", key, attempt)},
             }
 
             crashed = False
@@ -107,8 +109,10 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
             state.total_cost += budget.cost_used
             state.total_llm_calls += budget.calls
 
-            if result:
-                state.fix = result[0]
+            submitted = resume.read_live(agent, invoke_config, "fix")
+            if submitted:
+                patches = resume.read_live(agent, invoke_config, "patches") or []
+                state.fix = FixResult(**{**submitted, "attempts": len(patches)})
                 state.stage = PipelineStage.DONE
                 return state
 

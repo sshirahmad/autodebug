@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from langchain_core.tools import tool
+from typing import Annotated
+
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import InjectedToolCallId, tool
+from langgraph.types import Command
 
 from autodebug.sandbox import Sandbox
 from autodebug.state import BisectResult
@@ -54,23 +58,41 @@ def make_submit_result_tool(sha: str, info, result: list, **_):
     return submit_result
 
 
-def make_submit_culprit_tool(sandbox: Sandbox, result: list, **_):
+def make_submit_culprit_tool(sandbox: Sandbox, **_):
     from autodebug.tools import git_utils as _gu
 
     @tool(parse_docstring=True)
-    def submit_culprit(sha: str, explanation: str) -> str:
+    def submit_culprit(
+        sha: str, explanation: str,
+        tool_call_id: Annotated[str, InjectedToolCallId],
+    ) -> Command | str:
         """Submit the SHA of the commit that introduced the bug.
 
         Args:
             sha: The full or short commit SHA of the culprit commit.
             explanation: Brief explanation of why this commit is the culprit.
         """
+        # Validate BEFORE recording: an empty or unresolvable SHA must NOT be
+        # accepted as a culprit (returning a string leaves the channel unset, so
+        # the agent keeps iterating instead of advancing on a bogus culprit).
+        sha = (sha or "").strip()
+        if not sha:
+            return ("No SHA provided. Identify the culprit first (e.g. "
+                    "`git log --oneline <known_good>..HEAD`), then call submit_culprit "
+                    "with its SHA.")
         info = _gu.get_commit_info(sandbox, sha)
-        result.append(BisectResult(
+        if not info.sha:
+            return (f"'{sha}' does not resolve to a commit in this repo. Verify it "
+                    "with `git show <sha>` and submit a real culprit SHA.")
+        bisect = BisectResult(
             culprit_commit=info.sha,
             commit_message=info.message,
             commit_diff=info.diff,
             steps_taken=0,
-        ))
-        return f"Culprit commit recorded: {info.sha} — {info.message}"
+        )
+        return Command(update={
+            "bisect": bisect.model_dump(),
+            "messages": [ToolMessage(f"Culprit commit recorded: {info.sha} — {info.message}",
+                                     tool_call_id=tool_call_id)],
+        })
     return submit_culprit

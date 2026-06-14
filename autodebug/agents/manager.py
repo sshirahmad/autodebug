@@ -14,12 +14,15 @@ AUTODEBUG_MANAGER != 0). The classic linear pipeline remains the fallback.
 from __future__ import annotations
 
 import sys
+import uuid
 
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage
 
 import os
 
+from autodebug import resume
+from autodebug.agent_state import ManagerAgentState
 from autodebug.agents.base import (
     Budget, BudgetExceeded, build_model, budget_middleware, model_retry_middleware,
     planning_middleware, require_tool_calls_middleware, session_budget_middleware,
@@ -53,7 +56,6 @@ def run_manager(state: DebugState, *, registry) -> DebugState:
 
     cfg = registry.get_config("manager")
     fsm = FSM()
-    result: list = []
     prompts = registry.prompt_states("manager")
 
     llm = build_model(model_id=cfg.model, provider=cfg.provider)
@@ -78,11 +80,13 @@ def run_manager(state: DebugState, *, registry) -> DebugState:
 
     budget = Budget.from_config(cfg)
     tools = registry.build_tools(
-        "manager", state=state, registry=registry, fsm=fsm, result=result,
+        "manager", state=state, registry=registry, fsm=fsm,
     )
     agent = create_agent(
         model=llm,
         tools=tools,
+        state_schema=ManagerAgentState,
+        checkpointer=resume.get_saver(),
         middleware=(
             budget_middleware(budget)
             + model_retry_middleware()
@@ -92,18 +96,23 @@ def run_manager(state: DebugState, *, registry) -> DebugState:
             + [fsm_prompt(fsm, prompts, progress_fn=lambda: _progress_block(state, fsm))]
             + [fsm_tool_gate(fsm, MANAGER_ALLOWED_TOOLS)]
             + [fsm_tool_enforce(fsm, MANAGER_ALLOWED_TOOLS)]
-            + submission_middleware(result)
+            + submission_middleware("outcome")
             + require_tool_calls_middleware()
             + tool_call_limit_middleware(cfg.tool_call_limits)
         ),
     )
 
+    # Fresh thread per run: the manager REPLAYS its orchestration each time
+    # (cheap — the sub-agents serve their results from cache on resume), rather
+    # than resuming mid-conversation where a skipped sub-agent call would leave
+    # state.repro/bisect/root_cause empty for the fixer.
+    invoke_config = {
+        "recursion_limit": sys.maxsize,
+        "configurable": {"thread_id": f"manager-{resume.bug_key(state)}-{uuid.uuid4().hex[:8]}"},
+    }
     session_error = ""
     try:
-        agent.invoke(
-            {"messages": [HumanMessage(content=initial_text)]},
-            config={"recursion_limit": sys.maxsize},
-        )
+        agent.invoke({"messages": [HumanMessage(content=initial_text)]}, config=invoke_config)
     except BudgetExceeded as e:
         session_error = str(e)
     except Exception as e:  # noqa: BLE001 — never let one error abort the pipeline
@@ -116,8 +125,9 @@ def run_manager(state: DebugState, *, registry) -> DebugState:
 
     # Outcome: trust an explicit finish('success'); otherwise a verified fix on
     # state still counts. Everything else is a failure.
+    outcome = resume.read_live(agent, invoke_config, "outcome")
     succeeded = bool(state.fix) and (
-        not result or result[0].get("outcome") == "success"
+        not outcome or outcome.get("outcome") == "success"
     )
     if succeeded:
         state.stage = PipelineStage.DONE
@@ -127,6 +137,6 @@ def run_manager(state: DebugState, *, registry) -> DebugState:
         if session_error:
             state.error = f"ManagerAgent: {session_error}"
         elif not state.error:
-            reason = result[0]["summary"] if result else "no verified fix produced"
+            reason = outcome["summary"] if outcome else "no verified fix produced"
             state.error = f"ManagerAgent: {reason}"
     return state

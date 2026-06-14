@@ -6,7 +6,6 @@ import sys
 
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage
-from langgraph.checkpoint.memory import InMemorySaver
 
 from autodebug.agents.base import (
     Budget, BudgetExceeded, attempt_trajectory, build_model, budget_middleware,
@@ -14,6 +13,8 @@ from autodebug.agents.base import (
     require_tool_calls_middleware, retry_feedback, submission_middleware,
     summarization_middleware, tool_call_limit_middleware,
 )
+from autodebug import resume
+from autodebug.agent_state import BisectAgentState
 from autodebug.sandbox import Sandbox
 from autodebug.state import BisectResult, DebugState, PipelineStage
 from autodebug.tools import git_utils
@@ -25,14 +26,24 @@ def run_bisect(state: DebugState, *, registry) -> DebugState:
     assert state.repro and state.repro.confirmed
 
     cfg = registry.get_config("bisect")
-    result: list[BisectResult] = []
     known_good = state.known_good_commit or ""
 
     system_prompt = registry.system_prompt("bisect")
     llm = build_model(model_id=cfg.model, provider=cfg.provider)
 
+    key = resume.bug_key(state)
+    saver = resume.get_saver()
     with Sandbox(volume=state.repo_volume) as sandbox:
         git_utils.unshallow(sandbox)
+
+        # Resume: a prior run already identified the culprit — re-read its commit.
+        cached = resume.cached_bisect(key, cfg.max_retries, sandbox)
+        if cached is not None:
+            state.bisect = cached
+            state.stage = PipelineStage.ROOT_CAUSE
+            return state
+        resume.clear("bisect", key, cfg.max_retries)
+
         original_sha = git_utils.current_sha(sandbox)
         head_info = git_utils.get_commit_info(sandbox, original_sha)
 
@@ -52,26 +63,26 @@ def run_bisect(state: DebugState, *, registry) -> DebugState:
         run_error: str | None = None
         for attempt in range(cfg.max_retries + 1):
             budget = Budget.from_config(cfg)
-            tools = registry.build_tools("bisect", sandbox=sandbox, result=result)
-            saver = InMemorySaver()
+            tools = registry.build_tools("bisect", sandbox=sandbox)
             agent = create_agent(
                 model=llm,
                 tools=tools,
                 system_prompt=system_prompt,
+                state_schema=BisectAgentState,
                 checkpointer=saver,
                 middleware=(
                     budget_middleware(budget)
                     + model_retry_middleware()
                     + planning_middleware()
                     + summarization_middleware(cfg.model, cfg.provider)
-                    + submission_middleware(result)
+                    + submission_middleware("bisect")
                     + require_tool_calls_middleware()
                     + tool_call_limit_middleware(cfg.tool_call_limits)
                 ),
             )
             invoke_config = {
                 "recursion_limit": sys.maxsize,
-                "configurable": {"thread_id": f"bisect-{attempt}"},
+                "configurable": {"thread_id": resume.thread_id("bisect", key, attempt)},
             }
 
             crashed = False
@@ -93,8 +104,9 @@ def run_bisect(state: DebugState, *, registry) -> DebugState:
             # Accept a submitted result even if the attempt later crashed —
             # the agent often submits then keeps over-investigating until the
             # budget hits, and we'd otherwise throw away a valid answer.
-            if result:
-                state.bisect = result[0]
+            submitted = resume.read_live(agent, invoke_config, "bisect")
+            if submitted:
+                state.bisect = BisectResult(**submitted)
                 state.stage = PipelineStage.ROOT_CAUSE
                 return state
 

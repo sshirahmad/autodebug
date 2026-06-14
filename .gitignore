@@ -29,3 +29,6 @@ BugsInPy/
 
 # LangMem SQLite store (env-specific binary)
 data/
+
+# Agent checkpoints / resume store (per-machine, regenerated)
+.autodebug/

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from langchain_core.tools import tool
+from typing import Annotated
+
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import InjectedToolCallId, tool
+from langgraph.types import Command
 
 import re
 
@@ -78,12 +82,13 @@ def make_inspect_at_tool(sandbox: Sandbox, repro_script: str, **_):
     return inspect_at
 
 
-def make_submit_root_cause_tool(result: list, **_):
+def make_submit_root_cause_tool(**_):
     @tool(parse_docstring=True)
     def submit_root_cause(
         summary: str, relevant_lines: str | list[str], hypothesis: str,
         evidence: str, fix_plan: str,
-    ) -> str:
+        tool_call_id: Annotated[str, InjectedToolCallId],
+    ) -> Command:
         """Submit the root cause analysis once you have OBSERVED the failure.
 
         Args:
@@ -102,12 +107,15 @@ def make_submit_root_cause_tool(result: list, **_):
         """
         if isinstance(relevant_lines, str):
             relevant_lines = [l.strip() for l in relevant_lines.splitlines() if l.strip()]
-        result.append(RootCauseResult(
+        rc = RootCauseResult(
             summary=summary,
             relevant_lines=relevant_lines,
             hypothesis=hypothesis,
             evidence=evidence,
             fix_plan=fix_plan,
-        ))
-        return "Root cause submitted."
+        )
+        return Command(update={
+            "root_cause": rc.model_dump(),
+            "messages": [ToolMessage("Root cause submitted.", tool_call_id=tool_call_id)],
+        })
     return submit_root_cause

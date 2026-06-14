@@ -36,12 +36,14 @@ def test_every_tool_has_a_description():
 
 def test_every_tool_argument_has_a_description():
     """Guards against adding a tool without parse_docstring=True / Args: — the
-    model can't see arg descriptions otherwise."""
+    model can't see arg descriptions otherwise. Uses the model-facing schema
+    (tool_call_schema), which excludes injected args like tool_call_id."""
     missing = {}
     for name, t in _build_all_tools().items():
-        if not t.args_schema:
+        schema = getattr(t, "tool_call_schema", None) or t.args_schema
+        if not schema:
             continue
-        props = t.args_schema.model_json_schema().get("properties", {})
+        props = schema.model_json_schema().get("properties", {})
         undocumented = [a for a, v in props.items() if not v.get("description")]
         if undocumented:
             missing[name] = undocumented
@@ -106,25 +108,37 @@ def test_run_script_returns_json():
 # submit_repro
 # ---------------------------------------------------------------------------
 
+def _call(tool, **args):
+    """Invoke a tool via a tool-call so injected args (tool_call_id) are filled.
+    Returns a Command (accepted submit) or a ToolMessage (rejected/plain string)."""
+    return tool.invoke({"name": tool.name, "args": args, "id": "call_test", "type": "tool_call"})
+
+
+def _update(res) -> dict:
+    """The state update a tool's Command carries, or {} for a plain ToolMessage."""
+    return getattr(res, "update", {}) or {}
+
+
+def _content(res) -> str:
+    return getattr(res, "content", None) or str(res)
+
+
 def test_submit_repro_confirmed_when_script_fails():
     sandbox = MagicMock()
     sandbox.run_script.return_value = RunResult(exit_code=1, stdout="", stderr="ValueError")
-    result_holder = []
-    tool = make_submit_repro_tool(sandbox=sandbox, result=result_holder)
-    output = tool.invoke({"script": "raise ValueError()", "error_output": "ValueError"})
-    assert "confirmed" in output.lower()
-    assert len(result_holder) == 1
-    assert result_holder[0].confirmed is True
+    tool = make_submit_repro_tool(sandbox=sandbox)
+    res = _call(tool, script="raise ValueError()", error_output="ValueError")
+    repro = _update(res).get("repro")
+    assert repro and repro["confirmed"] is True and repro["repro_script"] == "raise ValueError()"
 
 
 def test_submit_repro_rejected_when_script_passes():
     sandbox = MagicMock()
     sandbox.run_script.return_value = RunResult(exit_code=0, stdout="", stderr="")
-    result_holder = []
-    tool = make_submit_repro_tool(sandbox=sandbox, result=result_holder)
-    output = tool.invoke({"script": "print('ok')", "error_output": ""})
-    assert "not reproduced" in output.lower()
-    assert len(result_holder) == 0
+    tool = make_submit_repro_tool(sandbox=sandbox)
+    res = _call(tool, script="print('ok')", error_output="")
+    assert "not reproduced" in _content(res).lower()
+    assert not _update(res)  # nothing written to the channel
 
 
 # ---------------------------------------------------------------------------
@@ -147,38 +161,28 @@ def _sandbox_with_file(content: str) -> MagicMock:
 
 
 def test_apply_patch_success():
-    patches = []
     sandbox = _sandbox_with_file("def add(a, b):\n    return a - b  # bug\n")
-    tool = make_apply_patch_tool(sandbox=sandbox, patches=patches)
-    result = tool.invoke({
-        "path": "calc.py",
-        "old_content": "return a - b  # bug",
-        "new_content": "return a + b",
-    })
-    assert "applied" in result.lower()
-    assert len(patches) == 1
+    tool = make_apply_patch_tool(sandbox=sandbox)
+    res = _call(tool, path="calc.py", old_content="return a - b  # bug", new_content="return a + b")
+    patches = _update(res).get("patches")
+    assert patches and patches[0]["path"] == "calc.py"
     sandbox.write_file.assert_called_once()
 
 
 def test_apply_patch_old_content_not_found():
-    patches = []
     sandbox = _sandbox_with_file("def add(a, b):\n    return a - b  # bug\n")
-    tool = make_apply_patch_tool(sandbox=sandbox, patches=patches)
-    result = tool.invoke({
-        "path": "calc.py",
-        "old_content": "this does not exist in the file",
-        "new_content": "something",
-    })
-    assert "error" in result.lower()
-    assert len(patches) == 0
+    tool = make_apply_patch_tool(sandbox=sandbox)
+    res = _call(tool, path="calc.py", old_content="this does not exist in the file", new_content="x")
+    assert "error" in _content(res).lower()
+    assert not _update(res)
 
 
 def test_apply_patch_file_not_found():
     sandbox = MagicMock()
     sandbox.exec.return_value = RunResult(exit_code=1, stdout="", stderr="")  # test -f fails
-    tool = make_apply_patch_tool(sandbox=sandbox, patches=[])
-    result = tool.invoke({"path": "ghost.py", "old_content": "x", "new_content": "y"})
-    assert "not found" in result.lower()
+    tool = make_apply_patch_tool(sandbox=sandbox)
+    res = _call(tool, path="ghost.py", old_content="x", new_content="y")
+    assert "not found" in _content(res).lower()
 
 
 def test_submit_fix_uses_repro_as_oracle_and_captures_git_diff():
@@ -187,12 +191,11 @@ def test_submit_fix_uses_repro_as_oracle_and_captures_git_diff():
     sandbox = MagicMock()
     sandbox.run_script.return_value = RunResult(exit_code=0, stdout="ok", stderr="")  # repro passes
     sandbox.git.return_value = RunResult(exit_code=0, stdout="THE REAL DIFF", stderr="")
-    result, patches = [], [{"path": "a.py"}]
-    tool = make_submit_fix_tool(sandbox=sandbox, repro_script="s", patches=patches, result=result)
-    out = tool.invoke({"summary": "fixed it"})
-    assert "submitted" in out.lower()
+    tool = make_submit_fix_tool(sandbox=sandbox, repro_script="s")
+    res = _call(tool, summary="fixed it")
+    fix = _update(res).get("fix")
     # Patch is normalized to end with a newline (git apply requires it).
-    assert len(result) == 1 and result[0].patch == "THE REAL DIFF\n"
+    assert fix and fix["patch"] == "THE REAL DIFF\n"
     sandbox.git.assert_called_once_with("diff")
 
 
@@ -201,21 +204,19 @@ def test_submit_fix_rejected_when_diff_is_empty():
     sandbox = MagicMock()
     sandbox.run_script.return_value = RunResult(exit_code=0, stdout="ok", stderr="")
     sandbox.git.return_value = RunResult(exit_code=0, stdout="  \n", stderr="")  # empty diff
-    result = []
-    tool = make_submit_fix_tool(sandbox=sandbox, repro_script="s", patches=[], result=result)
-    out = tool.invoke({"summary": "x"})
-    assert "no source changes" in out.lower()
-    assert result == []
+    tool = make_submit_fix_tool(sandbox=sandbox, repro_script="s")
+    res = _call(tool, summary="x")
+    assert "no source changes" in _content(res).lower()
+    assert not _update(res)
 
 
 def test_submit_fix_rejected_when_repro_still_fails():
     sandbox = MagicMock()
     sandbox.run_script.return_value = RunResult(exit_code=1, stdout="", stderr="boom")  # repro fails
-    result = []
-    tool = make_submit_fix_tool(sandbox=sandbox, repro_script="s", patches=[], result=result)
-    out = tool.invoke({"summary": "x"})
-    assert "cannot submit" in out.lower()
-    assert result == []
+    tool = make_submit_fix_tool(sandbox=sandbox, repro_script="s")
+    res = _call(tool, summary="x")
+    assert "cannot submit" in _content(res).lower()
+    assert not _update(res)
     sandbox.git.assert_not_called()
 
 
@@ -231,11 +232,50 @@ def test_shell_runs_command_and_returns_exit_code_and_output():
 def test_apply_patch_refuses_test_files():
     """The fix agent must not edit the test that serves as its success oracle."""
     sandbox = MagicMock()
-    patches = []
-    tool = make_apply_patch_tool(sandbox=sandbox, patches=patches)
+    tool = make_apply_patch_tool(sandbox=sandbox)
     for path in ("test/units/test_x.py", "tests/test_foo.py", "pkg/foo/bar_test.py"):
-        result = tool.invoke({"path": path, "old_content": "a", "new_content": "b"})
-        assert "refused" in result.lower() and "test" in result.lower()
-    assert patches == []
+        res = _call(tool, path=path, old_content="a", new_content="b")
+        assert "refused" in _content(res).lower() and "test" in _content(res).lower()
+        assert not _update(res)
     sandbox.exec.assert_not_called()       # rejected before any filesystem access
     sandbox.write_file.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# submit_culprit (bisect) — must reject empty / unresolvable SHAs so a bogus
+# culprit never propagates to the manager (which would advance on it).
+# ---------------------------------------------------------------------------
+
+from unittest.mock import patch
+from autodebug.tools.bisect import make_submit_culprit_tool
+from autodebug.tools.git_utils import CommitInfo
+
+
+def _commit_info(sha: str) -> CommitInfo:
+    return CommitInfo(sha=sha, short_sha=sha[:7], message="msg" if sha else "",
+                      author="a", date="d", diff="diff" if sha else "")
+
+
+def test_submit_culprit_records_a_resolvable_sha():
+    tool = make_submit_culprit_tool(sandbox=MagicMock())
+    with patch("autodebug.tools.git_utils.get_commit_info",
+               return_value=_commit_info("abc123def456")):
+        res = _call(tool, sha="abc123", explanation="introduced the bug")
+    bisect = _update(res).get("bisect")
+    assert bisect and bisect["culprit_commit"] == "abc123def456"
+
+
+def test_submit_culprit_rejects_blank_sha():
+    tool = make_submit_culprit_tool(sandbox=MagicMock())
+    res = _call(tool, sha="   ", explanation="dunno")
+    assert "no sha" in _content(res).lower()
+    assert not _update(res)  # nothing written -> agent stays in its loop and retries cheaply
+
+
+def test_submit_culprit_rejects_unresolvable_sha():
+    tool = make_submit_culprit_tool(sandbox=MagicMock())
+    with patch("autodebug.tools.git_utils.get_commit_info",
+               return_value=_commit_info("")):  # git couldn't resolve it
+        res = _call(tool, sha="deadbeef", explanation="guess")
+    assert "does not resolve" in _content(res).lower()
+    assert not _update(res)
