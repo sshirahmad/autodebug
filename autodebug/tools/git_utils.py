@@ -79,3 +79,18 @@ def unshallow(sandbox: Sandbox) -> None:
 
 def checkout(sandbox: Sandbox, ref: str) -> None:
     sandbox.git("checkout", "--force", ref)
+
+
+def restore_checkout(sandbox: Sandbox, sha: str) -> None:
+    """Return the working tree to `sha`, aborting any in-progress `git bisect`.
+
+    The repo volume is shared across pipeline stages; a crashed or unfinished
+    bisect (or a stray checkout) would otherwise leave the tree on the wrong
+    commit, so root_cause/fix would run against the wrong code. Best-effort —
+    never raises, so it's safe in a `finally`.
+    """
+    try:
+        sandbox.git("bisect", "reset")        # no-op (nonzero) if not bisecting
+        sandbox.git("checkout", "--force", sha)
+    except Exception:
+        pass

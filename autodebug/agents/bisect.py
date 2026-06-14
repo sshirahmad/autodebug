@@ -61,71 +61,78 @@ def run_bisect(state: DebugState, *, registry) -> DebugState:
 
         crashed = False
         run_error: str | None = None
-        for attempt in range(cfg.max_retries + 1):
-            budget = Budget.from_config(cfg)
-            tools = registry.build_tools("bisect", sandbox=sandbox)
-            agent = create_agent(
-                model=llm,
-                tools=tools,
-                system_prompt=system_prompt,
-                state_schema=BisectAgentState,
-                checkpointer=saver,
-                middleware=(
-                    budget_middleware(budget)
-                    + model_retry_middleware()
-                    + planning_middleware()
-                    + summarization_middleware(cfg.model, cfg.provider)
-                    + submission_middleware("bisect")
-                    + require_tool_calls_middleware()
-                    + tool_call_limit_middleware(cfg.tool_call_limits)
-                ),
-            )
-            invoke_config = {
-                "recursion_limit": sys.maxsize,
-                "configurable": {"thread_id": resume.thread_id("bisect", key, attempt)},
-            }
-
-            crashed = False
-            try:
-                agent.invoke(
-                    {"messages": [HumanMessage(content=initial_text)]},
-                    config=invoke_config,
+        try:
+            for attempt in range(cfg.max_retries + 1):
+                budget = Budget.from_config(cfg)
+                tools = registry.build_tools("bisect", sandbox=sandbox)
+                agent = create_agent(
+                    model=llm,
+                    tools=tools,
+                    system_prompt=system_prompt,
+                    state_schema=BisectAgentState,
+                    checkpointer=saver,
+                    middleware=(
+                        budget_middleware(budget)
+                        + model_retry_middleware()
+                        + planning_middleware()
+                        + summarization_middleware(cfg.model, cfg.provider)
+                        + submission_middleware("bisect")
+                        + require_tool_calls_middleware()
+                        + tool_call_limit_middleware(cfg.tool_call_limits)
+                    ),
                 )
-            except BudgetExceeded:
-                crashed = True
-            except Exception as exc:  # noqa: BLE001 — degrade, don't abort the pipeline
-                crashed = True
-                run_error = f"{type(exc).__name__}: {str(exc)[:300]}"
+                invoke_config = {
+                    "recursion_limit": sys.maxsize,
+                    "configurable": {"thread_id": resume.thread_id("bisect", key, attempt)},
+                }
 
-            state.total_tokens += budget.tokens_used
-            state.total_cost += budget.cost_used
-            state.total_llm_calls += budget.calls
+                crashed = False
+                try:
+                    agent.invoke(
+                        {"messages": [HumanMessage(content=initial_text)]},
+                        config=invoke_config,
+                    )
+                except BudgetExceeded:
+                    crashed = True
+                except Exception as exc:  # noqa: BLE001 — degrade, don't abort the pipeline
+                    crashed = True
+                    run_error = f"{type(exc).__name__}: {str(exc)[:300]}"
 
-            # Accept a submitted result even if the attempt later crashed —
-            # the agent often submits then keeps over-investigating until the
-            # budget hits, and we'd otherwise throw away a valid answer.
-            submitted = resume.read_live(agent, invoke_config, "bisect")
-            if submitted:
-                state.bisect = BisectResult(**submitted)
-                state.stage = PipelineStage.ROOT_CAUSE
-                return state
+                state.total_tokens += budget.tokens_used
+                state.total_cost += budget.cost_used
+                state.total_llm_calls += budget.calls
 
-            # No result. Retry only if the attempt crashed AND retries remain.
-            if not crashed or attempt >= cfg.max_retries:
-                break
+                # Accept a submitted result even if the attempt later crashed —
+                # the agent often submits then keeps over-investigating until the
+                # budget hits, and we'd otherwise throw away a valid answer.
+                submitted = resume.read_live(agent, invoke_config, "bisect")
+                if submitted:
+                    state.bisect = BisectResult(**submitted)
+                    state.stage = PipelineStage.ROOT_CAUSE
+                    return state
 
-            # Retrying: optimize the prompt from this failed attempt's history.
-            system_prompt = maybe_optimize_prompt(
-                system_prompt,
-                attempt_trajectory(agent, invoke_config),
-                retry_feedback("identifying the culprit commit and calling submit_culprit"),
-                model_id=cfg.model, provider=cfg.provider,
+                # No result. Retry only if the attempt crashed AND retries remain.
+                if not crashed or attempt >= cfg.max_retries:
+                    break
+
+                # Retrying: optimize the prompt from this failed attempt's history.
+                system_prompt = maybe_optimize_prompt(
+                    system_prompt,
+                    attempt_trajectory(agent, invoke_config),
+                    retry_feedback("identifying the culprit commit and calling submit_culprit"),
+                    model_id=cfg.model, provider=cfg.provider,
+                )
+
+            state.stage = PipelineStage.FAILED
+            state.error = (
+                f"BisectAgent: {run_error}" if run_error else
+                "BisectAgent: budget exceeded with no submission" if crashed else
+                "BisectAgent: could not identify culprit commit"
             )
-
-        state.stage = PipelineStage.FAILED
-        state.error = (
-            f"BisectAgent: {run_error}" if run_error else
-            "BisectAgent: budget exceeded with no submission" if crashed else
-            "BisectAgent: could not identify culprit commit"
-        )
-        return state
+            return state
+        finally:
+            # The repo volume is shared with the later stages. A crashed or
+            # in-progress `git bisect` (or a stray checkout) would otherwise leave
+            # the tree on the wrong commit, so root_cause/fix would run against the
+            # wrong code. Always hand it back at the original HEAD.
+            git_utils.restore_checkout(sandbox, original_sha)

@@ -172,6 +172,42 @@ class TestRunRepro:
 
 
 # ---------------------------------------------------------------------------
+# run_bisect — must always hand the shared volume back at the original HEAD
+# ---------------------------------------------------------------------------
+
+class TestRunBisect:
+    def test_restores_checkout_on_success(self, repro_state):
+        def behavior(agent):
+            agent.state["bisect"] = BisectResult(
+                culprit_commit="c0ffee", commit_message="m", commit_diff="d",
+                steps_taken=0).model_dump()
+        sb = _make_fake_sandbox()
+        with patch_sandbox("autodebug.agents.bisect", sb), \
+             patch_create_agent("autodebug.agents.bisect", behavior), \
+             _patched_bisect_helpers(), \
+             patch("autodebug.agents.bisect.git_utils.restore_checkout") as restore:
+            from autodebug.registry import AutoDebugRegistry
+            from autodebug.agents.bisect import run_bisect
+            state = run_bisect(repro_state, registry=AutoDebugRegistry.from_file())
+        assert state.stage == PipelineStage.ROOT_CAUSE
+        restore.assert_called_once_with(sb, "deadbeef")  # original HEAD from helpers
+
+    def test_restores_checkout_on_failure(self, repro_state):
+        # No submission: stage FAILED, but the volume is STILL restored so the
+        # next stage doesn't inherit a mid-bisect / wrong checkout.
+        sb = _make_fake_sandbox()
+        with patch_sandbox("autodebug.agents.bisect", sb), \
+             patch_create_agent("autodebug.agents.bisect", behavior=None), \
+             _patched_bisect_helpers(), \
+             patch("autodebug.agents.bisect.git_utils.restore_checkout") as restore:
+            from autodebug.registry import AutoDebugRegistry
+            from autodebug.agents.bisect import run_bisect
+            state = run_bisect(repro_state, registry=AutoDebugRegistry.from_file())
+        assert state.stage == PipelineStage.FAILED
+        restore.assert_called_once_with(sb, "deadbeef")
+
+
+# ---------------------------------------------------------------------------
 # run_root_cause
 # ---------------------------------------------------------------------------
 

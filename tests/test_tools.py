@@ -279,3 +279,23 @@ def test_submit_culprit_rejects_unresolvable_sha():
         res = _call(tool, sha="deadbeef", explanation="guess")
     assert "does not resolve" in _content(res).lower()
     assert not _update(res)
+
+
+# ---------------------------------------------------------------------------
+# git_utils.restore_checkout — aborts any in-progress bisect and returns to HEAD
+# ---------------------------------------------------------------------------
+
+def test_restore_checkout_resets_bisect_then_checks_out():
+    from autodebug.tools import git_utils
+    sandbox = MagicMock()
+    git_utils.restore_checkout(sandbox, "abc123")
+    calls = [c.args for c in sandbox.git.call_args_list]
+    assert ("bisect", "reset") in calls
+    assert ("checkout", "--force", "abc123") in calls
+
+
+def test_restore_checkout_swallows_errors():
+    from autodebug.tools import git_utils
+    sandbox = MagicMock()
+    sandbox.git.side_effect = RuntimeError("git blew up")
+    git_utils.restore_checkout(sandbox, "abc123")  # must not raise (used in a finally)
