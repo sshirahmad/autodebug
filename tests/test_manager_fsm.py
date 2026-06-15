@@ -64,15 +64,20 @@ class TestToolGate:
             "run_fix_agent", "finish",
         )]
 
-    def test_init_only_exposes_repro(self):
+    def test_init_exposes_repro_and_finish(self):
+        # `finish` is always available (escape hatch); INIT otherwise only repros.
         fsm = FSM()  # INIT
-        names = [t.name for t in filter_tools(fsm, self._tools(), MANAGER_ALLOWED_TOOLS)]
-        assert names == ["run_repro_agent"]
+        names = {t.name for t in filter_tools(fsm, self._tools(), MANAGER_ALLOWED_TOOLS)}
+        assert names == {"run_repro_agent", "finish"}
 
-    def test_analyzed_exposes_fix_and_root_cause_only(self):
+    def test_analyzed_exposes_fix_root_cause_and_finish(self):
         fsm = FSM(phase=ManagerPhase.ANALYZED)
         names = {t.name for t in filter_tools(fsm, self._tools(), MANAGER_ALLOWED_TOOLS)}
-        assert names == {"run_fix_agent", "run_root_cause_agent"}
+        assert names == {"run_fix_agent", "run_root_cause_agent", "finish"}
+
+    def test_finish_allowed_in_every_phase(self):
+        for phase in MANAGER_ALLOWED_TOOLS:
+            assert "finish" in MANAGER_ALLOWED_TOOLS[phase], f"{phase} cannot finish"
 
     def test_revising_opens_loopback_and_finish(self):
         fsm = FSM(phase=ManagerPhase.REVISING)
@@ -135,7 +140,7 @@ class TestToolEnforcement:
     def test_allowed_tool_names_matches_gate(self):
         fsm = FSM(phase=ManagerPhase.ANALYZED)
         assert allowed_tool_names(fsm, MANAGER_ALLOWED_TOOLS) == {
-            "run_fix_agent", "run_root_cause_agent", "write_todos",
+            "run_fix_agent", "run_root_cause_agent", "finish", "write_todos",
         }
 
 

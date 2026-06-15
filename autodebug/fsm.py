@@ -50,11 +50,15 @@ TERMINAL: frozenset[ManagerPhase] = frozenset({ManagerPhase.DONE, ManagerPhase.F
 # guard. The tool-gate hides every other tool from the model on a given turn,
 # steering repro -> bisect -> root_cause -> fix, while REVISING re-opens the
 # earlier agents so a failed fix can loop back (fix <-> repro/root_cause).
+# `finish` is allowed in EVERY phase: it's the universal escape hatch. Without it
+# the manager can be trapped with no legal move — if every sub-agent tool for the
+# phase has hit its tool_call_limit, the agent has nothing left to call and just
+# narrates "all tools are exhausted", looping until the budget trips.
 MANAGER_ALLOWED_TOOLS: dict[str, tuple[str, ...]] = {
-    ManagerPhase.INIT.value:       ("run_repro_agent",),
-    ManagerPhase.REPRODUCED.value: ("run_bisect_agent", "run_repro_agent"),
-    ManagerPhase.BISECTED.value:   ("run_root_cause_agent", "run_repro_agent"),
-    ManagerPhase.ANALYZED.value:   ("run_fix_agent", "run_root_cause_agent"),
+    ManagerPhase.INIT.value:       ("run_repro_agent", "finish"),
+    ManagerPhase.REPRODUCED.value: ("run_bisect_agent", "run_repro_agent", "finish"),
+    ManagerPhase.BISECTED.value:   ("run_root_cause_agent", "run_repro_agent", "finish"),
+    ManagerPhase.ANALYZED.value:   ("run_fix_agent", "run_root_cause_agent", "finish"),
     ManagerPhase.REVISING.value:   (
         "run_repro_agent", "run_root_cause_agent", "run_fix_agent", "finish",
     ),
