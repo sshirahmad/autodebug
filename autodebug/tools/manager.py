@@ -13,6 +13,7 @@ the autodebug.agents package at import time — avoiding a circular import.
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated
 
 from langchain_core.messages import ToolMessage
@@ -20,6 +21,8 @@ from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.types import Command
 
 from autodebug.fsm import FSM, ManagerPhase
+
+logger = logging.getLogger(__name__)
 
 
 def _delegate(driver, state, registry) -> str | None:
@@ -30,6 +33,8 @@ def _delegate(driver, state, registry) -> str | None:
         driver(state, registry=registry)
         return None
     except Exception as exc:  # noqa: BLE001 — resilience boundary
+        logger.warning("Sub-agent %s crashed: %s: %s",
+                       getattr(driver, "__name__", driver), type(exc).__name__, exc)
         return f"{type(exc).__name__}: {str(exc)[:300]}"
 
 

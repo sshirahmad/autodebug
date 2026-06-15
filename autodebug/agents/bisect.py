@@ -42,6 +42,19 @@ def run_bisect(state: DebugState, *, registry) -> DebugState:
             state.bisect = cached
             state.stage = PipelineStage.ROOT_CAUSE
             return state
+
+        # Don't restart blind: if a previous attempt proposed a culprit that wasn't
+        # accepted (empty/unresolvable SHA, or not the real regression), surface it
+        # so this attempt reconsiders rather than repeating it. Read BEFORE clear().
+        prior = resume.last_attempt_artifact("bisect", key, cfg.max_retries, "submit_culprit")
+        prior_note = ""
+        if prior and (prior.get("sha") or "").strip():
+            prior_note = (
+                f"\nNOTE: a PREVIOUS attempt proposed culprit `{prior['sha']}` which was "
+                "NOT accepted (empty/unresolvable SHA, or not the true regression point). "
+                "Reconsider — verify any candidate resolves and actually introduces the "
+                "buggy behaviour before submitting.\n"
+            )
         resume.clear("bisect", key, cfg.max_retries)
 
         original_sha = git_utils.current_sha(sandbox)
@@ -52,6 +65,7 @@ def run_bisect(state: DebugState, *, registry) -> DebugState:
             f"Current HEAD (last buggy state): {head_info.short_sha} — {head_info.message}\n"
             f"Date: {head_info.date}\n"
             + (f"Known-good commit (bug did NOT exist here): {known_good}\n" if known_good else "")
+            + prior_note
             + f"\nRepro script (fails at HEAD, exits non-zero when bug is present):\n"
             f"```python\n{state.repro.repro_script}\n```\n\n"
             f"Repro error output:\n```\n{state.repro.error_output[:2000]}\n```\n\n"

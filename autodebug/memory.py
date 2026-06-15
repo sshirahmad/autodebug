@@ -13,6 +13,7 @@ Env vars:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sqlite3
@@ -28,10 +29,17 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 _DB_PATH      = Path(__file__).resolve().parents[1] / "data" / "memory.db"
 _EMBED_MODEL  = os.getenv("AUTODEBUG_EMBED_MODEL", "huggingface:sentence-transformers/all-MiniLM-L6-v2")
 _EMBED_DIMS   = int(os.getenv("AUTODEBUG_EMBED_DIMS", "384"))
 _MEMORY_MODEL = os.getenv("AUTODEBUG_MEMORY_MODEL", "openrouter/owl-alpha")
+# Provider for the memory model. None => build_model falls back to the agent's
+# provider (AUTODEBUG_MODEL_PROVIDER) — set this when the memory model needs a
+# different provider/route than the agent's (e.g. agent on Anthropic, memory on
+# an OpenRouter model).
+_MEMORY_PROVIDER = os.getenv("AUTODEBUG_MEMORY_PROVIDER") or None
 
 _EXTRACT_INSTRUCTIONS = (
     "Extract debugging actions, observations, and results from this debugging session. "
@@ -98,7 +106,7 @@ def memory_store() -> SqliteStore:
 
 def _get_manager(namespace: tuple[str, ...]):
     from autodebug.agents.base import build_model
-    model = build_model(model_id=_MEMORY_MODEL)
+    model = build_model(model_id=_MEMORY_MODEL, provider=_MEMORY_PROVIDER)
     return create_memory_store_manager(
         model,
         schemas=[DebugAction, DebugObservation, DebugResult],
@@ -117,8 +125,10 @@ def store_agent_run(stage: str, state) -> None:
         messages = [HumanMessage(content=_build_summary(stage, project, state))]
         manager = _get_manager(("autodebug", stage))
         manager.invoke({"messages": messages}, config={"recursion_limit": 500})
-    except Exception:
-        pass  # memory failures must never break the pipeline
+    except Exception as exc:
+        # Memory failures must never break the pipeline — but surface them.
+        logger.warning("Memory store failed for stage %r: %s: %s",
+                       stage, type(exc).__name__, exc)
 
 
 def _project_from_url(repo_url: str) -> str:
@@ -212,6 +222,7 @@ def make_search_memory_tool(agent_name: str = "unknown", **_):
         try:
             return str(underlying.invoke({"query": query}))
         except Exception as exc:
+            logger.warning("Memory search failed: %s: %s", type(exc).__name__, exc)
             return f"memory search failed: {exc}"
 
     return search_memory

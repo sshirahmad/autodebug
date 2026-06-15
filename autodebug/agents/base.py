@@ -7,6 +7,7 @@ via the `budget_middleware` (a pair of before_model/after_model hooks).
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from dataclasses import dataclass, field
@@ -25,6 +26,8 @@ from langchain.chat_models import init_chat_model
 from langgraph.runtime import Runtime
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "claude-sonnet-4-6"
 _DEFAULT_PROVIDER = "anthropic"
@@ -242,6 +245,13 @@ def require_tool_calls_middleware() -> list:
 _TRAJ_HEAD = 4
 _TRAJ_TAIL = 56
 
+# Prompt optimization runs on a DEDICATED model, separate from the agent's: the
+# gradient optimizer makes a structured-output (tool_choice) call that some agent
+# models — notably ones routed via OpenRouter — reject with a 404. Configure via
+# AUTODEBUG_PROMPT_OPTIM_MODEL / _PROVIDER; this is the default and must support
+# tool_choice.
+_DEFAULT_OPTIM_MODEL = "openai/gpt-4o-mini"
+
 
 def retry_feedback(goal: str) -> str:
     """Feedback string handed to the optimizer describing why a retry happened."""
@@ -283,19 +293,25 @@ def maybe_optimize_prompt(
 ) -> str:
     """Improve `current_prompt` from a failed attempt's trajectory via LangMem.
 
-    Uses the gradient prompt optimizer: it reflects on the trajectory + feedback
-    and rewrites the prompt to avoid the observed failure mode. Best-effort — any
-    error (missing dep, optimizer failure, empty trajectory) returns the original
-    prompt so the retry loop is never blocked. Disable with AUTODEBUG_PROMPT_OPTIM=0.
+    The gradient optimizer makes a structured-output (tool_choice) call that some
+    agent models can't do (OpenRouter routes may 404), so optimization runs on a
+    DEDICATED model — `AUTODEBUG_PROMPT_OPTIM_MODEL` / `_PROVIDER` (default
+    openai/gpt-4o-mini), which must support tool_choice — independent of the
+    agent's own `model_id`. The provider falls back to the agent's so the existing
+    keys/routing are reused. Best-effort: any error returns the original prompt so
+    the retry loop is never blocked. Disable with AUTODEBUG_PROMPT_OPTIM=0.
     """
     if os.getenv("AUTODEBUG_PROMPT_OPTIM", "1") == "0" or not messages:
         return current_prompt
+    opt_model = os.getenv("AUTODEBUG_PROMPT_OPTIM_MODEL", _DEFAULT_OPTIM_MODEL)
+    opt_provider = os.getenv("AUTODEBUG_PROMPT_OPTIM_PROVIDER") or provider
     try:
         from langmem import create_prompt_optimizer
         from langmem.prompts.types import AnnotatedTrajectory
 
-        model = build_model(model_id=model_id, provider=provider)
-        optimizer = create_prompt_optimizer(model, kind="gradient")
+        optimizer = create_prompt_optimizer(
+            build_model(model_id=opt_model, provider=opt_provider), kind="gradient"
+        )
         trajectory = AnnotatedTrajectory(
             messages=_trim_trajectory(messages), feedback=feedback
         )
@@ -304,8 +320,12 @@ def maybe_optimize_prompt(
         )
         if isinstance(improved, str) and improved.strip():
             return improved
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(
+            "Prompt optimization failed on model %r (provider %r); keeping the "
+            "original prompt. %s: %s",
+            opt_model, opt_provider, type(exc).__name__, exc,
+        )
     return current_prompt
 
 

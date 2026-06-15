@@ -6,9 +6,12 @@ so the repo lives entirely inside the Docker volume.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from autodebug.sandbox import Sandbox
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -92,5 +95,6 @@ def restore_checkout(sandbox: Sandbox, sha: str) -> None:
     try:
         sandbox.git("bisect", "reset")        # no-op (nonzero) if not bisecting
         sandbox.git("checkout", "--force", sha)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Could not restore the working tree to %s: %s: %s",
+                       sha, type(exc).__name__, exc)

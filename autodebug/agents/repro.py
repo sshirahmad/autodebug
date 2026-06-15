@@ -23,12 +23,13 @@ def run_repro(state: DebugState, *, registry) -> DebugState:
     """Drive the repro agent until it produces a confirmed reproducing script."""
     assert state.repo_volume
     cfg = registry.get_config("repro")
+    key = resume.bug_key(state)
 
-    # Refine rather than regenerate: if a reproduction already exists, we're being
-    # re-invoked (the manager looped back from a failed fix). Hand the agent the
-    # prior script so it corrects it instead of inventing a different one each time.
+    # Don't restart blind: carry forward context from the previous invocation.
     refine_note = ""
     if state.repro is not None:
+        # A reproduction was CONFIRMED but the downstream fix couldn't be verified
+        # against it (manager looped back) — hand back the prior script to refine.
         refine_note = (
             "\nNOTE: a previous reproduction was confirmed but the downstream fix "
             "could not be verified against it — it may be imprecise or target the "
@@ -38,6 +39,19 @@ def run_repro(state: DebugState, *, registry) -> DebugState:
             "Refine THIS reproduction so it precisely targets the bug described "
             "above; do not start from an unrelated angle.\n"
         )
+    else:
+        # A previous attempt FAILED to confirm a repro. If it at least tried a
+        # candidate script, surface it so this attempt diagnoses that dead-end
+        # instead of repeating it.
+        prior = resume.last_attempt_artifact("repro", key, cfg.max_retries, "submit_repro")
+        if prior and (prior.get("script") or "").strip():
+            refine_note = (
+                "\nNOTE: a PREVIOUS attempt did not produce a confirmed reproduction. "
+                "It tried this script, which did NOT reliably trigger the reported bug:\n"
+                f"```python\n{prior['script']}\n```\n"
+                "Work out WHY it failed and take a different approach — do not just "
+                "resubmit the same script.\n"
+            )
     initial_text = (
         f"Bug report:\n\n{state.bug_report}\n\n"
         f"{refine_note}"
@@ -50,7 +64,6 @@ def run_repro(state: DebugState, *, registry) -> DebugState:
 
     crashed = False
     run_error: str | None = None
-    key = resume.bug_key(state)
     saver = resume.get_saver()
     with Sandbox(volume=state.repo_volume) as sandbox:
         # Resume: a prior run already produced (and we re-validate) a repro.

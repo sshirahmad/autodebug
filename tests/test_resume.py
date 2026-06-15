@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from langchain_core.messages import HumanMessage  # noqa: E402
+from langchain_core.messages import AIMessage, HumanMessage  # noqa: E402
 from langgraph.graph import START, END, StateGraph  # noqa: E402
 
 from autodebug import resume  # noqa: E402
@@ -143,6 +143,26 @@ def test_cached_bisect_refreshes_commit(tmp_path):
                                               message="fresh msg", author="a", date="d", diff="fresh"))
         bisect = resume.cached_bisect(key, max_attempts=2, sandbox=sandbox)
     assert bisect.culprit_commit == "abc123full" and bisect.commit_diff == "fresh"
+
+
+# ---------------------------------------------------------------------------
+# last_attempt_artifact — carry a prior FAILED attempt's candidate forward
+# ---------------------------------------------------------------------------
+
+def test_last_attempt_artifact_returns_prior_submit_args(tmp_path):
+    key = "K"
+    ai = AIMessage(content="", tool_calls=[
+        {"name": "submit_repro", "args": {"script": "print(1)", "error_output": "x"}, "id": "c1"}])
+    _seed(tmp_path, ReproAgentState, resume.thread_id("repro", key, 0), {"messages": [ai]})
+    args = resume.last_attempt_artifact("repro", key, max_attempts=2, tool_name="submit_repro")
+    assert args and args["script"] == "print(1)"
+
+
+def test_last_attempt_artifact_none_when_no_such_call(tmp_path):
+    # Thread exists but the agent never called submit_repro (e.g. budget died first).
+    _seed(tmp_path, ReproAgentState, resume.thread_id("repro", "K", 0),
+          {"messages": [AIMessage(content="thinking...")]})
+    assert resume.last_attempt_artifact("repro", "K", max_attempts=2, tool_name="submit_repro") is None
 
 
 # ---------------------------------------------------------------------------

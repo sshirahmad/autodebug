@@ -22,11 +22,14 @@ Toggles:
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import sqlite3
 from pathlib import Path
 
 from autodebug.state import BisectResult, ReproResult, RootCauseResult
+
+logger = logging.getLogger(__name__)
 
 _saver = None
 
@@ -51,9 +54,13 @@ def get_saver():
         saver = SqliteSaver(conn)
         saver.setup()
         _saver = saver
-    except Exception:
+    except Exception as exc:
         from langgraph.checkpoint.memory import InMemorySaver
 
+        logger.warning(
+            "Persistent checkpoint store unavailable (%s: %s); resume is disabled "
+            "this run — using an in-memory saver.", type(exc).__name__, exc,
+        )
         _saver = InMemorySaver()
     return _saver
 
@@ -86,7 +93,9 @@ def read_live(agent, invoke_config, channel: str):
     submit tool wrote before the budget tripped)."""
     try:
         return (agent.get_state(invoke_config).values or {}).get(channel)
-    except Exception:
+    except Exception as exc:
+        logger.warning("Could not read result channel %r from agent state: %s: %s",
+                       channel, type(exc).__name__, exc)
         return None
 
 
@@ -111,11 +120,44 @@ def _channel(agent: str, key: str, max_attempts: int, channel: str):
     for attempt in range(max_attempts, -1, -1):
         try:
             ck = saver.get({"configurable": {"thread_id": thread_id(agent, key, attempt)}})
-        except Exception:
+        except Exception as exc:
+            logger.warning("Could not read checkpoint %s: %s: %s",
+                           thread_id(agent, key, attempt), type(exc).__name__, exc)
             continue
         val = (ck or {}).get("channel_values", {}).get(channel)
         if val:
             return val
+    return None
+
+
+def _thread_messages(tid: str) -> list:
+    try:
+        ck = get_saver().get({"configurable": {"thread_id": tid}})
+    except Exception as exc:
+        logger.warning("Could not read checkpoint %s: %s: %s", tid, type(exc).__name__, exc)
+        return []
+    return (ck or {}).get("channel_values", {}).get("messages", []) or []
+
+
+def last_attempt_artifact(agent: str, key: str, max_attempts: int, tool_name: str):
+    """Args of the most recent `tool_name` call across this bug's attempt threads
+    (newest first) — i.e. the candidate a prior *failed* attempt actually tried
+    (a repro script, a culprit SHA). Lets the next attempt refine instead of
+    restarting blind. Returns the args dict, or None.
+
+    Reads the message history (failed submits write no channel), so call it BEFORE
+    `clear()` wipes the prior threads.
+    """
+    if not resume_enabled():
+        return None
+    for attempt in range(max_attempts, -1, -1):
+        last = None
+        for m in _thread_messages(thread_id(agent, key, attempt)):
+            for tc in getattr(m, "tool_calls", None) or []:
+                if tc.get("name") == tool_name:
+                    last = tc.get("args") or {}
+        if last is not None:
+            return last
     return None
 
 
