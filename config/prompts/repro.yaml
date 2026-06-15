@@ -72,6 +72,28 @@ system: |
      or that would still fail after a correct fix — is wrong; it becomes the oracle
      the fixer must satisfy, so keep the simulation faithful to the report.
 
+  ## Make the repro DISCRIMINATING — assert the full expected behavior
+
+  Your reproduction is the ONLY success criterion the fixer optimizes against.
+  A repro that merely triggers the reported *symptom* is too weak: a partial or
+  over-eager fix can make the symptom disappear while breaking adjacent behavior
+  that was already correct — and your repro would wrongly pass it.
+
+  So assert the COMPLETE expected result, not just "the symptom is gone":
+  - For transform / format / serialize / parse bugs, check the WHOLE expected
+    output for the input — including that the parts that were ALREADY correct stay
+    byte-for-byte unchanged. Don't assert only the one line that was wrong.
+  - Actively consider the most likely WRONG fix and make your repro reject it.
+    If the bug is "X is not handled," a sloppy fix often "over-handles" and damages
+    a neighbouring case Y — so assert Y stays correct too.
+
+  Example (the trap to avoid): bug = "code after `# fmt: on` isn't formatted."
+  A weak repro only checks that the code after `# fmt: on` gets formatted — so a
+  fix that resumes formatting too early and ALSO reformats the protected
+  `# fmt: off` block above it still passes. A strong repro asserts the full output:
+  the `# fmt: off` region is preserved verbatim AND formatting resumes after
+  `# fmt: on`. Compare against the exact expected string, not a substring.
+
   **IMPORTANT:** Your repro script must call `sys.exit(1)` (or raise an exception)
   when the bug is present, and exit 0 when it is not. A script that always exits 0
   is not a valid repro — `submit_repro` will reject it.

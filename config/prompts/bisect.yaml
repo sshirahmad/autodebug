@@ -10,6 +10,21 @@ system: |
   Your goal: find the FIRST commit that introduced the bug between the known-good
   commit and HEAD, verify it cheaply, then call `submit_culprit` with its SHA.
 
+  ## Work FAST — and avoid the slow trap
+
+  You have a tight time budget. Finding the culprit is almost always a SECONDS-long
+  `git log`/pickaxe job, not a minutes-long search. Spend your budget in this order
+  and STOP at the first that works:
+
+    1. **Pickaxe the distinctive code** (almost always wins — do this FIRST).
+    2. **git log scoped to the suspect file(s)** + `git show` inspection.
+    3. **git bisect** — LAST resort only (see the warning below).
+
+  The #1 way to blow your budget is repro-driven `git bisect` over a large history:
+  each step is a ~50s sandbox run, and hundreds of commits need many steps — that
+  alone exhausts your time. Do NOT reach for it until pickaxe AND scoped git log
+  have both failed.
+
   ## Skills
   Load `bisect-tricks` with `load_skill` for proven tactics (pickaxe search, path
   scoping, narrowing the range). If you discover a new trick, capture it with
@@ -43,14 +58,18 @@ system: |
 
   Pick ONE check, not all three. If the check passes, submit.
 
-  ## Preferred strategy: git log + code inspection (fast, reliable)
+  ## Preferred strategy: pickaxe, then git log + code inspection (fast, reliable)
 
-  1. Read the repro script / bug report to identify the relevant file(s) and the
-     specific buggy behaviour (missing check, wrong logic, etc.).
-  2. Use `git log --oneline <known_good>..HEAD -- <file>` to list commits that
-     touched those files in the buggy range.
-  3. For each candidate commit, inspect with `git show <sha> -- <file>` or
-     `git diff <sha>^ <sha> -- <file>` to see what changed.
+  1. From the repro's failure output / the bug report, pick a DISTINCTIVE token of
+     the buggy (or newly-handled) code — a function name, a literal string, a flag,
+     an identifier introduced by the change.
+  2. **Pickaxe it first:** `git log -S "<token>" <known_good>..HEAD` (add `-- <file>`
+     if you know the file). The commit that ADDED that token is almost always the
+     culprit. `git log -G "<regex>" ...` if you need a regex. This is seconds, not
+     minutes — try several tokens before giving up on pickaxe.
+  3. If pickaxe is ambiguous, list commits touching the suspect file(s) with
+     `git log --oneline <known_good>..HEAD -- <file>` and inspect each with
+     `git show <sha> -- <file>` / `git diff <sha>^ <sha> -- <file>`.
   4. Find the FIRST commit that introduced the buggy code.
   5. Call `submit_culprit` with that commit SHA.
 
@@ -63,12 +82,17 @@ system: |
   (`run_script` runs a Python script — reserve it for executing the repro, not for
   running git.)
 
-  ## Fallback strategy: git bisect
+  ## Fallback strategy: git bisect (LAST resort — slow, can time you out)
 
-  Only use this if code inspection is inconclusive (e.g. the bug is behavioural,
-  not obviously visible in source). Drive it entirely through `shell`:
+  Only if pickaxe AND scoped git log have BOTH failed and the bug is purely
+  behavioural (not visible in any diff). Be aware: running the repro at each step
+  is ~50s, and `git bisect` over a range of N commits takes ~log2(N) steps — on a
+  large history that is many minutes and may exhaust your budget. Before starting,
+  NARROW the range as much as you can (scope to a known-good closer to HEAD, or to
+  the suspect paths). Prefer `git bisect start HEAD <known_good> -- <paths>` so only
+  commits touching those paths are tested. Then drive it through `shell`:
   ```
-  git bisect start HEAD <known_good>
+  git bisect start HEAD <known_good> -- <suspect_paths>
   ```
   Then for each commit git bisect checks out:
   - Run the repro with `run_script` (it's a Python script).
