@@ -409,6 +409,85 @@ def maybe_optimize_prompt(
     return current_prompt
 
 
+# ---------------------------------------------------------------------------
+# Adversarial audit (LLM-as-judge)
+# ---------------------------------------------------------------------------
+# A cheap, dedicated model reviews an agent's submission before it's accepted and
+# flags real defects the agent's own checks miss — a repro too weak to discriminate
+# a correct fix, or a fix that masks the symptom / over-reaches. It runs on a plain
+# text verdict (no tool_choice), so any model works. Disable with AUTODEBUG_JUDGE=0;
+# pick the model with AUTODEBUG_JUDGE_MODEL / _PROVIDER.
+_DEFAULT_JUDGE_MODEL = "openai/gpt-4o-mini"
+
+_JUDGE_PROMPTS = {
+    "repro": (
+        "You are an ADVERSARIAL reviewer of a bug REPRODUCTION script. This script "
+        "is the ONLY oracle the fixer optimizes against, so a weak one lets a wrong "
+        "or over-eager fix pass. Reply REVISE if the repro: passes while the bug is "
+        "still unfixed; would STILL fail after a correct fix (tests the wrong thing); "
+        "only checks the symptom instead of the full expected behavior; or is overfit "
+        "to a single input so a special-cased fix would satisfy it. Reply ACCEPT only "
+        "if it clearly distinguishes a correct fix from both the buggy code and a "
+        "plausible over-eager fix. Be strict but fair — do not invent flaws."
+    ),
+    "fix": (
+        "You are an ADVERSARIAL reviewer of a code FIX for the stated root cause. "
+        "Reply REVISE if the patch: likely doesn't address the actual cause (masks "
+        "the symptom); is incomplete; or is over-broad and could change unrelated "
+        "behavior. Reply ACCEPT if it is a minimal, targeted change consistent with "
+        "the root cause. Be strict but fair — do not invent flaws."
+    ),
+}
+
+
+def _parse_verdict(text: str) -> tuple[bool, str]:
+    """Parse a judge reply into (accept, critique). Defaults to accept unless the
+    reply clearly says REVISE — a malformed/empty reply never blocks the pipeline."""
+    upper = text.upper()
+    revise = "REVISE" in upper and "VERDICT: ACCEPT" not in upper and "VERDICT:ACCEPT" not in upper
+    if not revise:
+        return True, ""
+    idx = upper.find("CRITIQUE:")
+    critique = text[idx + len("CRITIQUE:"):].strip() if idx != -1 else text.strip()
+    return False, critique[:600]
+
+
+def maybe_audit(
+    kind: str, payload: str, *, model_id: str | None = None, provider: str | None = None
+) -> tuple[bool, str]:
+    """Adversarially review a submission with a cheap dedicated judge.
+
+    Returns (ok, critique): ok=True means accept; ok=False means there's a real
+    flaw and `critique` says what to fix. Best-effort — any error, an unknown
+    `kind`, or AUTODEBUG_JUDGE=0 returns (True, "") so the pipeline is never
+    blocked by the judge.
+    """
+    if os.getenv("AUTODEBUG_JUDGE", "1") == "0" or kind not in _JUDGE_PROMPTS:
+        return True, ""
+    jmodel = os.getenv("AUTODEBUG_JUDGE_MODEL", _DEFAULT_JUDGE_MODEL)
+    jprovider = os.getenv("AUTODEBUG_JUDGE_PROVIDER") or provider
+    try:
+        from langchain_core.messages import SystemMessage
+
+        model = build_model(model_id=jmodel, provider=jprovider)
+        instruction = (
+            "\n\nAnswer in exactly this form:\nVERDICT: ACCEPT or REVISE\n"
+            "CRITIQUE: <one or two concrete, actionable sentences>"
+        )
+        resp = model.invoke([
+            SystemMessage(content=_JUDGE_PROMPTS[kind] + instruction),
+            HumanMessage(content=payload[:6000]),
+        ])
+        content = resp.content if isinstance(resp.content, str) else str(resp.content)
+        return _parse_verdict(content)
+    except Exception as exc:
+        logger.warning(
+            "Audit (%s) failed on model %r (provider %r); accepting. %s: %s",
+            kind, jmodel, jprovider, type(exc).__name__, exc,
+        )
+        return True, ""
+
+
 def submission_middleware(channel: str) -> list:
     """Stop the agent loop as soon as a submit_* tool writes its result `channel`.
 

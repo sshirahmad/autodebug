@@ -10,7 +10,7 @@ from langchain_core.messages import HumanMessage
 
 from autodebug.agents.base import (
     Budget, BudgetExceeded, attempt_trajectory, budget_middleware,
-    budget_nudge_middleware, maybe_optimize_prompt, model_for_attempt,
+    budget_nudge_middleware, maybe_audit, maybe_optimize_prompt, model_for_attempt,
     model_retry_middleware, planning_middleware, require_tool_calls_middleware,
     retry_feedback, submission_middleware, summarization_middleware,
     tool_call_limit_middleware,
@@ -117,9 +117,33 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
             submitted = resume.read_live(agent, invoke_config, "fix")
             if submitted:
                 patches = resume.read_live(agent, invoke_config, "patches") or []
-                state.fix = FixResult(**{**submitted, "attempts": len(patches)})
-                state.stage = PipelineStage.DONE
-                return state
+                last = attempt >= cfg.max_retries
+                # The fix already passed the repro + regression gate; the audit is a
+                # final adversarial check that it addresses the cause rather than
+                # masking the symptom. Accept unconditionally on the last attempt.
+                rc = state.root_cause
+                ok, critique = (True, "") if last else maybe_audit(
+                    "fix",
+                    "Root cause / fix plan:\n"
+                    f"{(rc.fix_plan or rc.hypothesis) if rc else ''}\n\n"
+                    f"Patch (unified diff):\n{submitted.get('patch', '')[:3500]}",
+                    model_id=model_id, provider=provider,
+                )
+                if ok:
+                    state.fix = FixResult(**{**submitted, "attempts": len(patches)})
+                    state.stage = PipelineStage.DONE
+                    return state
+                # Rejected with retries left: discard the patch from the shared tree
+                # so the next attempt starts clean, and carry the critique forward.
+                sandbox.git("reset", "--hard")
+                resume.clear_one("fix", key, attempt)
+                run_error = f"fix rejected by audit: {critique}"
+                system_prompt += (
+                    "\n\nA REVIEWER REJECTED YOUR FIX:\n" + critique +
+                    "\nRevise the patch to address this; keep it minimal and tied to "
+                    "the root cause."
+                )
+                continue
 
             if not crashed or attempt >= cfg.max_retries:
                 break

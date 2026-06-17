@@ -9,7 +9,7 @@ from langchain_core.messages import HumanMessage
 
 from autodebug.agents.base import (
     Budget, BudgetExceeded, attempt_trajectory, budget_middleware,
-    maybe_optimize_prompt, model_for_attempt, model_retry_middleware,
+    maybe_audit, maybe_optimize_prompt, model_for_attempt, model_retry_middleware,
     planning_middleware, require_tool_calls_middleware, retry_feedback,
     submission_middleware, summarization_middleware, tool_call_limit_middleware,
 )
@@ -118,9 +118,33 @@ def run_repro(state: DebugState, *, registry) -> DebugState:
             # tool persists it to the `repro` channel before the budget trips.
             submitted = resume.read_live(agent, invoke_config, "repro")
             if submitted:
-                state.repro = ReproResult(**submitted)
-                state.stage = PipelineStage.BISECT
-                return state
+                last = attempt >= cfg.max_retries
+                # Adversarial audit: a confirmed repro can still be a weak oracle.
+                # On the final attempt accept regardless, so the judge can't block
+                # the pipeline outright.
+                ok, critique = (True, "") if last else maybe_audit(
+                    "repro",
+                    f"Bug report:\n{state.bug_report}\n\n"
+                    f"Reproduction script:\n{submitted.get('repro_script', '')}\n\n"
+                    "Observed failure on the buggy code:\n"
+                    f"{submitted.get('error_output', '')[:1500]}",
+                    model_id=cfg.model, provider=cfg.provider,
+                )
+                if ok:
+                    state.repro = ReproResult(**submitted)
+                    state.stage = PipelineStage.BISECT
+                    return state
+                # Judge flagged a weak repro and retries remain: drop this thread
+                # and retry with the critique so the next attempt strengthens it.
+                resume.clear_one("repro", key, attempt)
+                run_error = f"reproduction rejected by audit: {critique}"
+                system_prompt += (
+                    "\n\nA REVIEWER REJECTED YOUR REPRODUCTION as too weak to be a "
+                    f"reliable oracle:\n{critique}\nStrengthen it to address this "
+                    "(assert the full expected behavior, add discriminating cases) "
+                    "before submitting again."
+                )
+                continue
 
             if not crashed or attempt >= cfg.max_retries:
                 break

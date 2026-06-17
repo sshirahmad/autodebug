@@ -381,6 +381,66 @@ class TestBudgetNudgeMiddleware:
         assert mw[0].before_model(state={"messages": []}, runtime=None) is None
 
 
+class TestAudit:
+    """LLM-as-judge adversarial review of a submission (base.maybe_audit)."""
+
+    def test_parse_verdict_accepts_by_default(self):
+        from autodebug.agents.base import _parse_verdict
+        ok, crit = _parse_verdict("VERDICT: ACCEPT\nCRITIQUE: looks good")
+        assert ok is True and crit == ""
+
+    def test_parse_verdict_detects_revise_and_extracts_critique(self):
+        from autodebug.agents.base import _parse_verdict
+        ok, crit = _parse_verdict("VERDICT: REVISE\nCRITIQUE: the repro only checks one line")
+        assert ok is False
+        assert "only checks one line" in crit
+
+    def test_parse_verdict_malformed_reply_does_not_block(self):
+        from autodebug.agents.base import _parse_verdict
+        ok, _ = _parse_verdict("hmm, I'm not sure about this")
+        assert ok is True
+
+    def test_disabled_via_env_returns_accept(self, monkeypatch):
+        from autodebug.agents import base
+        monkeypatch.setenv("AUTODEBUG_JUDGE", "0")
+        called = {"n": 0}
+        monkeypatch.setattr(base, "build_model", lambda **k: called.__setitem__("n", 1))
+        ok, crit = base.maybe_audit("repro", "anything")
+        assert ok is True and crit == "" and called["n"] == 0
+
+    def test_unknown_kind_returns_accept(self, monkeypatch):
+        from autodebug.agents import base
+        monkeypatch.delenv("AUTODEBUG_JUDGE", raising=False)
+        ok, _ = base.maybe_audit("not_a_kind", "x")
+        assert ok is True
+
+    def test_revise_verdict_flows_through(self, monkeypatch):
+        from autodebug.agents import base
+        monkeypatch.delenv("AUTODEBUG_JUDGE", raising=False)
+
+        class _Resp:
+            content = "VERDICT: REVISE\nCRITIQUE: overfit to a single input"
+
+        class _Model:
+            def invoke(self, msgs):
+                return _Resp()
+
+        monkeypatch.setattr(base, "build_model", lambda **k: _Model())
+        ok, crit = base.maybe_audit("repro", "payload")
+        assert ok is False and "overfit" in crit
+
+    def test_error_never_blocks(self, monkeypatch):
+        from autodebug.agents import base
+        monkeypatch.delenv("AUTODEBUG_JUDGE", raising=False)
+
+        def _boom(**k):
+            raise RuntimeError("model down")
+
+        monkeypatch.setattr(base, "build_model", _boom)
+        ok, crit = base.maybe_audit("fix", "payload")
+        assert ok is True and crit == ""
+
+
 class TestReviseRefinement:
     """When re-invoked with a prior artifact (manager looped back from a failed
     fix), repro/root_cause refine the previous result instead of regenerating."""
