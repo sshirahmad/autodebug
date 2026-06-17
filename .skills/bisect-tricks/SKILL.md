@@ -26,3 +26,14 @@ Bug: `reformat_many` doesn't handle OSError from ProcessPoolExecutor
 
 Use `git show <sha> -- <file>` to confirm the buggy code was introduced.
 The parent should NOT have the buggy code (or the function at all).
+
+## Pickaxe Self-Verification
+
+When `git log -S "<distinctive_string>"` returns exactly one commit in the range,
+that commit demonstrably added the buggy code. No further verification needed.
+
+Example: searching for `maybe_decrement_after_for_loop_variable` returns exactly
+one commit `c26daa4` — that's the culprit.
+
+Always try the pickaxe search first with a distinctive function/method name from
+the bug report before resorting to bisect.

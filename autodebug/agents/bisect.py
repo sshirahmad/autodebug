@@ -8,10 +8,10 @@ from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage
 
 from autodebug.agents.base import (
-    Budget, BudgetExceeded, attempt_trajectory, build_model, budget_middleware,
-    maybe_optimize_prompt, model_retry_middleware, planning_middleware,
-    require_tool_calls_middleware, retry_feedback, submission_middleware,
-    summarization_middleware, tool_call_limit_middleware,
+    Budget, BudgetExceeded, attempt_trajectory, budget_middleware,
+    maybe_optimize_prompt, model_for_attempt, model_retry_middleware,
+    planning_middleware, require_tool_calls_middleware, retry_feedback,
+    submission_middleware, summarization_middleware, tool_call_limit_middleware,
 )
 from autodebug import resume
 from autodebug.agent_state import BisectAgentState
@@ -29,7 +29,6 @@ def run_bisect(state: DebugState, *, registry) -> DebugState:
     known_good = state.known_good_commit or ""
 
     system_prompt = registry.system_prompt("bisect")
-    llm = build_model(model_id=cfg.model, provider=cfg.provider)
 
     key = resume.bug_key(state)
     saver = resume.get_saver()
@@ -78,6 +77,7 @@ def run_bisect(state: DebugState, *, registry) -> DebugState:
         try:
             for attempt in range(cfg.max_retries + 1):
                 budget = Budget.from_config(cfg)
+                llm = model_for_attempt(attempt, cfg.model, cfg.provider)
                 tools = registry.build_tools("bisect", sandbox=sandbox)
                 agent = create_agent(
                     model=llm,
@@ -137,12 +137,12 @@ def run_bisect(state: DebugState, *, registry) -> DebugState:
                     model_id=cfg.model, provider=cfg.provider,
                 )
 
-            state.stage = PipelineStage.FAILED
-            state.error = (
-                f"BisectAgent: {run_error}" if run_error else
-                "BisectAgent: budget exceeded with no submission" if crashed else
-                "BisectAgent: could not identify culprit commit"
-            )
+            # Bisect is best-effort, not a gate: if it can't pin a culprit, advance
+            # to root_cause anyway (it works from the repro + bug report). Leaving
+            # the stage FAILED here would throw away every bug whose regression
+            # point is hard to bisect but is still fixable from the reproduction.
+            state.bisect = None
+            state.stage = PipelineStage.ROOT_CAUSE
             return state
         finally:
             # The repo volume is shared with the later stages. A crashed or

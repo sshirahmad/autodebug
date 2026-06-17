@@ -29,8 +29,14 @@ reproduced: |
   Goal of this phase: identify the CULPRIT COMMIT that introduced the
   regression. Call `run_bisect_agent`.
 
+  The culprit is HELPFUL but NOT REQUIRED. If bisect comes back inconclusive
+  (no culprit), do NOT get stuck retrying it — call `run_root_cause_agent`
+  directly. Root cause can analyze from the reproduction and bug report alone;
+  it just won't have a culprit diff. Only retry bisect if you have a concrete
+  new idea for narrowing it.
+
   Only re-run `run_repro_agent` if you have a concrete reason to doubt the
-  current reproduction. Otherwise proceed to bisection.
+  current reproduction.
 
   Respond with exactly one tool call — no prose.
 

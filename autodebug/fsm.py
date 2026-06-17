@@ -56,7 +56,11 @@ TERMINAL: frozenset[ManagerPhase] = frozenset({ManagerPhase.DONE, ManagerPhase.F
 # narrates "all tools are exhausted", looping until the budget trips.
 MANAGER_ALLOWED_TOOLS: dict[str, tuple[str, ...]] = {
     ManagerPhase.INIT.value:       ("run_repro_agent", "finish"),
-    ManagerPhase.REPRODUCED.value: ("run_bisect_agent", "run_repro_agent", "finish"),
+    # root_cause is reachable from REPRODUCED too: bisect is best-effort, so if it
+    # can't pin a culprit the manager can still analyze from the repro + report.
+    ManagerPhase.REPRODUCED.value: (
+        "run_bisect_agent", "run_root_cause_agent", "run_repro_agent", "finish",
+    ),
     ManagerPhase.BISECTED.value:   ("run_root_cause_agent", "run_repro_agent", "finish"),
     ManagerPhase.ANALYZED.value:   ("run_fix_agent", "run_root_cause_agent", "finish"),
     ManagerPhase.REVISING.value:   (

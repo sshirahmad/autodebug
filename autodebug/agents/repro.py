@@ -8,10 +8,10 @@ from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage
 
 from autodebug.agents.base import (
-    Budget, BudgetExceeded, attempt_trajectory, build_model, budget_middleware,
-    maybe_optimize_prompt, model_retry_middleware, planning_middleware,
-    require_tool_calls_middleware, retry_feedback, submission_middleware,
-    summarization_middleware, tool_call_limit_middleware,
+    Budget, BudgetExceeded, attempt_trajectory, budget_middleware,
+    maybe_optimize_prompt, model_for_attempt, model_retry_middleware,
+    planning_middleware, require_tool_calls_middleware, retry_feedback,
+    submission_middleware, summarization_middleware, tool_call_limit_middleware,
 )
 from autodebug import resume
 from autodebug.agent_state import ReproAgentState
@@ -60,7 +60,6 @@ def run_repro(state: DebugState, *, registry) -> DebugState:
     )
 
     system_prompt = registry.system_prompt("repro")
-    llm = build_model(model_id=cfg.model, provider=cfg.provider)
 
     crashed = False
     run_error: str | None = None
@@ -76,6 +75,7 @@ def run_repro(state: DebugState, *, registry) -> DebugState:
 
         for attempt in range(cfg.max_retries + 1):
             budget = Budget.from_config(cfg)
+            llm = model_for_attempt(attempt, cfg.model, cfg.provider)
             tools = registry.build_tools("repro", sandbox=sandbox)
             agent = create_agent(
                 model=llm,

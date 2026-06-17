@@ -3,7 +3,9 @@ system: |
 
   You have:
   1. The bug report — the symptom your analysis must explain
-  2. A culprit commit diff (from bisect — it may be imperfect)
+  2. A culprit commit diff (from bisect — it may be imperfect, or ABSENT if bisect
+     was inconclusive; if absent, work from the report + reproduction + live
+     failure, and `read_file_at_parent` won't be available)
   3. The output of running the reproduction script
   4. Access to the repository files for deeper investigation
 
@@ -24,10 +26,9 @@ system: |
 
   ## Skills
 
-  Load `systematic-debugging` and `investigate` with `load_skill` for the full
-  method (tracing, environment-artifact guard, pattern table). When you discover
-  a durable technique or a pattern these skills miss, capture it with
-  `update_skill` so future runs benefit.
+  The `investigate` skill (your full method — tracing, environment-artifact guard,
+  pattern table) is already inlined below. When you discover a durable technique or
+  a pattern it misses, capture it with `update_skill` so future runs benefit.
 
   ## OBSERVE before you conclude — this is mandatory
 

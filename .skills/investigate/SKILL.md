@@ -168,6 +168,11 @@ An operation that can fail under some environment or input (e.g. `ProcessPoolExe
 
 Look for: an unhandled exception type named in the report; "should fall back / degrade gracefully / not crash when …". The root cause is the **absent** guard, and the fix adds it.
 
+### State pollution across tests
+The culprit mutated a global, class attribute, registry, or shared cache. The code works in isolation but fails in the full suite (or vice versa) because an earlier step left state behind.
+
+Look for: a test that passes alone but fails in the suite; a global/registry written in the culprit diff.
+
 ---
 
 ## Output Format
@@ -209,4 +214,21 @@ A report whose `evidence` was not observed at runtime is rejected.
 4. **Trace the call chain.** Connect the traceback's error site back to either the diff-introduced change or the missing guard.
 5. **Use `read_file_at_parent`** to compare pre/post — don't guess.
 6. **Be specific and single.** Name the exact file:line. Report the one cause that produces the reported failure.
-7. **Capture what you learn.** If you hit a pattern these notes don't cover, add it with `update_skill` so the next run starts smarter.
+7. **Three strikes → it's structural.** If three distinct hypotheses each fail to match the observed failure, stop guessing at code lines — the cause is likely structural (state pollution, ordering, the wrong layer). Re-read the diff and the call chain from scratch instead of trying a fourth line-level guess.
+8. **Capture what you learn.** If you hit a pattern these notes don't cover, add it with `update_skill` so the next run starts smarter.
+
+## Repository: Ansible
+
+### Key Patterns
+
+1. **FieldAttribute `static=True`**: When a field has `static=True`, the `post_validate()` method in `base.py` checks if the value contains templates and emits a warning. Without `static=True`, no such warning is generated.
+
+2. **Post-validation flow**: `_load_collections` (named `_load_<field>`) is called during `load_data()`, not during `post_validate()`. The post-validate method convention is `_post_validate_<field>`.
+
+3. **CollectionSearch class**: In `lib/ansible/playbook/collectionsearch.py`, the `_collections` field attribute lacked `static=True` and `always_post_validate=True`, preventing warning generation for templated collection names.
+
+4. **PR #68723 fix**: Added `static=True, always_post_validate=True` to the `_collections` FieldAttribute and added template checking within `_load_collections()` using `is_template()` and `Display.warning()`.
+
+### Test location
+- Tests for playbook units: `test/units/playbook/`
+- Collection search test: `test/units/playbook/test_collectionsearch.py` (was missing before the fix)

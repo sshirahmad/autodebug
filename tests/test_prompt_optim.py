@@ -123,6 +123,46 @@ class TestMaybeOptimizePrompt:
         assert used["model"] == base._DEFAULT_OPTIM_MODEL
 
 
+class TestBraceMasking:
+    """LangMem reads literal {x} as required f-string variables; our static
+    prompts/trajectories carry code with braces (e.g. {sha}). We mask them for the
+    optimizer round-trip so it doesn't demand spurious variables or crash .format()."""
+
+    def test_mask_then_unmask_is_identity(self):
+        s = 'use {sha}; idx = commits[len(commits)//2]; first_bad = {x}'
+        masked = base._mask_braces(s)
+        assert "{" not in masked and "}" not in masked
+        assert base._unmask_braces(masked) == s
+
+    def test_masked_prompt_exposes_no_fstring_variables(self):
+        import re
+        masked = base._mask_braces("find {sha} at {len(commits)} -- {first_bad}")
+        assert re.findall(r"\{(.+?)\}", masked) == []  # LangMem extracts nothing
+
+    def test_optimizer_receives_masked_prompt_and_result_is_unmasked(self, monkeypatch):
+        monkeypatch.delenv("AUTODEBUG_PROMPT_OPTIM", raising=False)
+        seen = {}
+
+        def behavior(_model):
+            return "improved with {sha}"   # model echoes a brace -> must round-trip
+
+        # capture what the optimizer was handed
+        import langmem
+        monkeypatch.setattr(base, "build_model", lambda model_id=None, provider=None: model_id)
+
+        class _Opt:
+            def __init__(self, model): pass
+            def invoke(self, inp):
+                seen["prompt"] = inp["prompt"]
+                return behavior(None)
+
+        monkeypatch.setattr(langmem, "create_prompt_optimizer",
+                            lambda model, kind="gradient": _Opt(model))
+        out = base.maybe_optimize_prompt("keep {sha} here", [AIMessage(content="x {y}")], "fb")
+        assert "{" not in seen["prompt"] and "}" not in seen["prompt"]  # masked going in
+        assert out == "improved with {sha}"                            # unmasked coming out
+
+
 class TestTrimTrajectory:
     def test_keeps_short_trajectories_intact(self):
         msgs = [AIMessage(content=str(i)) for i in range(10)]

@@ -15,11 +15,11 @@ def make_load_skill_tool(**_):
         """Load a skill's full documentation by name.
 
         Returns the contents of .skills/<name>/SKILL.md, useful for loading
-        extended guidance on-demand (e.g. 'systematic-debugging',
-        'git-advanced-workflows', 'investigate').
+        extended guidance on-demand (e.g. 'investigate', 'bisect-tricks',
+        'git-advanced-workflows').
 
         Args:
-            name: Skill directory name under .skills/ (e.g. 'systematic-debugging').
+            name: Skill directory name under .skills/ (e.g. 'investigate').
         """
         skill_file = _SKILLS_ROOT / name / "SKILL.md"
         if not skill_file.exists():

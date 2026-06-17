@@ -24,6 +24,10 @@ def make_read_file_at_parent_tool(sandbox: Sandbox, parent_sha: str, **_):
         Args:
             path: Relative path from the repo root to read at the parent commit.
         """
+        if not parent_sha:
+            return ("No culprit commit was identified (bisect was inconclusive), so "
+                    "there is no parent revision to compare against. Use read_file "
+                    "and the runtime-inspection tools instead.")
         content = git_utils.get_file_at_commit(sandbox, parent_sha, path)
         return content or f"File not found at parent commit: {path}"
     return read_file_at_parent

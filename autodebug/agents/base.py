@@ -283,6 +283,38 @@ def _trim_trajectory(messages: list) -> list:
     return messages[:_TRAJ_HEAD] + messages[-_TRAJ_TAIL:]
 
 
+# LangMem's gradient optimizer treats every `{x}` in the prompt as a required
+# f-string variable (it `.format()`s the prompt + trajectory internally). Our
+# system prompts are STATIC text — never formatted — but they contain literal
+# braces (e.g. code examples in skills, `{sha}`, `{len(commits)}`), and so do
+# agent trajectories. Those make the optimizer demand spurious "variables"
+# ("Missing required variable: …") and blow up its own `.format()` (IndexError).
+# So we mask braces to private-use sentinels for the round-trip and restore them.
+_BRACE_L, _BRACE_R = chr(0xE000), chr(0xE001)  # Unicode PUA; never appear in prompts
+
+
+def _mask_braces(s: str) -> str:
+    return s.replace("{", _BRACE_L).replace("}", _BRACE_R)
+
+
+def _unmask_braces(s: str) -> str:
+    return s.replace(_BRACE_L, "{").replace(_BRACE_R, "}")
+
+
+def _mask_messages(messages: list) -> list:
+    """Copies of `messages` with braces in their text content masked."""
+    out = []
+    for m in messages:
+        c = getattr(m, "content", None)
+        if isinstance(c, str) and ("{" in c or "}" in c):
+            try:
+                m = m.model_copy(update={"content": _mask_braces(c)})
+            except Exception:
+                continue  # skip a message we can't safely copy rather than crash
+        out.append(m)
+    return out
+
+
 def maybe_optimize_prompt(
     current_prompt: str,
     messages: list,
@@ -312,14 +344,17 @@ def maybe_optimize_prompt(
         optimizer = create_prompt_optimizer(
             build_model(model_id=opt_model, provider=opt_provider), kind="gradient"
         )
+        # Mask braces so LangMem doesn't read literal {…} in the prompt/trajectory
+        # as required f-string variables (or crash its internal .format()).
         trajectory = AnnotatedTrajectory(
-            messages=_trim_trajectory(messages), feedback=feedback
+            messages=_mask_messages(_trim_trajectory(messages)),
+            feedback=_mask_braces(feedback),
         )
         improved = optimizer.invoke(
-            {"trajectories": [trajectory], "prompt": current_prompt}
+            {"trajectories": [trajectory], "prompt": _mask_braces(current_prompt)}
         )
         if isinstance(improved, str) and improved.strip():
-            return improved
+            return _unmask_braces(improved)
     except Exception as exc:
         logger.warning(
             "Prompt optimization failed on model %r (provider %r); keeping the "
@@ -369,4 +404,29 @@ def build_model(
         kwargs["base_url"] = resolved_base
     if temperature is not None:
         kwargs["temperature"] = temperature
+    # Per-request timeout so a stalled provider connection RAISES instead of
+    # blocking on a C-level socket read forever (which also makes Ctrl+C
+    # undeliverable). model_retry_middleware then retries the timeout, and the
+    # budget eventually trips. Set AUTODEBUG_MODEL_TIMEOUT=0 to disable.
+    timeout = float(os.getenv("AUTODEBUG_MODEL_TIMEOUT", "120"))
+    if timeout > 0:
+        kwargs["timeout"] = timeout
     return init_chat_model(mid, model_provider=prv, **kwargs)
+
+
+def model_for_attempt(attempt: int, model_id: str | None, provider: str | None):
+    """Build the chat model for a retry `attempt`.
+
+    On retries (attempt > 0), escalate to AUTODEBUG_RETRY_MODEL / _PROVIDER if
+    configured — the cheap base model takes the first shot, a stronger model takes
+    the do-overs. Falls back to the base model when no retry model is set, so this
+    is a no-op unless you opt in.
+    """
+    if attempt > 0:
+        retry_model = os.getenv("AUTODEBUG_RETRY_MODEL")
+        if retry_model:
+            return build_model(
+                model_id=retry_model,
+                provider=os.getenv("AUTODEBUG_RETRY_MODEL_PROVIDER") or provider,
+            )
+    return build_model(model_id=model_id, provider=provider)

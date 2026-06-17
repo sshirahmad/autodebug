@@ -228,8 +228,9 @@ class TestManagerTools:
         assert fsm.phase == ManagerPhase.REPRODUCED
 
     def test_bisect_blank_culprit_is_rejected(self, fake_agents, state):
-        # A sub-agent that submits an empty SHA must NOT advance the FSM — that
-        # blank culprit caused a wasted repro+bisect redo in production.
+        # A sub-agent that submits an empty SHA must NOT be treated as a real find:
+        # the culprit is cleared and the FSM stays in REPRODUCED (no advance on a
+        # bogus culprit). The signal points the manager to root_cause-without-culprit.
         m = _import_manager_tools()
         fsm = FSM(phase=ManagerPhase.REPRODUCED)
         state.repro = ReproResult(repro_script="x", error_output="boom", confirmed=True)
@@ -239,9 +240,9 @@ class TestManagerTools:
         )
         tool = m.make_run_bisect_agent_tool(state=state, registry=None, fsm=fsm)
         out = tool.invoke({})
-        assert "BISECT FAILED" in out
-        assert fsm.phase == ManagerPhase.REPRODUCED  # did NOT advance
-        assert state.bisect is None                  # cleared for a clean retry
+        assert "INCONCLUSIVE" in out and "run_root_cause_agent" in out
+        assert fsm.phase == ManagerPhase.REPRODUCED  # did NOT advance on a blank culprit
+        assert state.bisect is None                  # cleared
 
     def test_bisect_valid_culprit_advances(self, fake_agents, state):
         m = _import_manager_tools()

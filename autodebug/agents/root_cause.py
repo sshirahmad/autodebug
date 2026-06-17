@@ -20,10 +20,10 @@ from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage
 
 from autodebug.agents.base import (
-    Budget, BudgetExceeded, attempt_trajectory, build_model, budget_middleware,
-    maybe_optimize_prompt, model_retry_middleware, planning_middleware,
-    require_tool_calls_middleware, retry_feedback, submission_middleware,
-    summarization_middleware, tool_call_limit_middleware,
+    Budget, BudgetExceeded, attempt_trajectory, budget_middleware,
+    maybe_optimize_prompt, model_for_attempt, model_retry_middleware,
+    planning_middleware, require_tool_calls_middleware, retry_feedback,
+    submission_middleware, summarization_middleware, tool_call_limit_middleware,
 )
 from autodebug import resume
 from autodebug.agent_state import RootCauseAgentState
@@ -46,13 +46,11 @@ def _used_inspection_tool(messages: list) -> bool:
 def run_root_cause(state: DebugState, *, registry) -> DebugState:
     """Drive the root_cause agent until it submits an evidence-backed hypothesis."""
     assert state.repo_volume
-    assert state.bisect
-    assert state.repro
+    assert state.repro  # bisect (culprit) is best-effort; root_cause works without it
 
     cfg = registry.get_config("root_cause")
 
     system_prompt = registry.system_prompt("root_cause")
-    llm = build_model(model_id=cfg.model, provider=cfg.provider)
 
     # Refine rather than regenerate: a prior hypothesis means the fix based on it
     # failed, so the manager looped back. Surface it so the agent corrects what was
@@ -84,12 +82,23 @@ def run_root_cause(state: DebugState, *, registry) -> DebugState:
 
     with Sandbox(volume=state.repo_volume) as sandbox:
         initial_run = sandbox.run_script(state.repro.repro_script)
+        if state.bisect:
+            culprit_block = (
+                f"Culprit commit: {state.bisect.commit_message}\n"
+                f"SHA: {state.bisect.culprit_commit}\n\n"
+                f"Commit diff:\n```diff\n{state.bisect.commit_diff}\n```\n\n"
+            )
+        else:
+            culprit_block = (
+                "Culprit commit: NOT identified (bisect was inconclusive). Work from "
+                "the bug report, the reproduction, and the live failure instead — "
+                "`read_file_at_parent` is unavailable, so rely on "
+                "run_repro_with_traceback, inspect_at, and read_file.\n\n"
+            )
         initial_text = (
             f"Bug report (the symptom your hypothesis MUST explain):\n"
             f"{state.bug_report}\n\n"
-            f"Culprit commit: {state.bisect.commit_message}\n"
-            f"SHA: {state.bisect.culprit_commit}\n\n"
-            f"Commit diff:\n```diff\n{state.bisect.commit_diff}\n```\n\n"
+            f"{culprit_block}"
             f"Reproduction script output:\n```\n{initial_run.output[-3000:]}\n```\n"
             f"{refine_note}\n"
             "Identify the root cause of the bug described above. You MUST observe "
@@ -100,10 +109,11 @@ def run_root_cause(state: DebugState, *, registry) -> DebugState:
 
         for attempt in range(cfg.max_retries + 1):
             budget = Budget.from_config(cfg)
+            llm = model_for_attempt(attempt, cfg.model, cfg.provider)
             tools = registry.build_tools(
                 "root_cause",
                 sandbox=sandbox,
-                parent_sha=f"{state.bisect.culprit_commit}^",
+                parent_sha=f"{state.bisect.culprit_commit}^" if state.bisect else "",
                 repro_script=state.repro.repro_script,
             )
             agent = create_agent(

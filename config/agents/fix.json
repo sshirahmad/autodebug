@@ -1,7 +1,7 @@
 {
   "system_prompt": "config/prompts/fix.yaml",
   "tools": ["search_memory", "read_file", "list_files", "apply_patch", "run_repro", "run_tests", "shell", "load_skill", "update_skill", "submit_fix"],
-  "skills": ["systematic-debugging"],
+  "skills": [],
   "time_budget_seconds": 1200,
   "cost_budget_usd": 3.00,
   "cost_per_1k_input_tokens": 0.003,

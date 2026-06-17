@@ -192,9 +192,9 @@ class TestRunBisect:
         assert state.stage == PipelineStage.ROOT_CAUSE
         restore.assert_called_once_with(sb, "deadbeef")  # original HEAD from helpers
 
-    def test_restores_checkout_on_failure(self, repro_state):
-        # No submission: stage FAILED, but the volume is STILL restored so the
-        # next stage doesn't inherit a mid-bisect / wrong checkout.
+    def test_advances_to_root_cause_without_culprit_and_restores(self, repro_state):
+        # No submission: bisect is best-effort, so it ADVANCES to root_cause
+        # (state.bisect=None) rather than failing — and still restores the volume.
         sb = _make_fake_sandbox()
         with patch_sandbox("autodebug.agents.bisect", sb), \
              patch_create_agent("autodebug.agents.bisect", behavior=None), \
@@ -203,7 +203,8 @@ class TestRunBisect:
             from autodebug.registry import AutoDebugRegistry
             from autodebug.agents.bisect import run_bisect
             state = run_bisect(repro_state, registry=AutoDebugRegistry.from_file())
-        assert state.stage == PipelineStage.FAILED
+        assert state.stage == PipelineStage.ROOT_CAUSE
+        assert state.bisect is None
         restore.assert_called_once_with(sb, "deadbeef")
 
 
@@ -258,6 +259,21 @@ class TestRunRootCause:
             state = run_root_cause(bisect_state, registry=AutoDebugRegistry.from_file())
 
         assert state.stage == PipelineStage.FIX  # graceful accept, not FAILED
+
+    def test_runs_without_a_culprit(self, repro_state):
+        # Bisect was inconclusive (state.bisect is None) — root_cause still runs
+        # from the repro + bug report and advances to fix.
+        assert repro_state.bisect is None
+        rc = RootCauseResult(summary="s", relevant_lines=["f:1"], hypothesis="h", evidence="e")
+        sb = _make_fake_sandbox()
+        sb.run_script.return_value = RunResult(exit_code=1, stdout="", stderr="x")
+        with patch_sandbox("autodebug.agents.root_cause", sb), \
+             _patch_root_cause_agent(rc, inspected=True):
+            from autodebug.registry import AutoDebugRegistry
+            from autodebug.agents.root_cause import run_root_cause
+            state = run_root_cause(repro_state, registry=AutoDebugRegistry.from_file())
+        assert state.stage == PipelineStage.FIX
+        assert state.bisect is None
 
 
 # ---------------------------------------------------------------------------
@@ -470,3 +486,37 @@ class TestRequireToolCallsMiddleware:
             state={"messages": [HumanMessage(content="hi")]}, runtime=None,
         )
         assert out is None
+
+
+# ---------------------------------------------------------------------------
+# model_for_attempt — optionally escalate to a stronger model on retries
+# ---------------------------------------------------------------------------
+
+class TestModelForAttempt:
+    def _capture(self, monkeypatch):
+        from autodebug.agents import base
+        seen = {}
+        monkeypatch.setattr(
+            base, "build_model",
+            lambda model_id=None, provider=None: seen.update(model=model_id, provider=provider),
+        )
+        return base, seen
+
+    def test_first_attempt_uses_base_model(self, monkeypatch):
+        base, seen = self._capture(monkeypatch)
+        monkeypatch.setenv("AUTODEBUG_RETRY_MODEL", "strong")  # set but attempt 0 ignores it
+        base.model_for_attempt(0, "base", "prov")
+        assert seen == {"model": "base", "provider": "prov"}
+
+    def test_retry_escalates_when_retry_model_set(self, monkeypatch):
+        base, seen = self._capture(monkeypatch)
+        monkeypatch.setenv("AUTODEBUG_RETRY_MODEL", "strong")
+        monkeypatch.delenv("AUTODEBUG_RETRY_MODEL_PROVIDER", raising=False)
+        base.model_for_attempt(1, "base", "prov")
+        assert seen == {"model": "strong", "provider": "prov"}  # provider falls back to base
+
+    def test_retry_keeps_base_when_no_retry_model(self, monkeypatch):
+        base, seen = self._capture(monkeypatch)
+        monkeypatch.delenv("AUTODEBUG_RETRY_MODEL", raising=False)
+        base.model_for_attempt(2, "base", "prov")
+        assert seen == {"model": "base", "provider": "prov"}

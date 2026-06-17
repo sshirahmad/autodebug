@@ -20,20 +20,20 @@ class TestResolveSkills:
         assert self.loader.resolve_skills([]) == ""
 
     def test_primary_skill_body_is_inlined(self):
-        out = self.loader.resolve_skills(["systematic-debugging"])
-        assert "Primary skill (already loaded): systematic-debugging" in out
+        out = self.loader.resolve_skills(["bisect-tricks"])
+        assert "Primary skill (already loaded): bisect-tricks" in out
         # a phrase that only exists in the FULL body, not the 1-line description:
-        assert "Iron Law" in out
+        assert "Match the Repro to the Bug" in out
 
     def test_secondary_skills_are_descriptions_only(self):
-        out = self.loader.resolve_skills(["investigate", "systematic-debugging"])
+        out = self.loader.resolve_skills(["investigate", "bisect-tricks"])
         # primary fully loaded
         assert "Primary skill (already loaded): investigate" in out
         assert "Step 0 — Anchor on the bug report" in out  # body of investigate
         # secondary listed as description + loadable, NOT its full body
         assert "## Additional skills" in out
-        assert "**systematic-debugging**" in out
-        assert "Iron Law" not in out  # systematic-debugging body NOT inlined here
+        assert "**bisect-tricks**" in out
+        assert "Match the Repro to the Bug" not in out  # bisect-tricks body NOT inlined here
         assert "load_skill" in out
 
     def test_missing_primary_warns_but_does_not_crash(self):

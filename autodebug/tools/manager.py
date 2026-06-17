@@ -89,7 +89,12 @@ def make_run_bisect_agent_tool(state, registry, fsm: FSM, **_):
                 f"{state.bisect.commit_message}"
             )
         state.bisect = None
-        return "BISECT FAILED — no culprit commit identified. Retry or finish('failed', ...)."
+        return (
+            "BISECT INCONCLUSIVE — no culprit commit identified. The culprit is "
+            "helpful but NOT required: call run_root_cause_agent to analyze from the "
+            "reproduction and bug report directly (it just won't have a culprit "
+            "diff). Retry bisect only if you have a concrete new idea."
+        )
 
     return run_bisect_agent
 
@@ -97,13 +102,14 @@ def make_run_bisect_agent_tool(state, registry, fsm: FSM, **_):
 def make_run_root_cause_agent_tool(state, registry, fsm: FSM, **_):
     @tool
     def run_root_cause_agent() -> str:
-        """Delegate to the Root-Cause sub-agent: explain WHY the culprit broke
-        things. Requires a culprit commit. Re-run in REVISING to refine a
+        """Delegate to the Root-Cause sub-agent: explain WHY the bug happens.
+        Uses the culprit diff if one was found, but works from the reproduction +
+        bug report alone if bisect was inconclusive. Re-run in REVISING to refine a
         hypothesis that led to a failed fix."""
         from autodebug.agents import run_root_cause
 
-        if not state.bisect:
-            return "Cannot analyze yet — find the culprit first (run_bisect_agent)."
+        if not (state.repro and state.repro.confirmed):
+            return "Cannot analyze yet — reproduce the bug first (run_repro_agent)."
         err = _delegate(run_root_cause, state, registry)
         if err:
             return (f"ROOT CAUSE sub-agent crashed: {err}. This may be transient — "

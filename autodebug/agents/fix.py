@@ -9,10 +9,10 @@ from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage
 
 from autodebug.agents.base import (
-    Budget, BudgetExceeded, attempt_trajectory, build_model, budget_middleware,
-    maybe_optimize_prompt, model_retry_middleware, planning_middleware,
-    require_tool_calls_middleware, retry_feedback, submission_middleware,
-    summarization_middleware, tool_call_limit_middleware,
+    Budget, BudgetExceeded, attempt_trajectory, budget_middleware,
+    maybe_optimize_prompt, model_for_attempt, model_retry_middleware,
+    planning_middleware, require_tool_calls_middleware, retry_feedback,
+    submission_middleware, summarization_middleware, tool_call_limit_middleware,
 )
 from autodebug import resume
 from autodebug.agent_state import FixAgentState
@@ -22,10 +22,13 @@ from autodebug.state import DebugState, FixResult, PipelineStage
 
 def run_fix(state: DebugState, *, registry) -> DebugState:
     """Drive the fix agent until it submits a passing patch."""
-    assert state.repo_volume
-    assert state.repro
-    assert state.bisect
-    assert state.root_cause
+    # bisect (culprit) is best-effort and may be None — the fix works from the
+    # root cause + reproduction and never reads state.bisect. Asserting it here
+    # crashed the fix agent (bare AssertionError) on every bug whose regression
+    # point bisect couldn't pin, after bisect became non-blocking.
+    assert state.repo_volume, "fix agent requires a repo volume"
+    assert state.repro, "fix agent requires a confirmed reproduction"
+    assert state.root_cause, "fix agent requires a root cause"
 
     cfg = registry.get_config("fix")
 
@@ -55,7 +58,6 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
     model_id = cfg.model or os.getenv("AUTODEBUG_FIX_MODEL")
     provider = cfg.provider or os.getenv("AUTODEBUG_FIX_MODEL_PROVIDER")
     system_prompt = registry.system_prompt("fix")
-    llm = build_model(model_id=model_id, provider=provider)
 
     crashed = False
     run_error: str | None = None
@@ -67,6 +69,7 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
     with Sandbox(volume=state.repo_volume) as sandbox:
         for attempt in range(cfg.max_retries + 1):
             budget = Budget.from_config(cfg)
+            llm = model_for_attempt(attempt, model_id, provider)
             tools = registry.build_tools(
                 "fix",
                 sandbox=sandbox,
