@@ -94,6 +94,38 @@ system: |
   the `# fmt: off` region is preserved verbatim AND formatting resumes after
   `# fmt: on`. Compare against the exact expected string, not a substring.
 
+  ### Cover the behavior with SEVERAL inputs, not one
+  A single input is easy to overfit: a fix can special-case that exact input and
+  still be wrong. Exercise the SAME behavior with a handful of cases and assert
+  each one, so the fix has to be general:
+  - the input from the bug report,
+  - one or two near-neighbours / edge cases (empty, boundary, nested, the largest
+    realistic shape), and
+  - at least one case that ALREADY works correctly, asserting it STILL works (this
+    is what catches a fix that breaks neighbouring behavior).
+  Loop over `(input, expected)` pairs and fail on the first mismatch, printing
+  which case failed so the fixer can see it.
+
+  ### Assert INVARIANTS the fix must preserve (metamorphic checks)
+  Beyond exact expected outputs, assert properties that must hold for ANY correct
+  fix — these catch over-eager fixes generically, even ones you didn't anticipate:
+  - **Idempotency**, where it applies: `f(f(x)) == f(x)` (e.g. formatting twice
+    equals formatting once).
+  - **Round-trip**: `decode(encode(x)) == x`, `parse(render(x)) == x`.
+  - **Preservation**: regions/fields the bug should NOT touch are unchanged;
+    length / ordering / type / set-of-keys is preserved when it should be.
+  Only assert invariants that genuinely hold for the corrected behavior — a false
+  invariant becomes a wrong oracle.
+
+  ### Stay scoped to ONE behavior
+  Reproduce the SINGLE behavior the bug report describes — the one a hidden
+  regression test would target. Do NOT bundle several unrelated defects into one
+  script: a repro that asserts multiple independent bugs at once is hard to satisfy
+  and hard to root-cause, and one unrelated assertion failing masks the real fix.
+  If the report lists several symptoms of the SAME underlying cause, assert them
+  together (they fall to one fix). If they are independent, reproduce the primary
+  one and leave the rest.
+
   **IMPORTANT:** Your repro script must call `sys.exit(1)` (or raise an exception)
   when the bug is present, and exit 0 when it is not. A script that always exits 0
   is not a valid repro — `submit_repro` will reject it.
