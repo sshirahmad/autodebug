@@ -340,6 +340,47 @@ class TestBudgetMiddleware:
         assert len(mw) == 2
 
 
+class TestBudgetFractionUsed:
+    def test_fraction_tracks_cost(self):
+        from autodebug.agents.base import Budget
+        b = Budget(cost_usd=1.0, cost_per_1k_input=1.0, cost_per_1k_output=0.0)
+        assert b.fraction_used == 0.0
+        b.add_tokens(800, 0)  # $0.80 of $1.00
+        assert abs(b.fraction_used - 0.8) < 1e-9
+
+    def test_fraction_is_max_of_dimensions(self):
+        from autodebug.agents.base import Budget
+        # cost barely used, but cap is the binding dimension we report.
+        b = Budget(cost_usd=10.0, cost_per_1k_input=1.0)
+        b.add_tokens(1000, 0)  # $1 / $10 = 0.1
+        assert abs(b.fraction_used - 0.1) < 1e-9
+
+    def test_no_limits_is_zero(self):
+        from autodebug.agents.base import Budget
+        assert Budget().fraction_used == 0.0
+
+
+class TestBudgetNudgeMiddleware:
+    def test_nudges_to_submit_once_over_threshold(self):
+        from autodebug.agents.base import Budget, budget_nudge_middleware
+        b = Budget(cost_usd=1.0, cost_per_1k_input=1.0)
+        b.add_tokens(900, 0)  # 90% used, over the 0.8 threshold
+        mw = budget_nudge_middleware(b, "submit_root_cause")
+        out = mw[0].before_model(state={"messages": []}, runtime=None)
+        assert out is not None
+        text = out["messages"][0].content
+        assert "submit_root_cause" in text
+        # Fires only once — a second call returns nothing even if still over.
+        assert mw[0].before_model(state={"messages": []}, runtime=None) is None
+
+    def test_silent_under_threshold(self):
+        from autodebug.agents.base import Budget, budget_nudge_middleware
+        b = Budget(cost_usd=1.0, cost_per_1k_input=1.0)
+        b.add_tokens(500, 0)  # 50% used
+        mw = budget_nudge_middleware(b, "submit_fix")
+        assert mw[0].before_model(state={"messages": []}, runtime=None) is None
+
+
 class TestReviseRefinement:
     """When re-invoked with a prior artifact (manager looped back from a failed
     fix), repro/root_cause refine the previous result instead of regenerating."""

@@ -23,6 +23,7 @@ from langchain.agents.middleware import (
     before_model,
 )
 from langchain.chat_models import init_chat_model
+from langchain_core.messages import HumanMessage
 from langgraph.runtime import Runtime
 
 load_dotenv()
@@ -60,6 +61,21 @@ class Budget:
     @property
     def elapsed_seconds(self) -> float:
         return time.monotonic() - self._start
+
+    @property
+    def fraction_used(self) -> float:
+        """How close we are to the binding limit, as a fraction in [0, ∞).
+
+        Max of the time fraction and the cost fraction — whichever ceiling the
+        run is about to hit first. Used to nudge the agent to submit before the
+        hard cap throws.
+        """
+        fractions = [0.0]
+        if self.time_seconds:
+            fractions.append(self.elapsed_seconds / self.time_seconds)
+        if self.cost_usd:
+            fractions.append(self.cost_used / self.cost_usd)
+        return max(fractions)
 
     def add_tokens(self, input_tokens: int, output_tokens: int = 0) -> float:
         self.tokens_used += input_tokens + output_tokens
@@ -109,6 +125,35 @@ def budget_middleware(budget: Budget) -> list:
         return None
 
     return [_check_budget, _track_tokens]
+
+
+def budget_nudge_middleware(budget: Budget, submit_tool: str, threshold: float = 0.8) -> list:
+    """Salvage a result before the hard budget cap throws.
+
+    Agents that investigate (root_cause) or iterate (fix) tend to spend their
+    whole budget exploring and never call their submit tool — so they return
+    *nothing*, the manager retries them, and the per-attempt cost multiplies
+    until the session ceiling kills the run with no hypothesis or patch to show
+    for it. This injects a one-time prompt once the agent crosses `threshold` of
+    its time/cost budget, telling it to stop and submit its best current answer.
+    A partial answer lets the pipeline proceed; an empty one wastes the budget.
+    """
+    fired = {"done": False}
+
+    @before_model
+    def _nudge(state: AgentState, runtime: Runtime) -> dict | None:
+        if fired["done"] or budget.fraction_used < threshold:
+            return None
+        fired["done"] = True
+        return {"messages": [HumanMessage(content=(
+            f"⏳ You have used ~{budget.fraction_used:.0%} of your budget. STOP "
+            f"investigating now and call `{submit_tool}` with your BEST current "
+            "answer, based on the evidence you have already gathered. A partial, "
+            "best-effort submission is far more useful than running out of budget "
+            "with nothing submitted."
+        ))]}
+
+    return [_nudge]
 
 
 def session_budget_middleware(state, max_cost: float | None, max_seconds: int | None) -> list:

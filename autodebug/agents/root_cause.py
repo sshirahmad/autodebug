@@ -21,9 +21,10 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from autodebug.agents.base import (
     Budget, BudgetExceeded, attempt_trajectory, budget_middleware,
-    maybe_optimize_prompt, model_for_attempt, model_retry_middleware,
-    planning_middleware, require_tool_calls_middleware, retry_feedback,
-    submission_middleware, summarization_middleware, tool_call_limit_middleware,
+    budget_nudge_middleware, maybe_optimize_prompt, model_for_attempt,
+    model_retry_middleware, planning_middleware, require_tool_calls_middleware,
+    retry_feedback, submission_middleware, summarization_middleware,
+    tool_call_limit_middleware,
 )
 from autodebug import resume
 from autodebug.agent_state import RootCauseAgentState
@@ -124,6 +125,7 @@ def run_root_cause(state: DebugState, *, registry) -> DebugState:
                 checkpointer=saver,
                 middleware=(
                     budget_middleware(budget)
+                    + budget_nudge_middleware(budget, "submit_root_cause")
                     + model_retry_middleware()
                     + planning_middleware()
                     + summarization_middleware(cfg.model, cfg.provider)
