@@ -196,7 +196,9 @@ def test_submit_fix_uses_repro_as_oracle_and_captures_git_diff():
     fix = _update(res).get("fix")
     # Patch is normalized to end with a newline (git apply requires it).
     assert fix and fix["patch"] == "THE REAL DIFF\n"
-    sandbox.git.assert_called_once_with("diff")
+    # The captured patch comes from `git diff` (other git calls may follow for the
+    # regression gate's name-only listing / stash).
+    sandbox.git.assert_any_call("diff")
 
 
 def test_submit_fix_rejected_when_diff_is_empty():
@@ -218,6 +220,71 @@ def test_submit_fix_rejected_when_repro_still_fails():
     assert "cannot submit" in _content(res).lower()
     assert not _update(res)
     sandbox.git.assert_not_called()
+
+
+def _gate_sandbox(baseline_out, post_out,
+                  changed="pkg/foo.py\n",
+                  test_file="/workspace/repo/tests/test_foo.py"):
+    """A sandbox mock that drives the submit_fix regression gate: repro passes,
+    one changed source module maps to one existing test file, and the two pytest
+    runs (baseline before stash-pop, post after) return the given summaries."""
+    sandbox = MagicMock()
+    sandbox.run_script.return_value = RunResult(exit_code=0, stdout="ok", stderr="")
+    calls = {"pytest": 0}
+
+    def exec_side(cmd, workdir=None):
+        if "pytest" in cmd:
+            calls["pytest"] += 1
+            out = baseline_out if calls["pytest"] == 1 else post_out
+            return RunResult(exit_code=0, stdout=out, stderr="")
+        if cmd.startswith("find "):
+            return RunResult(exit_code=0, stdout=test_file + "\n", stderr="")
+        return RunResult(exit_code=0, stdout="", stderr="")
+    sandbox.exec.side_effect = exec_side
+
+    def git_side(*args, workdir=None):
+        if args[:1] == ("diff",) and "--name-only" in args:
+            return RunResult(exit_code=0, stdout=changed, stderr="")
+        if args[:1] == ("diff",):
+            return RunResult(exit_code=0, stdout="diff --git a/pkg/foo.py b/pkg/foo.py\n+x", stderr="")
+        if args[:1] == ("stash",):
+            return RunResult(exit_code=0, stdout="Saved working directory", stderr="")
+        return RunResult(exit_code=0, stdout="", stderr="")
+    sandbox.git.side_effect = git_side
+    return sandbox
+
+
+def test_submit_fix_regression_gate_blocks_newly_failing_test():
+    """A patch that passes the repro but makes a previously-passing test fail is
+    rejected with the regressing test names."""
+    sandbox = _gate_sandbox(
+        baseline_out="",  # buggy code: the module's tests all pass
+        post_out="FAILED tests/test_foo.py::test_neighbour - AssertionError",
+    )
+    tool = make_submit_fix_tool(sandbox=sandbox, repro_script="s")
+    res = _call(tool, summary="x")
+    assert "regression" in _content(res).lower()
+    assert "test_neighbour" in _content(res)
+    assert not _update(res)  # fix not accepted
+
+
+def test_submit_fix_regression_gate_baselines_preexisting_failures():
+    """A test already failing at the buggy commit is baselined out — it must not
+    block the fix when it's still failing afterwards."""
+    line = "FAILED tests/test_foo.py::test_flaky - X"
+    sandbox = _gate_sandbox(baseline_out=line, post_out=line)
+    tool = make_submit_fix_tool(sandbox=sandbox, repro_script="s")
+    res = _call(tool, summary="x")
+    fix = _update(res).get("fix")
+    assert fix and fix["patch"].startswith("diff --git")
+
+
+def test_submit_fix_regression_gate_passes_when_clean():
+    sandbox = _gate_sandbox(baseline_out="", post_out="")
+    tool = make_submit_fix_tool(sandbox=sandbox, repro_script="s")
+    res = _call(tool, summary="x")
+    assert _update(res).get("fix")
+    assert "regression check passed" in _content(res).lower()
 
 
 def test_shell_runs_command_and_returns_exit_code_and_output():

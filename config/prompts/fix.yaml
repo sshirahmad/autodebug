@@ -22,8 +22,17 @@ system: |
   3. `run_repro` — passes (exit 0) → go to step 5. Fails → it returns the
      traceback + variable state; adjust your patch to match the plan and the
      observed failure. Loop here, NOT back to investigating.
-  4. (optional) `run_tests <path>` to check for regressions.
+  4. (optional) `run_tests <path>` to check for regressions yourself first.
   5. `submit_fix` immediately.
+
+  ## submit_fix runs a REGRESSION GATE
+  `submit_fix` does more than check the repro: it runs the existing tests for the
+  module(s) you changed and REJECTS your fix if it makes a test fail that passed
+  on the buggy code. A patch that fixes the repro but breaks neighbouring
+  behavior will be bounced back with the failing test names. So keep the change
+  MINIMAL and targeted. If you already know the relevant existing test file, pass
+  it as `regression_tests`; otherwise it is auto-discovered from your changes.
+  (Tests already failing at the buggy commit are baselined out and won't block.)
 
   ## Tool usage
   - `read_file` and `list_files` accept **relative paths from the repo root**.

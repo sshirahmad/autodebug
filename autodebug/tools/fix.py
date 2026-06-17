@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import os
+import re
 import shlex
 from typing import Annotated
 
@@ -13,6 +16,49 @@ from autodebug.patch_utils import is_test_path
 from autodebug.sandbox import REPO_DIR, Sandbox
 from autodebug.state import FixResult
 from autodebug.tools.introspect import postmortem_harness
+
+# pytest's short-summary lines for failures/errors look like
+# "FAILED path::test - reason" / "ERROR path - reason"; grab the node id.
+_PYTEST_FAIL_RE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)", re.MULTILINE)
+
+
+def _collect_failures(sandbox: Sandbox, targets: str) -> set[str]:
+    """Run the given pytest targets and return the set of failing/erroring node IDs."""
+    run = sandbox.exec(
+        f"python -m pytest {targets} -p no:cacheprovider --tb=no -q -rfE"
+    )
+    return set(_PYTEST_FAIL_RE.findall(run.output))
+
+
+def _discover_regression_tests(sandbox: Sandbox) -> str:
+    """Find existing test files covering the source files this fix changed.
+
+    Maps each changed source module `foo.py` to `test_foo.py` / `foo_test.py`
+    anywhere in the repo (pytest naming convention). Returns a space-separated,
+    shell-quoted target string (capped), or "" if none are found. These are the
+    project's OWN tests at the buggy commit — never the hidden benchmark test.
+    """
+    changed = sandbox.git("diff", "--name-only").stdout.splitlines()
+    bases = {
+        os.path.splitext(os.path.basename(p))[0]
+        for p in changed
+        if p.strip() and p.endswith(".py") and not is_test_path(p)
+    }
+    bases = {b for b in bases if re.fullmatch(r"[\w.-]+", b)}
+    found: list[str] = []
+    seen: set[str] = set()
+    for base in sorted(bases):
+        r = sandbox.exec(
+            f"find {REPO_DIR} -type f "
+            f"\\( -name 'test_{base}.py' -o -name '{base}_test.py' \\) "
+            "-not -path '*/.git/*'"
+        )
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line and line not in seen:
+                seen.add(line)
+                found.append(line)
+    return " ".join(shlex.quote(p) for p in found[:5])
 
 
 def make_apply_patch_tool(sandbox: Sandbox, **_):
@@ -93,14 +139,21 @@ def make_submit_fix_tool(sandbox: Sandbox, repro_script: str, **_):
     def submit_fix(
         summary: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
+        regression_tests: str = "",
     ) -> Command | str:
         """Submit the fix once the reproduction passes.
 
-        The reproduction is the success criterion: there is no benchmark test in
-        production, so a fix is accepted when the repro script exits 0.
+        The reproduction is the primary success criterion (there is no benchmark
+        test in production). Before accepting, this also runs the project's own
+        existing tests for the files you changed and REJECTS the fix if it makes a
+        test fail that passed on the buggy code (a regression) — so an over-eager
+        patch that breaks neighbouring behavior is caught here.
 
         Args:
             summary: One-line description of the fix you applied.
+            regression_tests: Optional space-separated test path(s) to use for the
+                regression check. Leave empty to auto-discover the test files for
+                the modules you changed.
         """
         repro_run = sandbox.run_script(repro_script)
         if not repro_run.success:
@@ -116,12 +169,47 @@ def make_submit_fix_tool(sandbox: Sandbox, repro_script: str, **_):
             )
         # git apply requires a trailing newline; normalize so the patch is valid.
         diff = diff.rstrip("\n") + "\n"
+
+        # Regression gate: a fix that passes the reproduction can still break
+        # adjacent behavior. Run the changed modules' existing tests and block
+        # only on tests that REGRESS (passed on the buggy code, fail after the
+        # patch). Baselining means a test already failing/flaky at the buggy
+        # commit never causes a false rejection.
+        targets = regression_tests.strip() or _discover_regression_tests(sandbox)
+        gate_note = " No existing test module was found to regression-check."
+        if targets:
+            stash = sandbox.git("stash")
+            if stash.exit_code != 0 or "No local changes" in stash.output:
+                # Couldn't isolate the patch to baseline — skip rather than risk a
+                # false regression (a pre-existing failure would look like one).
+                gate_note = " Regression check skipped (could not baseline)."
+            else:
+                baseline = _collect_failures(sandbox, targets)
+                if sandbox.git("stash", "pop").exit_code != 0:
+                    # Restore the fix from the captured diff so state stays intact.
+                    enc = base64.b64encode(diff.encode()).decode("ascii")
+                    sandbox.exec(f"echo {enc} | base64 -d | git apply --whitespace=nowarn -")
+                post = _collect_failures(sandbox, targets)
+                regressions = sorted(post - baseline)
+                if regressions:
+                    return (
+                        "Cannot submit: your fix makes tests FAIL that passed on the "
+                        "buggy code (regressions):\n  " + "\n  ".join(regressions) + "\n"
+                        "Adjust the patch so these keep passing. If one of them encodes "
+                        "the OLD buggy behavior, re-check that your fix is correct."
+                    )
+                gate_note = (
+                    f" Regression check passed on {len(targets.split())} existing "
+                    "test file(s)."
+                )
+
         # `attempts` is filled in by the driver from the patches channel.
-        fix = FixResult(patch=diff, attempts=0, test_output="")
+        fix = FixResult(patch=diff, attempts=0, test_output=targets)
         return Command(update={
             "fix": fix.model_dump(),
-            "messages": [ToolMessage("Fix validated against the reproduction and submitted.",
-                                     tool_call_id=tool_call_id)],
+            "messages": [ToolMessage(
+                "Fix validated against the reproduction and submitted." + gate_note,
+                tool_call_id=tool_call_id)],
         })
     return submit_fix
 
