@@ -21,6 +21,16 @@ from autodebug.sandbox import Sandbox
 from autodebug.state import DebugState, FixResult, PipelineStage
 
 
+def _record_attempt(state: DebugState, hypothesis: str, patch: str, outcome: str) -> None:
+    """Append a node to the hypothesis→fix attempt tree so a later loop-back can
+    avoid repeating a hypothesis/patch that already failed."""
+    state.hypothesis_attempts.append({
+        "hypothesis": (hypothesis or "")[:300],
+        "patch": (patch or "")[:800],
+        "outcome": outcome,
+    })
+
+
 def run_fix(state: DebugState, *, registry) -> DebugState:
     """Drive the fix agent until it submits a passing patch."""
     # bisect (culprit) is best-effort and may be None — the fix works from the
@@ -130,11 +140,15 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
                     model_id=model_id, provider=provider,
                 )
                 if ok:
+                    _record_attempt(state, rc.hypothesis if rc else "",
+                                    submitted.get("patch", ""), "pass")
                     state.fix = FixResult(**{**submitted, "attempts": len(patches)})
                     state.stage = PipelineStage.DONE
                     return state
-                # Rejected with retries left: discard the patch from the shared tree
-                # so the next attempt starts clean, and carry the critique forward.
+                # Rejected with retries left: record it, discard the patch from the
+                # shared tree so the next attempt starts clean, carry the critique.
+                _record_attempt(state, rc.hypothesis if rc else "",
+                                submitted.get("patch", ""), "rejected-by-audit")
                 sandbox.git("reset", "--hard")
                 resume.clear_one("fix", key, attempt)
                 run_error = f"fix rejected by audit: {critique}"
@@ -155,6 +169,19 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
                 retry_feedback("producing a patch that passes the repro and tests, then calling submit_fix"),
                 model_id=model_id, provider=provider,
             )
+
+    # Record the failed attempt in the hypothesis tree so a loop-back to
+    # root_cause explores a different cause rather than repeating this one.
+    try:
+        last_patches = resume.read_live(agent, invoke_config, "patches") or []
+    except Exception:  # noqa: BLE001 — recording is best-effort
+        last_patches = []
+    _record_attempt(
+        state,
+        state.root_cause.hypothesis if state.root_cause else "",
+        "; ".join(p.get("path", "") for p in last_patches),
+        "fail",
+    )
 
     state.stage = PipelineStage.FAILED
     state.error = (

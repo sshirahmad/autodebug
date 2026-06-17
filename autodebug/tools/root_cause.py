@@ -92,6 +92,7 @@ def make_submit_root_cause_tool(**_):
         summary: str, relevant_lines: str | list[str], hypothesis: str,
         evidence: str, fix_plan: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
+        alternatives: str | list[str] = "",
     ) -> Command:
         """Submit the root cause analysis once you have OBSERVED the failure.
 
@@ -108,15 +109,21 @@ def make_submit_root_cause_tool(**_):
                 which file and function, the exact lines/block to change, and the
                 precise new logic (e.g. wrap which call in try/except, what the
                 fallback does). Specific enough to implement WITHOUT re-investigating.
+            alternatives: Up to ~3 OTHER plausible root-cause hypotheses, ranked
+                most- to least-likely, in case the fix for your primary one fails.
+                One per line (or a list). Keep each to a sentence. Optional.
         """
         if isinstance(relevant_lines, str):
             relevant_lines = [l.strip() for l in relevant_lines.splitlines() if l.strip()]
+        if isinstance(alternatives, str):
+            alternatives = [a.strip(" -*\t") for a in alternatives.splitlines() if a.strip(" -*\t")]
         rc = RootCauseResult(
             summary=summary,
             relevant_lines=relevant_lines,
             hypothesis=hypothesis,
             evidence=evidence,
             fix_plan=fix_plan,
+            alternatives=alternatives,
         )
         return Command(update={
             "root_cause": rc.model_dump(),

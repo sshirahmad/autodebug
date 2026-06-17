@@ -34,6 +34,10 @@ class RootCauseResult(BaseModel):
     hypothesis: str
     evidence: str = ""   # runtime evidence the agent observed (postmortem/inspect_at)
     fix_plan: str = ""   # the concrete change the fixer should EXECUTE (not re-derive)
+    # Ranked alternative hypotheses to fall back to if the fix for the primary
+    # one fails — so a loop-back EXPLORES a different cause instead of re-deriving
+    # the same (failed) one. See DebugState.hypothesis_attempts for what's been tried.
+    alternatives: list[str] = Field(default_factory=list)
 
 
 class FixResult(BaseModel):
@@ -65,6 +69,12 @@ class DebugState(BaseModel):
     bisect: Optional[BisectResult] = None
     root_cause: Optional[RootCauseResult] = None
     fix: Optional[FixResult] = None
+
+    # The hypothesis→fix attempt "tree": one node per fix attempt, recording the
+    # hypothesis tried, a digest of the patch, and the outcome ("pass"/"fail").
+    # Lets a loop-back avoid re-trying a hypothesis+patch that already failed and
+    # steer root_cause toward an untried alternative.
+    hypothesis_attempts: list[dict] = Field(default_factory=list)
 
     # --- Metadata ---
     messages: list[dict] = Field(default_factory=list)

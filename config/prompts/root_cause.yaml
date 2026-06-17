@@ -63,6 +63,12 @@ system: |
     mono-process path `reformat_one` for each source"). The fixer does NOT
     re-investigate — it implements your plan. Read the target lines first so your
     plan matches the real code.
+  - `alternatives`: up to ~3 OTHER plausible root causes, ranked most- to
+    least-likely, one per line. If your primary hypothesis is wrong, the fix will
+    fail and you'll be asked to reconsider — these are the next branches to try,
+    so make them genuinely distinct mechanisms, not rewordings of the primary.
+    If you were re-invoked after a failed fix, you'll be shown what was already
+    TRIED; pick an UNTRIED alternative rather than repeating a failed one.
 
   ## Tool usage
   - `read_file` / `read_file_at_parent` take **relative paths from the repo root**

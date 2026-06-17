@@ -482,7 +482,27 @@ class TestReviseRefinement:
             from autodebug.agents.root_cause import run_root_cause
             run_root_cause(st, registry=AutoDebugRegistry.from_file())
         assert "PRIOR_HYPOTHESIS" in sink["text"]
-        assert "got wrong" in sink["text"]
+        assert "FAILED verification" in sink["text"]
+
+    def test_root_cause_surfaces_attempt_tree_and_alternatives(self):
+        from autodebug.registry import AutoDebugRegistry
+        from autodebug.state import DebugState, ReproResult, RootCauseResult
+        sink: dict = {}
+        st = DebugState(repo_url="u", bug_report="b", repo_volume="v")
+        st.repro = ReproResult(repro_script="s", error_output="e", confirmed=True)
+        st.root_cause = RootCauseResult(
+            summary="S", relevant_lines=[], hypothesis="PRIMARY",
+            alternatives=["ALT_ONE", "ALT_TWO"],
+        )
+        st.hypothesis_attempts = [{"hypothesis": "PRIMARY", "patch": "foo.py", "outcome": "fail"}]
+        with patch_capturing_create_agent("autodebug.agents.root_cause", sink), \
+             patch_sandbox("autodebug.agents.root_cause", _make_fake_sandbox()):
+            from autodebug.agents.root_cause import run_root_cause
+            run_root_cause(st, registry=AutoDebugRegistry.from_file())
+        # The already-tried hypothesis (with outcome) and the untried alternatives
+        # are both surfaced so the next analysis explores instead of repeating.
+        assert "Already TRIED" in sink["text"] and "[fail] PRIMARY" in sink["text"]
+        assert "ALT_ONE" in sink["text"] and "ALT_TWO" in sink["text"]
 
 
 class TestSessionBudgetMiddleware:

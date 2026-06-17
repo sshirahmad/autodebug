@@ -58,13 +58,33 @@ def run_root_cause(state: DebugState, *, registry) -> DebugState:
     # wrong instead of re-deriving (and possibly re-deriving the same mistake).
     refine_note = ""
     if state.root_cause is not None:
+        tried = state.hypothesis_attempts or []
+        tried_block = ""
+        if tried:
+            lines = "\n".join(
+                f"  - [{a.get('outcome', '?')}] {a.get('hypothesis', '')[:160]}"
+                for a in tried
+            )
+            tried_block = (
+                "\nAlready TRIED (hypothesis → fix outcome) — do NOT repeat these:\n"
+                f"{lines}\n"
+            )
+        alts = list(state.root_cause.alternatives or [])
+        alt_block = ""
+        if alts:
+            alt_block = (
+                "\nUntried ALTERNATIVE hypotheses you previously ranked:\n"
+                + "\n".join(f"  {i + 1}. {a}" for i, a in enumerate(alts)) + "\n"
+            )
         refine_note = (
-            "\nNOTE: a previous root-cause hypothesis was produced but the fix based "
-            "on it FAILED verification, so it was wrong or incomplete. Previous "
-            f"hypothesis:\n{state.root_cause.hypothesis}\n{state.root_cause.summary[:800]}\n"
-            "Identify what that analysis got wrong and produce a corrected hypothesis "
-            "(in particular, distinguish the real defect from any environment/import "
-            "artifact in the sandbox).\n"
+            "\nNOTE: a previous root-cause hypothesis led to a fix that FAILED "
+            "verification, so it was wrong or incomplete. Previous hypothesis:\n"
+            f"{state.root_cause.hypothesis}\n{state.root_cause.summary[:600]}\n"
+            f"{tried_block}{alt_block}"
+            "Pursue the most promising UNTRIED alternative above, or derive a NEW "
+            "mechanism — distinguish the real defect from any environment/import "
+            "artifact in the sandbox. Do not re-derive a hypothesis already tried. "
+            "Provide fresh `alternatives` for the next round.\n"
         )
 
     crashed = False

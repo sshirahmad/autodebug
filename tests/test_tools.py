@@ -13,6 +13,7 @@ from autodebug.sandbox import RunResult
 from autodebug.tools.shared import make_read_file_tool, make_list_files_tool, make_shell_tool
 from autodebug.tools.repro import make_run_script_tool, make_submit_repro_tool
 from autodebug.tools.fix import make_apply_patch_tool, make_submit_fix_tool
+from autodebug.tools.root_cause import make_submit_root_cause_tool
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +286,27 @@ def test_submit_fix_regression_gate_passes_when_clean():
     res = _call(tool, summary="x")
     assert _update(res).get("fix")
     assert "regression check passed" in _content(res).lower()
+
+
+def test_submit_root_cause_parses_newline_alternatives():
+    """alternatives can be a newline string (bullets stripped) -> ranked list."""
+    tool = make_submit_root_cause_tool()
+    res = _call(
+        tool, summary="s", relevant_lines="foo.py:1", hypothesis="primary",
+        evidence="observed", fix_plan="do X",
+        alternatives="- first alt\n- second alt",
+    )
+    rc = _update(res).get("root_cause")
+    assert rc["alternatives"] == ["first alt", "second alt"]
+
+
+def test_submit_root_cause_alternatives_default_empty():
+    tool = make_submit_root_cause_tool()
+    res = _call(
+        tool, summary="s", relevant_lines=["foo.py:1"], hypothesis="h",
+        evidence="e", fix_plan="p",
+    )
+    assert _update(res).get("root_cause")["alternatives"] == []
 
 
 def test_shell_runs_command_and_returns_exit_code_and_output():
