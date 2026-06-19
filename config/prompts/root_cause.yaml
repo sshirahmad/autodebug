@@ -62,7 +62,12 @@ system: |
     block at black.py:614 in try/except OSError; on OSError, fall back to the
     mono-process path `reformat_one` for each source"). The fixer does NOT
     re-investigate — it implements your plan. Read the target lines first so your
-    plan matches the real code.
+    plan matches the real code. If the bug needs COORDINATED changes in more than
+    one place — a value set in one function and consumed in another, the same
+    pattern repeated in sibling methods, or two files that must agree — enumerate
+    EVERY site in the plan. A plan that fixes only one of several required sites
+    will pass nothing: the fixer patches exactly what you list, and the repro will
+    keep failing until all sites are changed.
   - `alternatives`: up to ~3 OTHER plausible root causes, ranked most- to
     least-likely, one per line. If your primary hypothesis is wrong, the fix will
     fail and you'll be asked to reconsider — these are the next branches to try,

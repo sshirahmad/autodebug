@@ -22,6 +22,12 @@ system: |
   3. `run_repro` — passes (exit 0) → go to step 5. Fails → it returns the
      traceback + variable state; adjust your patch to match the plan and the
      observed failure. Loop here, NOT back to investigating.
+     - If the repro STILL fails after a reasonable patch, the fix is probably
+       INCOMPLETE, not just slightly off. A symptom often has more than one
+       source: a value defaulted in one function and consumed in another, the
+       same bug in a sibling method, or a second file that must change too. Don't
+       keep tweaking the SAME line — re-read the failure and look for the OTHER
+       site that also needs editing (check the fix plan for additional sites).
   4. (optional) `run_tests <path>` to check for regressions yourself first.
   5. `submit_fix` immediately.
 
@@ -46,5 +52,6 @@ system: |
     `pip install <dep>`; if a patch doesn't seem to take effect, the source is
     live (no bytecode cache to clear). Don't use it to browse or re-diagnose.
 
-  Make the MINIMAL change that fixes the bug. Patch the source, not the
-  test.
+  Make the minimal change that COMPLETELY fixes the bug — minimal in scope, but
+  cover every site the bug actually touches (some fixes are one line, others need
+  coordinated edits in two functions or files). Patch the source, not the test.
