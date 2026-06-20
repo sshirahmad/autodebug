@@ -9,7 +9,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from eval.run_eval import (  # noqa: E402
     bisect_signals, compute_metrics, validate_fix, _source_files, _HARNESS_ERROR_RE,
+    load_partial,
 )
+
+
+class TestLoadPartial:
+    """Resume support: read an incremental JSONL of per-instance results."""
+
+    def test_missing_file_is_empty(self, tmp_path):
+        results, done = load_partial(tmp_path / "nope.jsonl")
+        assert results == [] and done == set()
+
+    def test_loads_ids_and_skips_bad_lines(self, tmp_path):
+        p = tmp_path / "run.jsonl"
+        p.write_text(
+            '{"instance_id": "ansible-1", "fix_success": true}\n'
+            "\n"                                   # blank line tolerated
+            "{ this is not json }\n"               # half-written line tolerated
+            '{"instance_id": "ansible-2", "fix_success": false}\n',
+            encoding="utf-8",
+        )
+        results, done = load_partial(p)
+        assert done == {"ansible-1", "ansible-2"}
+        assert len(results) == 2
 
 
 class TestValidateFixGuards:

@@ -307,27 +307,69 @@ def select_instances(dataset: list[dict], limit: int = 0, ids: str = "") -> list
     return dataset[:limit] if limit else dataset
 
 
-def main(dataset_path: str, limit: int = 0, ids: str = "") -> None:
+def _status_for(result: dict) -> str:
+    if result.get("fix_category") == "harness_invalid":
+        return STATUS_SKIP
+    if result.get("fix_success"):
+        return STATUS_OK
+    if result.get("repro_success"):
+        return STATUS_MID
+    return STATUS_ERR
+
+
+def load_partial(jsonl_path: Path) -> tuple[list[dict], set[str]]:
+    """Read an incremental JSONL of per-instance results (one dict per line).
+
+    Returns (results, done_ids). Bad/blank lines are skipped so a half-written
+    final line from a hard kill can't break the resume.
+    """
+    results: list[dict] = []
+    done: set[str] = set()
+    if jsonl_path.exists():
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            results.append(r)
+            done.add(str(r.get("instance_id")))
+    return results, done
+
+
+def main(dataset_path: str, limit: int = 0, ids: str = "", resume: str = "") -> None:
     dataset = json.loads(Path(dataset_path).read_text(encoding="utf-8"))
     instances = select_instances(dataset, limit, ids)
     if not instances:
         print("No instances selected — nothing to run.")
         return
 
-    results = []
-    for i, instance in enumerate(instances, 1):
-        print(f"[{i}/{len(instances)}] {instance['id']} ...", end=" ", flush=True)
-        result = run_on_instance(instance)
-        results.append(result)
-        if result.get("fix_category") == "harness_invalid":
-            status = STATUS_SKIP
-        elif result["fix_success"]:
-            status = STATUS_OK
-        elif result["repro_success"]:
-            status = STATUS_MID
-        else:
-            status = STATUS_ERR
-        print(status)
+    RESULTS_DIR.mkdir(exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Results are appended to this JSONL as each instance finishes, so a cancel
+    # never loses completed work. `--resume <file>` continues an existing one:
+    # already-finished instances are loaded and skipped.
+    jsonl_path = Path(resume) if resume else RESULTS_DIR / f"run_{stamp}.jsonl"
+    results, done = load_partial(jsonl_path)
+    if done:
+        print(f"Resuming from {jsonl_path.name}: {len(done)} instance(s) already "
+              f"complete — skipping them.")
+
+    todo = [inst for inst in instances if str(inst["id"]) not in done]
+    if not todo:
+        print("All selected instances are already complete in the resume file.")
+    with jsonl_path.open("a", encoding="utf-8") as fh:
+        for i, instance in enumerate(todo, 1):
+            print(f"[{i}/{len(todo)}] {instance['id']} ...", end=" ", flush=True)
+            result = run_on_instance(instance)
+            results.append(result)
+            # Persist immediately (flush + fsync) so a kill mid-run keeps this row.
+            fh.write(json.dumps(result) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+            print(_status_for(result))
 
     metrics = compute_metrics(results)
     print("\n--- Metrics ---")
@@ -337,13 +379,13 @@ def main(dataset_path: str, limit: int = 0, ids: str = "") -> None:
         else:
             print(f"  {k}: {v}")
 
-    out_path = RESULTS_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    RESULTS_DIR.mkdir(exist_ok=True)
+    out_path = RESULTS_DIR / f"run_{stamp}.json"
     out_path.write_text(
         json.dumps({"metrics": metrics, "results": results}, indent=2),
         encoding="utf-8",
     )
     print(f"\nResults saved to {out_path}")
+    print(f"Incremental log (resume with --resume): {jsonl_path}")
 
 
 if __name__ == "__main__":
@@ -362,5 +404,10 @@ if __name__ == "__main__":
         "--ids", default="",
         help="Comma-separated instance ids to run (overrides limit), e.g. --ids pandas:23,black:4.",
     )
+    parser.add_argument(
+        "--resume", default="",
+        help="Path to a prior run's incremental JSONL (eval/results/run_*.jsonl). "
+             "Already-completed instances in it are skipped; new results are appended.",
+    )
     args = parser.parse_args()
-    main(args.dataset, args.limit, args.ids)
+    main(args.dataset, args.limit, args.ids, args.resume)
