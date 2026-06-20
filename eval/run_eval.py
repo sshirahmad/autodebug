@@ -339,6 +339,23 @@ def load_partial(jsonl_path: Path) -> tuple[list[dict], set[str]]:
     return results, done
 
 
+def report_only(jsonl_path: str) -> None:
+    """Compute and print metrics from an existing incremental JSONL — no runs.
+
+    Each line is a full per-instance result dict (exactly what compute_metrics
+    consumes), so metrics over a partial/cancelled run are just an aggregation of
+    what already completed. Nothing is re-executed.
+    """
+    results, _ = load_partial(Path(jsonl_path))
+    if not results:
+        print(f"No results found in {jsonl_path}")
+        return
+    metrics = compute_metrics(results)
+    print(f"--- Metrics over {len(results)} completed instance(s) in {jsonl_path} ---")
+    for k, v in metrics.items():
+        print(f"  {k}: {v:.1%}" if isinstance(v, float) and v <= 1 else f"  {k}: {v}")
+
+
 def main(dataset_path: str, limit: int = 0, ids: str = "", resume: str = "") -> None:
     dataset = json.loads(Path(dataset_path).read_text(encoding="utf-8"))
     instances = select_instances(dataset, limit, ids)
@@ -409,5 +426,13 @@ if __name__ == "__main__":
         help="Path to a prior run's incremental JSONL (eval/results/run_*.jsonl). "
              "Already-completed instances in it are skipped; new results are appended.",
     )
+    parser.add_argument(
+        "--report", default="",
+        help="Compute and print metrics from an existing incremental JSONL and exit "
+             "(no runs). Use after a cancelled run to score what completed.",
+    )
     args = parser.parse_args()
-    main(args.dataset, args.limit, args.ids, args.resume)
+    if args.report:
+        report_only(args.report)
+    else:
+        main(args.dataset, args.limit, args.ids, args.resume)
