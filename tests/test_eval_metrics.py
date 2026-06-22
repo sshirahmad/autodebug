@@ -9,8 +9,35 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from eval.run_eval import (  # noqa: E402
     bisect_signals, compute_metrics, validate_fix, _source_files, _HARNESS_ERROR_RE,
-    load_partial,
+    load_partial, _normalize_test_command,
 )
+
+
+class TestNormalizeTestCommand:
+    def test_tox_is_rewritten_to_pytest(self):
+        out = _normalize_test_command("tox tests/test_x.py::test_y")
+        assert out == "python -m pytest tests/test_x.py::test_y"
+
+    def test_pytest_command_is_unchanged(self):
+        cmd = "pytest tests/test_x.py::test_y"
+        assert _normalize_test_command(cmd) == cmd
+
+    def test_none_is_empty(self):
+        assert _normalize_test_command(None) == ""
+
+
+class TestSanitizeRequirements:
+    def test_drops_editable_and_pkg_resources(self):
+        from autodebug.sandbox.runner import _sanitize_requirements
+        reqs = (
+            "click==7.1.2\n"
+            "-e git+https://github.com/x/y@abc#egg=y\n"
+            "pkg-resources==0.0.0\n"
+            "\n# a comment\n"
+            "pluggy==0.13.1\n"
+        )
+        out = _sanitize_requirements(reqs).splitlines()
+        assert out == ["click==7.1.2", "pluggy==0.13.1"]
 
 
 class TestLoadPartial:

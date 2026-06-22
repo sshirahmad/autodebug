@@ -57,6 +57,11 @@ class DebugState(BaseModel):
     known_good_commit: Optional[str] = None  # optional real hint: a version where it worked
     github_issue_url: Optional[str] = None
     ref: Optional[str] = None                # commit/branch to check out (defaults to HEAD)
+    # Production-real environment (NOT test metadata): the deployment's pinned
+    # dependencies and setup step, used at clone time so the agent runs against the
+    # versions the code actually expects.
+    requirements: Optional[str] = None
+    setup_command: Optional[str] = None
 
     # --- Runtime ---
     stage: PipelineStage = PipelineStage.INIT

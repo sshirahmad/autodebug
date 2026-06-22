@@ -99,6 +99,19 @@ def _diag(category: str, *, passed: bool, applied: bool, harness_valid,
     }
 
 
+def _normalize_test_command(cmd: str | None) -> str:
+    """Make a dataset test_command runnable in our sandbox.
+
+    `tox <pytest-node-id>` can't take a pytest path as a positional arg (tox
+    rejects it). We install the bug's pinned deps directly, so run the test via
+    pytest in that env instead of spinning a fresh tox virtualenv.
+    """
+    cmd = (cmd or "").strip()
+    if cmd.startswith("tox "):
+        return "python -m pytest " + cmd[len("tox "):].strip()
+    return cmd
+
+
 def _reset_apply_test(sb, test_command: str, *, reset_to: str, patch: str | None = None):
     """Reset the repo to `reset_to`, optionally apply `patch`, run `test_command`.
 
@@ -136,7 +149,7 @@ def validate_fix(instance: dict, patch: str) -> dict:
 
     Returns a `_diag` dict; `category` is the authoritative verdict.
     """
-    test_command = instance.get("test_command")
+    test_command = _normalize_test_command(instance.get("test_command"))
     if not patch or not patch.strip():
         return _diag("no_patch", passed=False, applied=False, harness_valid=None,
                      reason="no patch produced")
@@ -157,6 +170,8 @@ def validate_fix(instance: dict, patch: str) -> dict:
             instance.get("pre_fix_commit"),
             test_patch=instance.get("test_patch"),
             fixed_commit=fixed_commit,
+            requirements=instance.get("requirements"),
+            setup_command=instance.get("setup_command"),
         )
         with Sandbox(volume=volume) as sb:
             # Commit the test-synced working tree so we can return to this exact
@@ -226,6 +241,8 @@ def run_on_instance(instance: dict) -> dict:
             bug_report=instance["bug_report"],
             ref=instance.get("pre_fix_commit"),
             known_good_commit=instance.get("known_good_commit"),
+            requirements=instance.get("requirements"),
+            setup_command=instance.get("setup_command"),
         )
         fix_diag = fix_validation(state, instance)
         return {

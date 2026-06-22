@@ -250,6 +250,23 @@ def remove_repo_volume(name: str) -> None:
 _TEST_PATHSPECS = ("test/", "tests/", "*/test/", "*/tests/", "test_*", "*_test.py")
 
 
+def _sanitize_requirements(reqs: str) -> str:
+    """Keep only installable pins from a frozen requirements blob.
+
+    Drops the self-editable install (the repo is already checked out and on
+    PYTHONPATH) and `pkg-resources==0.0.0` (a Debian artifact that breaks pip).
+    """
+    out = []
+    for line in (reqs or "").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or s.startswith("-e ") or s.startswith("-e git+"):
+            continue
+        if s.lower().startswith("pkg-resources==0.0.0"):
+            continue
+        out.append(s)
+    return "\n".join(out)
+
+
 def clone_into_volume(
     volume: str,
     repo_url: str,
@@ -257,6 +274,8 @@ def clone_into_volume(
     *,
     test_patch: str | None = None,
     fixed_commit: str | None = None,
+    requirements: str | None = None,
+    setup_command: str | None = None,
 ) -> None:
     """One-shot container that clones repo_url into /workspace/repo on the volume.
 
@@ -308,6 +327,23 @@ def clone_into_volume(
             f"if [ -f \"$f\" ]; then timeout 300 pip install --target={deps} -r \"$f\" || true; fi; done ; "
             f"true )"
         )
+        # 3) Pin the env to the bug's recorded versions, layered ON TOP of the
+        #    generic install. Old checkouts need old pytest/pluggy/plugins; the
+        #    generic install pulls newer, incompatible ones, so the gold test can't
+        #    even run (scored harness_invalid). --upgrade lets the pins REPLACE the
+        #    generic versions; --no-deps installs only the frozen set (no newer
+        #    transitive pulls). Best-effort: pins that won't build on this image's
+        #    Python are skipped, leaving the generic fallback in place.
+        sanitized = _sanitize_requirements(requirements or "")
+        if sanitized:
+            enc_req = base64.b64encode(sanitized.encode("utf-8")).decode("ascii")
+            cmd += (
+                f" && ( echo {enc_req} | base64 -d > /tmp/reqs.txt ; "
+                f"timeout 900 pip install --target={deps} --upgrade --no-deps "
+                f"-r /tmp/reqs.txt || true )"
+            )
+        if setup_command and setup_command.strip():
+            cmd += f" && ( cd {shlex.quote(REPO_DIR)} && ({setup_command}) || true )"
     # Clear any compiled bytecode so the agents always execute the live source
     # (a stale .pyc would mask their patches).
     cmd += (

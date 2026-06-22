@@ -35,7 +35,10 @@ def clone_repo(state: DebugState) -> DebugState:
         # Production clone: just the repo at the given ref (default HEAD). No test
         # files are injected — the benchmark's FAIL_TO_PASS test is applied only in
         # the eval harness's separate scoring sandbox, never in the agents' repo.
-        clone_into_volume(volume, state.repo_url, state.ref)
+        clone_into_volume(
+            volume, state.repo_url, state.ref,
+            requirements=state.requirements, setup_command=state.setup_command,
+        )
     except Exception:
         remove_repo_volume(volume)
         raise
