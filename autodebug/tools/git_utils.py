@@ -84,6 +84,22 @@ def checkout(sandbox: Sandbox, ref: str) -> None:
     sandbox.git("checkout", "--force", ref)
 
 
+def reset_worktree(sandbox: Sandbox) -> None:
+    """Revert all working-tree changes to the current commit (the buggy checkout).
+
+    The repo volume is shared across stages, so a FAILED fix leaves its patches on
+    the tree. Without this, a later stage — a fix retry, or a manager loop-back to
+    repro/root_cause — would run against (and a new fix's `git diff` would capture)
+    the leftover patch. `apply_patch` only edits tracked files, so `reset --hard`
+    fully undoes it; untracked files are left alone. Best-effort, never raises.
+    """
+    try:
+        sandbox.git("reset", "--hard", "HEAD")
+    except Exception as exc:
+        logger.warning("Could not reset the working tree: %s: %s",
+                       type(exc).__name__, exc)
+
+
 def restore_checkout(sandbox: Sandbox, sha: str) -> None:
     """Return the working tree to `sha`, aborting any in-progress `git bisect`.
 

@@ -388,3 +388,17 @@ def test_restore_checkout_swallows_errors():
     sandbox = MagicMock()
     sandbox.git.side_effect = RuntimeError("git blew up")
     git_utils.restore_checkout(sandbox, "abc123")  # must not raise (used in a finally)
+
+
+def test_reset_worktree_hard_resets_to_head():
+    from autodebug.tools import git_utils
+    sandbox = MagicMock()
+    git_utils.reset_worktree(sandbox)
+    assert ("reset", "--hard", "HEAD") in [c.args for c in sandbox.git.call_args_list]
+
+
+def test_reset_worktree_swallows_errors():
+    from autodebug.tools import git_utils
+    sandbox = MagicMock()
+    sandbox.git.side_effect = RuntimeError("git blew up")
+    git_utils.reset_worktree(sandbox)  # must not raise

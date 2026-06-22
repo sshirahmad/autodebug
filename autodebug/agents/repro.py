@@ -17,6 +17,7 @@ from autodebug import resume
 from autodebug.agent_state import ReproAgentState
 from autodebug.sandbox import Sandbox
 from autodebug.state import DebugState, PipelineStage, ReproResult
+from autodebug.tools import git_utils
 
 
 def run_repro(state: DebugState, *, registry) -> DebugState:
@@ -65,6 +66,9 @@ def run_repro(state: DebugState, *, registry) -> DebugState:
     run_error: str | None = None
     saver = resume.get_saver()
     with Sandbox(volume=state.repo_volume) as sandbox:
+        # Run against the clean buggy tree: a manager loop-back may follow a failed
+        # fix that left patches on the shared volume.
+        git_utils.reset_worktree(sandbox)
         # Resume: a prior run already produced (and we re-validate) a repro.
         cached = resume.cached_repro(key, cfg.max_retries, sandbox)
         if cached is not None:

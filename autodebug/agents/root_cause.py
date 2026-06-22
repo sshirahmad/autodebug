@@ -30,6 +30,7 @@ from autodebug import resume
 from autodebug.agent_state import RootCauseAgentState
 from autodebug.sandbox import Sandbox
 from autodebug.state import DebugState, PipelineStage, RootCauseResult
+from autodebug.tools import git_utils
 
 _INSPECTION_TOOLS = {"run_repro_with_traceback", "inspect_at"}
 
@@ -102,6 +103,8 @@ def run_root_cause(state: DebugState, *, registry) -> DebugState:
     resume.clear("root_cause", key, cfg.max_retries)
 
     with Sandbox(volume=state.repo_volume) as sandbox:
+        # Analyze the clean buggy tree, not a prior failed fix's leftover patches.
+        git_utils.reset_worktree(sandbox)
         initial_run = sandbox.run_script(state.repro.repro_script)
         if state.bisect:
             culprit_block = (

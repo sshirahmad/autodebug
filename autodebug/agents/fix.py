@@ -19,6 +19,7 @@ from autodebug import resume
 from autodebug.agent_state import FixAgentState
 from autodebug.sandbox import Sandbox
 from autodebug.state import DebugState, FixResult, PipelineStage
+from autodebug.tools import git_utils
 
 
 def _record_attempt(state: DebugState, hypothesis: str, patch: str, outcome: str) -> None:
@@ -79,6 +80,11 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
     resume.clear("fix", key, cfg.max_retries)
     with Sandbox(volume=state.repo_volume) as sandbox:
         for attempt in range(cfg.max_retries + 1):
+            # Start every attempt from the clean buggy tree: the shared volume may
+            # carry a prior failed fix's patches (this run's earlier attempt, or an
+            # earlier manager fix call), and building on them would contaminate the
+            # diff submit_fix captures.
+            git_utils.reset_worktree(sandbox)
             budget = Budget.from_config(cfg)
             llm = model_for_attempt(attempt, model_id, provider)
             tools = registry.build_tools(
@@ -145,11 +151,10 @@ def run_fix(state: DebugState, *, registry) -> DebugState:
                     state.fix = FixResult(**{**submitted, "attempts": len(patches)})
                     state.stage = PipelineStage.DONE
                     return state
-                # Rejected with retries left: record it, discard the patch from the
-                # shared tree so the next attempt starts clean, carry the critique.
+                # Rejected with retries left: record it and carry the critique
+                # forward. The next attempt resets the tree at its start.
                 _record_attempt(state, rc.hypothesis if rc else "",
                                 submitted.get("patch", ""), "rejected-by-audit")
-                sandbox.git("reset", "--hard")
                 resume.clear_one("fix", key, attempt)
                 run_error = f"fix rejected by audit: {critique}"
                 system_prompt += (
