@@ -417,6 +417,10 @@ def _run_parallel(todo: list, fh, results: list, workers: int) -> None:
 
 def main(dataset_path: str, limit: int = 0, ids: str = "", resume: str = "",
          workers: int = 1) -> None:
+    # Agents mutate a single shared .skills/ path; during a (possibly parallel)
+    # eval that's a race + a reproducibility hazard, so disable skill writes
+    # unless the user explicitly opts in. Set before workers spawn so they inherit.
+    os.environ.setdefault("AUTODEBUG_SKILL_WRITES", "0")
     dataset = json.loads(Path(dataset_path).read_text(encoding="utf-8"))
     instances = select_instances(dataset, limit, ids)
     if not instances:

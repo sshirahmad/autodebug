@@ -2,11 +2,29 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 
 from langchain_core.tools import tool
 
 _SKILLS_ROOT = Path(__file__).resolve().parents[2] / ".skills"
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write `text` to `path` atomically (temp file in the same dir + os.replace),
+    so a concurrent reader never sees a half-written file."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-skill-", suffix=".md")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)  # atomic on the same filesystem
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def make_load_skill_tool(**_):
@@ -50,6 +68,13 @@ def make_update_skill_tool(agent_name: str = "", **_):
             mode: 'append' (default) adds content after existing text;
                   'replace' overwrites the entire file.
         """
+        # Skill writes mutate a single shared host path. During an eval (esp.
+        # parallel --workers) that's both a race and a reproducibility hazard —
+        # one bug's edit changes another bug's prompt mid-run — so run_eval turns
+        # writes off by default. Reads (load_skill) still work.
+        if os.getenv("AUTODEBUG_SKILL_WRITES", "1") == "0":
+            return ("Skill writes are disabled for this run "
+                    "(AUTODEBUG_SKILL_WRITES=0); nothing was persisted.")
         if not name or "/" in name or "\\" in name or name.startswith("."):
             return "Error: invalid skill name — must be a plain directory name with no slashes."
 
@@ -57,13 +82,23 @@ def make_update_skill_tool(agent_name: str = "", **_):
         skill_dir.mkdir(parents=True, exist_ok=True)
         skill_file = skill_dir / "SKILL.md"
 
-        if mode == "replace" or not skill_file.exists():
-            skill_file.write_text(content.strip() + "\n", encoding="utf-8")
-            action = "created" if not skill_file.exists() else "replaced"
-        else:
-            existing = skill_file.read_text(encoding="utf-8")
-            skill_file.write_text(existing.rstrip() + "\n\n" + content.strip() + "\n", encoding="utf-8")
-            action = "updated"
+        # Cross-process lock so concurrent workers can't lose each other's appends
+        # (the append below is a read-modify-write) or read a torn file.
+        from filelock import FileLock, Timeout
+        try:
+            with FileLock(str(skill_dir / ".lock"), timeout=30):
+                existed = skill_file.exists()
+                if mode == "replace" or not existed:
+                    new_text = content.strip() + "\n"
+                    action = "replaced" if existed else "created"
+                else:
+                    existing = skill_file.read_text(encoding="utf-8")
+                    new_text = existing.rstrip() + "\n\n" + content.strip() + "\n"
+                    action = "updated"
+                _atomic_write(skill_file, new_text)
+        except Timeout:
+            return (f"Skill '{name}' not written: another run holds the lock — "
+                    "try again, the change was not persisted.")
 
         source = f" (written by {agent_name})" if agent_name else ""
         return f"Skill '{name}' {action}{source}. Path: {skill_file}"

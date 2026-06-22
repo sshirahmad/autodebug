@@ -32,3 +32,6 @@ data/
 
 # Agent checkpoints / resume store (per-machine, regenerated)
 .autodebug/
+
+# skill update lock files
+.skills/**/.lock
