@@ -87,6 +87,14 @@ def memory_store() -> SqliteStore:
     if _store is None:
         _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False, isolation_level=None)
+        # memory.db is a single store shared across runs (cross-bug learning is the
+        # point). Make it safe for concurrent worker processes the same way as the
+        # checkpointer: WAL lets a reader and a writer proceed at once, and the busy
+        # timeout makes a contending writer WAIT instead of failing "database is
+        # locked". (Failures here are swallowed, so without this, memory writes are
+        # just silently dropped under --workers contention.)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"PRAGMA busy_timeout={int(os.getenv('AUTODEBUG_SQLITE_BUSY_MS', '30000'))}")
         store = SqliteStore(
             conn,
             index=IndexConfig(
