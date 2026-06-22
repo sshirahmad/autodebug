@@ -215,7 +215,23 @@ def make_search_memory_tool(agent_name: str = "unknown", **_):
     limits, etc.) that models often hallucinate field names for — we've seen
     `{'key': '<uuid>'}` instead of `{'query': '<text>'}`. Wrap it with a clean
     single-arg `query: str` signature so the LLM can only get it right.
+
+    RECALL is opt-in: memories are always WRITTEN (the corpus grows), but agents
+    only SEARCH them when AUTODEBUG_MEMORY_ENABLED=1. Off by default gives a clean,
+    reproducible baseline (no recall influence) and skips loading the embedding
+    model / touching the store entirely.
     """
+    if os.getenv("AUTODEBUG_MEMORY_ENABLED", "0") != "1":
+        @tool(parse_docstring=True)
+        def search_memory(query: str) -> str:
+            """Search past debugging sessions for relevant patterns.
+
+            Args:
+                query: Natural-language description of what you're looking for.
+            """
+            return "Memory recall is disabled for this run (AUTODEBUG_MEMORY_ENABLED=0)."
+        return search_memory
+
     namespace = ("autodebug",)
     instructions = _SEARCH_INSTRUCTIONS_BY_AGENT.get(
         agent_name,

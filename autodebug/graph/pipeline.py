@@ -109,8 +109,11 @@ def run_pipeline(repo_url: str, bug_report: str, *, run_label: str | None = None
                     break
                 with _tracer.start_as_current_span(f"autodebug.{name}"):
                     state = runner(state, registry=registry)
-                if os.getenv("AUTODEBUG_MEMORY_ENABLED", "0") == "1":
-                    store_agent_run(name, state)
+                # Always accumulate memories (best-effort, never raises). Whether
+                # agents RECALL them is gated separately by AUTODEBUG_MEMORY_ENABLED
+                # (see make_search_memory_tool), so the corpus grows even when recall
+                # is off for a clean/reproducible baseline.
+                store_agent_run(name, state)
 
             span.set_attribute("final_stage", str(state.stage))
             return state

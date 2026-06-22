@@ -112,7 +112,7 @@ common ones — see [.env.example](.env.example) for the full list:
 | `AUTODEBUG_FIX_MODEL` | Optional stronger model just for fix generation | — |
 | `AUTODEBUG_MANAGER` | `1` = Manager FSM, `0` = linear pipeline | `1` |
 | `AUTODEBUG_PROMPT_OPTIM` | Rewrite a failing agent's prompt from its trajectory on retry | `1` |
-| `AUTODEBUG_MEMORY_ENABLED` | Cross-run learning via LangMem | `0` |
+| `AUTODEBUG_MEMORY_ENABLED` | Memory **recall** via LangMem (memories are always written; this gates reads) | `0` |
 | `SANDBOX_IMAGE` / `SANDBOX_TIMEOUT_SECONDS` / `SANDBOX_MEM_LIMIT` | Docker sandbox knobs | `autodebug-sandbox:latest` / `300` / `512m` |
 | `GITHUB_TOKEN` | For reading issues / opening PRs | — |
 
