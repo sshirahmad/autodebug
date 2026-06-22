@@ -40,6 +40,20 @@ _DEPS_DIR = "/workspace/deps"
 _SRC_ROOTS = (REPO_DIR, f"{REPO_DIR}/src", f"{REPO_DIR}/lib", _DEPS_DIR)
 _PYTHONPATH = ":".join(_SRC_ROOTS)
 
+# Optional per-bug conda env (AUTODEBUG_CONDA=1): a base image with micromamba
+# builds a Python env at the bug's exact version ON THE VOLUME at clone time, so
+# pip finds matching wheels (old numpy/scipy/etc. install instead of failing to
+# build) and every stage runs the right interpreter. The env is self-contained,
+# so only the clone container needs micromamba; the runtime just prepends the
+# env's bin to PATH. Packages are cached in a shared named volume across bugs.
+_CONDA_ENV = "/workspace/env"
+_CONDA_PKGS_VOLUME = "autodebug-conda-pkgs"
+_CONDA_ROOT = "/opt/mamba"
+
+
+def _conda_on() -> bool:
+    return os.getenv("AUTODEBUG_CONDA", "0") == "1"
+
 
 @dataclass
 class RunResult:
@@ -131,6 +145,11 @@ class Sandbox:
         """Execute a shell command in the container. workdir defaults to REPO_DIR."""
         if self.container is None:
             raise RuntimeError("Sandbox not started; call start() or use a `with` block")
+        # In conda mode, prepend the per-bug env's bin so `python`/`pip`/`pytest`
+        # resolve to the bug's interpreter. Harmless if the env dir is absent, but
+        # gated so legacy (image-Python) runs are byte-identical.
+        if _conda_on():
+            command = f'export PATH="{_CONDA_ENV}/bin:$PATH"; {command}'
         # Wrap in `timeout` so no single command can hang the pipeline. SIGTERM at
         # the limit, SIGKILL 10s later; a timed-out command exits 124.
         result = self.container.exec_run(
@@ -276,6 +295,7 @@ def clone_into_volume(
     fixed_commit: str | None = None,
     requirements: str | None = None,
     setup_command: str | None = None,
+    python_version: str | None = None,
 ) -> None:
     """One-shot container that clones repo_url into /workspace/repo on the volume.
 
@@ -294,10 +314,25 @@ def clone_into_volume(
     import base64
 
     client = docker.from_env()
-    image = os.getenv("SANDBOX_IMAGE", "autodebug-sandbox:latest")
+    use_conda = _conda_on() and bool(python_version)
+    image = (
+        os.getenv("AUTODEBUG_CONDA_IMAGE", "autodebug-sandbox-conda:latest")
+        if use_conda else os.getenv("SANDBOX_IMAGE", "autodebug-sandbox:latest")
+    )
     cmd = f"git clone {shlex.quote(repo_url)} {shlex.quote(REPO_DIR)}"
     if ref:
         cmd += f" && cd {shlex.quote(REPO_DIR)} && git checkout {shlex.quote(ref)}"
+
+    # Per-bug conda env at the exact Python version, ON THE VOLUME so every later
+    # stage runs the right interpreter and pip finds matching wheels. `pip` below
+    # routes through this env when on; otherwise it's the image's pip.
+    pip = "pip"
+    if use_conda:
+        cmd += (
+            f" && micromamba create -y -p {_CONDA_ENV} -c conda-forge "
+            f"python={shlex.quote(python_version)} pip"
+        )
+        pip = f"{_CONDA_ENV}/bin/pip"
 
     # Install the CHECKED-OUT project's own dependencies into a VOLUME-backed dir
     # so they persist to the long-lived per-stage Sandbox containers (site-packages
@@ -313,18 +348,18 @@ def clone_into_volume(
             f" && cd {shlex.quote(REPO_DIR)} && ( "
             # 1) the checkout's own RUNTIME deps (the image pins a newer version; the
             #    older checkout often needs different deps — e.g. old black imports `regex`).
-            f"(timeout 600 pip install --target={deps} . "
-            f"|| timeout 300 pip install --target={deps} -r requirements.txt || true) ; "
+            f"(timeout 600 {pip} install --target={deps} . "
+            f"|| timeout 300 {pip} install --target={deps} -r requirements.txt || true) ; "
             # 2) TEST/dev deps layered on top. The official FAIL_TO_PASS test routinely
             #    imports test-only deps (pytest plugins, hypothesis, aiohttp for black's
             #    blackd tests, ...). Without them the test MODULE fails to import, which
             #    the eval would otherwise misread as a failed fix rather than a broken
             #    env. Best-effort across the common extra names and dev-requirement files.
             f"for e in d test tests dev testing; do "
-            f"timeout 300 pip install --target={deps} \".[$e]\" >/dev/null 2>&1 || true; done ; "
+            f"timeout 300 {pip} install --target={deps} \".[$e]\" >/dev/null 2>&1 || true; done ; "
             f"for f in test-requirements.txt requirements-test.txt requirements-dev.txt "
             f"dev-requirements.txt requirements/test.txt requirements/dev.txt; do "
-            f"if [ -f \"$f\" ]; then timeout 300 pip install --target={deps} -r \"$f\" || true; fi; done ; "
+            f"if [ -f \"$f\" ]; then timeout 300 {pip} install --target={deps} -r \"$f\" || true; fi; done ; "
             f"true )"
         )
         # 3) Pin the env to the bug's recorded versions, layered ON TOP of the
@@ -339,7 +374,7 @@ def clone_into_volume(
             enc_req = base64.b64encode(sanitized.encode("utf-8")).decode("ascii")
             cmd += (
                 f" && ( echo {enc_req} | base64 -d > /tmp/reqs.txt ; "
-                f"timeout 900 pip install --target={deps} --upgrade --no-deps "
+                f"timeout 900 {pip} install --target={deps} --upgrade --no-deps "
                 f"-r /tmp/reqs.txt || true )"
             )
         if setup_command and setup_command.strip():
@@ -365,9 +400,18 @@ def clone_into_volume(
             f"| git apply --whitespace=nowarn - || true"
         )
 
+    volumes = {volume: {"bind": "/workspace", "mode": "rw"}}
+    environment = None
+    if use_conda:
+        # Share the conda package cache across bugs (a named volume) so each Python
+        # version + wheel is downloaded once; the env itself lives on the per-bug
+        # repo volume.
+        volumes[_CONDA_PKGS_VOLUME] = {"bind": _CONDA_ROOT, "mode": "rw"}
+        environment = {"MAMBA_ROOT_PREFIX": _CONDA_ROOT}
     client.containers.run(
         image=image,
         command=["bash", "-c", cmd],
-        volumes={volume: {"bind": "/workspace", "mode": "rw"}},
+        volumes=volumes,
+        environment=environment,
         remove=True,
     )

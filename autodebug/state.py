@@ -58,10 +58,11 @@ class DebugState(BaseModel):
     github_issue_url: Optional[str] = None
     ref: Optional[str] = None                # commit/branch to check out (defaults to HEAD)
     # Production-real environment (NOT test metadata): the deployment's pinned
-    # dependencies and setup step, used at clone time so the agent runs against the
-    # versions the code actually expects.
+    # dependencies, setup step, and interpreter version, used at clone time so the
+    # agent runs against the versions the code actually expects.
     requirements: Optional[str] = None
     setup_command: Optional[str] = None
+    python_version: Optional[str] = None  # e.g. "3.7.3"; selects the per-bug conda env
 
     # --- Runtime ---
     stage: PipelineStage = PipelineStage.INIT

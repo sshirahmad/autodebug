@@ -38,6 +38,7 @@ def clone_repo(state: DebugState) -> DebugState:
         clone_into_volume(
             volume, state.repo_url, state.ref,
             requirements=state.requirements, setup_command=state.setup_command,
+            python_version=state.python_version,
         )
     except Exception:
         remove_repo_volume(volume)

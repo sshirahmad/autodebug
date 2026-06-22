@@ -172,6 +172,7 @@ def validate_fix(instance: dict, patch: str) -> dict:
             fixed_commit=fixed_commit,
             requirements=instance.get("requirements"),
             setup_command=instance.get("setup_command"),
+            python_version=instance.get("python_version"),
         )
         with Sandbox(volume=volume) as sb:
             # Commit the test-synced working tree so we can return to this exact
@@ -243,6 +244,7 @@ def run_on_instance(instance: dict) -> dict:
             known_good_commit=instance.get("known_good_commit"),
             requirements=instance.get("requirements"),
             setup_command=instance.get("setup_command"),
+            python_version=instance.get("python_version"),
         )
         fix_diag = fix_validation(state, instance)
         return {
