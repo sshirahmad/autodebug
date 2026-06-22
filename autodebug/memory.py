@@ -201,14 +201,22 @@ _SEARCH_INSTRUCTIONS_BY_AGENT = {
 
 
 def make_search_memory_tool(agent_name: str = "unknown", **_):
-    """Factory: returns a LangChain tool that searches this agent's past memories only.
+    """Factory: returns a LangChain tool that searches past debugging memories.
+
+    Searches the whole ("autodebug",) namespace PREFIX, not just this agent's
+    sub-namespace. In manager mode every memory is written under
+    ("autodebug", "manager") (one store_agent_run per session), so a per-agent
+    search of ("autodebug", <stage>) found almost nothing — the memories were
+    effectively write-only. The prefix reaches them all (the per-agent
+    `instructions` still steer the query); store.search treats the first arg as a
+    namespace prefix.
 
     The underlying LangMem tool exposes a rich schema (query, namespace filters,
     limits, etc.) that models often hallucinate field names for — we've seen
     `{'key': '<uuid>'}` instead of `{'query': '<text>'}`. Wrap it with a clean
     single-arg `query: str` signature so the LLM can only get it right.
     """
-    namespace = ("autodebug", agent_name)
+    namespace = ("autodebug",)
     instructions = _SEARCH_INSTRUCTIONS_BY_AGENT.get(
         agent_name,
         "Search past debugging sessions for relevant patterns and strategies.",
