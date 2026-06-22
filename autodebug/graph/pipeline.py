@@ -82,15 +82,23 @@ def _failed(state: DebugState) -> bool:
     return str(state.stage) in (PipelineStage.FAILED.value, str(PipelineStage.FAILED))
 
 
-def run_pipeline(repo_url: str, bug_report: str, **kwargs) -> DebugState:
-    """Run the full clone → repro → bisect → root_cause → fix sequence."""
+def run_pipeline(repo_url: str, bug_report: str, *, run_label: str | None = None,
+                 **kwargs) -> DebugState:
+    """Run the full clone → repro → bisect → root_cause → fix sequence.
+
+    `run_label` names the root trace span (e.g. the bug id, "ansible-1") so runs
+    are identifiable in Phoenix; it's observability-only and never reaches the
+    agents. Defaults to "autodebug.pipeline".
+    """
     setup_tracing()
     from autodebug.registry import AutoDebugRegistry
     registry = AutoDebugRegistry.from_file()
 
-    with _tracer.start_as_current_span("autodebug.pipeline") as span:
+    with _tracer.start_as_current_span(run_label or "autodebug.pipeline") as span:
         span.set_attribute("repo_url", repo_url)
         span.set_attribute("bug_report", bug_report[:500])
+        if run_label:
+            span.set_attribute("instance_id", run_label)
 
         state = DebugState(repo_url=repo_url, bug_report=bug_report, **kwargs)
         try:

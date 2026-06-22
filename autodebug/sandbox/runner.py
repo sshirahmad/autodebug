@@ -40,19 +40,21 @@ _DEPS_DIR = "/workspace/deps"
 _SRC_ROOTS = (REPO_DIR, f"{REPO_DIR}/src", f"{REPO_DIR}/lib", _DEPS_DIR)
 _PYTHONPATH = ":".join(_SRC_ROOTS)
 
-# Optional per-bug conda env (AUTODEBUG_CONDA=1): a base image with micromamba
-# builds a Python env at the bug's exact version ON THE VOLUME at clone time, so
-# pip finds matching wheels (old numpy/scipy/etc. install instead of failing to
-# build) and every stage runs the right interpreter. The env is self-contained,
-# so only the clone container needs micromamba; the runtime just prepends the
-# env's bin to PATH. Packages are cached in a shared named volume across bugs.
+# Per-bug conda env: at clone time, micromamba builds a Python env at the bug's
+# EXACT version ON THE VOLUME, so pip finds matching wheels (old numpy/scipy/etc.
+# install instead of failing to build from source) and every stage runs the right
+# interpreter. The env is self-contained, so the runtime just prepends its bin to
+# PATH. Packages are cached in a shared named volume across bugs (each version +
+# wheel downloaded once). The sandbox image is micromamba-based (docker/sandbox).
 _CONDA_ENV = "/workspace/env"
 _CONDA_PKGS_VOLUME = "autodebug-conda-pkgs"
 _CONDA_ROOT = "/opt/mamba"
 
 
-def _conda_on() -> bool:
-    return os.getenv("AUTODEBUG_CONDA", "0") == "1"
+def _default_python() -> str:
+    """Interpreter for bugs that don't record a version (e.g. ad-hoc production
+    runs). BugsInPy instances always carry their python_version."""
+    return os.getenv("AUTODEBUG_DEFAULT_PYTHON", "3.11")
 
 
 @dataclass
@@ -145,11 +147,9 @@ class Sandbox:
         """Execute a shell command in the container. workdir defaults to REPO_DIR."""
         if self.container is None:
             raise RuntimeError("Sandbox not started; call start() or use a `with` block")
-        # In conda mode, prepend the per-bug env's bin so `python`/`pip`/`pytest`
-        # resolve to the bug's interpreter. Harmless if the env dir is absent, but
-        # gated so legacy (image-Python) runs are byte-identical.
-        if _conda_on():
-            command = f'export PATH="{_CONDA_ENV}/bin:$PATH"; {command}'
+        # Prepend the per-bug env's bin so `python`/`pip`/`pytest` resolve to the
+        # bug's interpreter (the env is built at clone time on the volume).
+        command = f'export PATH="{_CONDA_ENV}/bin:$PATH"; {command}'
         # Wrap in `timeout` so no single command can hang the pipeline. SIGTERM at
         # the limit, SIGKILL 10s later; a timed-out command exits 124.
         result = self.container.exec_run(
@@ -314,25 +314,19 @@ def clone_into_volume(
     import base64
 
     client = docker.from_env()
-    use_conda = _conda_on() and bool(python_version)
-    image = (
-        os.getenv("AUTODEBUG_CONDA_IMAGE", "autodebug-sandbox-conda:latest")
-        if use_conda else os.getenv("SANDBOX_IMAGE", "autodebug-sandbox:latest")
-    )
+    image = os.getenv("SANDBOX_IMAGE", "autodebug-sandbox:latest")
     cmd = f"git clone {shlex.quote(repo_url)} {shlex.quote(REPO_DIR)}"
     if ref:
         cmd += f" && cd {shlex.quote(REPO_DIR)} && git checkout {shlex.quote(ref)}"
 
     # Per-bug conda env at the exact Python version, ON THE VOLUME so every later
-    # stage runs the right interpreter and pip finds matching wheels. `pip` below
-    # routes through this env when on; otherwise it's the image's pip.
-    pip = "pip"
-    if use_conda:
-        cmd += (
-            f" && micromamba create -y -p {_CONDA_ENV} -c conda-forge "
-            f"python={shlex.quote(python_version)} pip"
-        )
-        pip = f"{_CONDA_ENV}/bin/pip"
+    # stage runs the right interpreter and pip finds matching wheels. All pip
+    # installs below route through this env.
+    cmd += (
+        f" && micromamba create -y -p {_CONDA_ENV} -c conda-forge "
+        f"python={shlex.quote(python_version or _default_python())} pip"
+    )
+    pip = f"{_CONDA_ENV}/bin/pip"
 
     # Install the CHECKED-OUT project's own dependencies into a VOLUME-backed dir
     # so they persist to the long-lived per-stage Sandbox containers (site-packages
@@ -400,18 +394,16 @@ def clone_into_volume(
             f"| git apply --whitespace=nowarn - || true"
         )
 
-    volumes = {volume: {"bind": "/workspace", "mode": "rw"}}
-    environment = None
-    if use_conda:
-        # Share the conda package cache across bugs (a named volume) so each Python
-        # version + wheel is downloaded once; the env itself lives on the per-bug
-        # repo volume.
-        volumes[_CONDA_PKGS_VOLUME] = {"bind": _CONDA_ROOT, "mode": "rw"}
-        environment = {"MAMBA_ROOT_PREFIX": _CONDA_ROOT}
     client.containers.run(
         image=image,
         command=["bash", "-c", cmd],
-        volumes=volumes,
-        environment=environment,
+        # Share the conda package cache across bugs (a named volume) so each Python
+        # version + wheel is downloaded once; the env itself lives on the per-bug
+        # repo volume.
+        volumes={
+            volume: {"bind": "/workspace", "mode": "rw"},
+            _CONDA_PKGS_VOLUME: {"bind": _CONDA_ROOT, "mode": "rw"},
+        },
+        environment={"MAMBA_ROOT_PREFIX": _CONDA_ROOT},
         remove=True,
     )

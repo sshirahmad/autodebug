@@ -1,4 +1,4 @@
-"""Tests for sandbox setup — the per-bug conda env wiring (AUTODEBUG_CONDA)."""
+"""Tests for sandbox setup — the per-bug conda env built at clone time."""
 
 from __future__ import annotations
 
@@ -22,32 +22,30 @@ def _capture_clone(monkeypatch, **kwargs) -> dict:
 
 
 class TestCondaClone:
-    def test_conda_env_created_and_pip_routed(self, monkeypatch):
-        monkeypatch.setenv("AUTODEBUG_CONDA", "1")
+    def test_env_created_at_recorded_version_and_pip_routed(self, monkeypatch):
         cap = _capture_clone(monkeypatch, requirements="pluggy==0.13.1",
                              python_version="3.7.3")
         cmd = cap["command"][2]  # ["bash", "-c", <cmd>]
         assert "micromamba create -y -p /workspace/env" in cmd
         assert "python=3.7.3" in cmd
-        # pip installs route through the env, not the image pip.
+        # every pip install routes through the env, never a bare image pip.
         assert "/workspace/env/bin/pip install" in cmd
         assert "pip install" not in cmd.replace("/workspace/env/bin/pip install", "")
         # shared package cache mounted + root prefix set.
         assert runner._CONDA_PKGS_VOLUME in cap["volumes"]
         assert cap["environment"] == {"MAMBA_ROOT_PREFIX": runner._CONDA_ROOT}
-        assert cap["image"] == "autodebug-sandbox-conda:latest"
 
-    def test_legacy_unchanged_when_flag_off(self, monkeypatch):
-        monkeypatch.delenv("AUTODEBUG_CONDA", raising=False)
-        cap = _capture_clone(monkeypatch, python_version="3.7.3")
-        cmd = cap["command"][2]
-        assert "micromamba" not in cmd
-        assert "pip install --target=" in cmd  # legacy image pip + target dir
-        assert runner._CONDA_PKGS_VOLUME not in cap.get("volumes", {})
-        assert cap.get("environment") is None
+    def test_defaults_python_when_version_absent(self, monkeypatch):
+        monkeypatch.setenv("AUTODEBUG_DEFAULT_PYTHON", "3.10")
+        cap = _capture_clone(monkeypatch)  # no python_version
+        assert "python=3.10" in cap["command"][2]
 
-    def test_no_conda_without_python_version(self, monkeypatch):
-        monkeypatch.setenv("AUTODEBUG_CONDA", "1")
-        cap = _capture_clone(monkeypatch)  # flag on but no version -> legacy path
-        assert "micromamba" not in cap["command"][2]
-        assert runner._CONDA_PKGS_VOLUME not in cap.get("volumes", {})
+    def test_exec_prepends_env_bin_to_path(self):
+        # The runtime resolves python/pip/pytest from the per-bug env.
+        sb = runner.Sandbox.__new__(runner.Sandbox)
+        sb.container = MagicMock()
+        sb.container.exec_run.return_value = MagicMock(output=(b"", b""), exit_code=0)
+        sb.exec_timeout = 30
+        sb.exec("python --version")
+        sent = sb.container.exec_run.call_args.kwargs["cmd"]
+        assert 'export PATH="/workspace/env/bin:$PATH";' in sent[-1]
