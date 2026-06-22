@@ -373,7 +373,53 @@ def report_only(jsonl_path: str) -> None:
         print(f"  {k}: {v:.1%}" if isinstance(v, float) and v <= 1 else f"  {k}: {v}")
 
 
-def main(dataset_path: str, limit: int = 0, ids: str = "", resume: str = "") -> None:
+def _worker_init() -> None:
+    """Isolate each pool worker's agent checkpointer so concurrent processes don't
+    contend on one sqlite file (each gets its own .autodebug/w<pid> dir)."""
+    os.environ["AUTODEBUG_CHECKPOINT_DIR"] = f".autodebug/w{os.getpid()}"
+
+
+def _persist(fh, results: list, result: dict) -> None:
+    results.append(result)
+    # flush + fsync so a kill keeps every finished row.
+    fh.write(json.dumps(result) + "\n")
+    fh.flush()
+    os.fsync(fh.fileno())
+
+
+def _run_sequential(todo: list, fh, results: list) -> None:
+    for i, instance in enumerate(todo, 1):
+        print(f"[{i}/{len(todo)}] {instance['id']} ...", end=" ", flush=True)
+        result = run_on_instance(instance)
+        _persist(fh, results, result)
+        print(_status_for(result))
+
+
+def _run_parallel(todo: list, fh, results: list, workers: int) -> None:
+    """Run instances concurrently. Each bug is independent and the pipeline is
+    blocking (Docker), so separate processes give true parallelism. The PARENT is
+    the only JSONL writer (results funnel back via futures), so no file locking is
+    needed; results land out of order, which is fine for a line-per-bug log."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    print(f"Running {len(todo)} instance(s) on {workers} workers...")
+    with ProcessPoolExecutor(max_workers=workers, initializer=_worker_init) as ex:
+        futs = {ex.submit(run_on_instance, inst): inst for inst in todo}
+        for done_n, fut in enumerate(as_completed(futs), 1):
+            inst = futs[fut]
+            try:
+                result = fut.result()
+            except Exception as e:  # noqa: BLE001 — a worker crash shouldn't sink the run
+                result = {"instance_id": inst["id"], "project": inst.get("project", ""),
+                          "repro_success": False, "bisect_correct": False,
+                          "fix_success": False, "fix_category": "error", "error": str(e),
+                          "stage_reached": PipelineStage.FAILED}
+            _persist(fh, results, result)
+            print(f"[{done_n}/{len(todo)}] {inst['id']} {_status_for(result)}", flush=True)
+
+
+def main(dataset_path: str, limit: int = 0, ids: str = "", resume: str = "",
+         workers: int = 1) -> None:
     dataset = json.loads(Path(dataset_path).read_text(encoding="utf-8"))
     instances = select_instances(dataset, limit, ids)
     if not instances:
@@ -395,15 +441,10 @@ def main(dataset_path: str, limit: int = 0, ids: str = "", resume: str = "") -> 
     if not todo:
         print("All selected instances are already complete in the resume file.")
     with jsonl_path.open("a", encoding="utf-8") as fh:
-        for i, instance in enumerate(todo, 1):
-            print(f"[{i}/{len(todo)}] {instance['id']} ...", end=" ", flush=True)
-            result = run_on_instance(instance)
-            results.append(result)
-            # Persist immediately (flush + fsync) so a kill mid-run keeps this row.
-            fh.write(json.dumps(result) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-            print(_status_for(result))
+        if workers > 1 and len(todo) > 1:
+            _run_parallel(todo, fh, results, workers)
+        else:
+            _run_sequential(todo, fh, results)
 
     metrics = compute_metrics(results)
     print("\n--- Metrics ---")
@@ -448,8 +489,14 @@ if __name__ == "__main__":
         help="Compute and print metrics from an existing incremental JSONL and exit "
              "(no runs). Use after a cancelled run to score what completed.",
     )
+    parser.add_argument(
+        "--workers", type=int, default=1,
+        help="Run this many instances in parallel (separate processes). Each bug is "
+             "independent; the limit is Docker/RAM/CPU, LLM rate limits, and cost. "
+             "Default 1 (sequential).",
+    )
     args = parser.parse_args()
     if args.report:
         report_only(args.report)
     else:
-        main(args.dataset, args.limit, args.ids, args.resume)
+        main(args.dataset, args.limit, args.ids, args.resume, args.workers)
