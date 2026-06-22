@@ -375,12 +375,6 @@ def report_only(jsonl_path: str) -> None:
         print(f"  {k}: {v:.1%}" if isinstance(v, float) and v <= 1 else f"  {k}: {v}")
 
 
-def _worker_init() -> None:
-    """Isolate each pool worker's agent checkpointer so concurrent processes don't
-    contend on one sqlite file (each gets its own .autodebug/w<pid> dir)."""
-    os.environ["AUTODEBUG_CHECKPOINT_DIR"] = f".autodebug/w{os.getpid()}"
-
-
 def _persist(fh, results: list, result: dict) -> None:
     results.append(result)
     # flush + fsync so a kill keeps every finished row.
@@ -405,7 +399,7 @@ def _run_parallel(todo: list, fh, results: list, workers: int) -> None:
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     print(f"Running {len(todo)} instance(s) on {workers} workers...")
-    with ProcessPoolExecutor(max_workers=workers, initializer=_worker_init) as ex:
+    with ProcessPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(run_on_instance, inst): inst for inst in todo}
         for done_n, fut in enumerate(as_completed(futs), 1):
             inst = futs[fut]

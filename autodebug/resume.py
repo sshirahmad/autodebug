@@ -39,8 +39,13 @@ def resume_enabled() -> bool:
 
 
 def get_saver():
-    """Shared persistent SqliteSaver (one connection per process; agents run
-    sequentially). Falls back to an in-memory saver if sqlite can't be opened, so
+    """Shared persistent SqliteSaver. ONE DB (`.autodebug/agents.sqlite`) is used
+    by every process, including parallel `run_eval --workers`. Concurrency is made
+    safe with WAL + a busy timeout: WAL lets readers and a writer proceed at once,
+    and the busy timeout makes a contending writer WAIT (up to the timeout) instead
+    of failing with "database is locked". Our write cadence (a checkpoint between
+    LLM calls) is low enough that this comfortably handles several workers sharing
+    the single file. Falls back to an in-memory saver if sqlite can't be opened, so
     checkpointing never blocks a run."""
     global _saver
     if _saver is not None:
@@ -51,6 +56,9 @@ def get_saver():
         path = Path(os.getenv("AUTODEBUG_CHECKPOINT_DIR", ".autodebug")) / "agents.sqlite"
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(path), check_same_thread=False)
+        # Make the single DB safe to share across concurrent worker processes.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"PRAGMA busy_timeout={int(os.getenv('AUTODEBUG_SQLITE_BUSY_MS', '30000'))}")
         saver = SqliteSaver(conn)
         saver.setup()
         _saver = saver
