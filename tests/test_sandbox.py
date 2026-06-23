@@ -31,6 +31,10 @@ class TestCondaClone:
         # every pip install routes through the env, never a bare image pip.
         assert "/workspace/env/bin/pip install" in cmd
         assert "pip install" not in cmd.replace("/workspace/env/bin/pip install", "")
+        # a baseline test runner is always installed (BugsInPy bugs often omit
+        # pytest from their runtime freeze), and into the env — not a --target dir.
+        assert "pytest" in cmd
+        assert "--target" not in cmd
         # shared package cache mounted + root prefix set.
         assert runner._CONDA_PKGS_VOLUME in cap["volumes"]
         assert cap["environment"] == {"MAMBA_ROOT_PREFIX": runner._CONDA_ROOT}

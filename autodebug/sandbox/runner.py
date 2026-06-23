@@ -326,50 +326,48 @@ def clone_into_volume(
         f" && micromamba create -y -p {_CONDA_ENV} -c conda-forge "
         f"python={shlex.quote(python_version or _default_python())} pip"
     )
-    pip = f"{_CONDA_ENV}/bin/pip"
+    pip = f"{_CONDA_ENV}/bin/pip install"
 
-    # Install the CHECKED-OUT project's own dependencies into a VOLUME-backed dir
-    # so they persist to the long-lived per-stage Sandbox containers (site-packages
-    # in this one-shot container is discarded). The image pip-installs the latest
-    # version of each subject, but the checkout is usually older with different
-    # deps — e.g. old black does `import regex as re` and `regex` isn't present, so
-    # `import black` dies before the bug is reached. _DEPS_DIR is on PYTHONPATH.
+    # Install everything INTO the env (not a --target dir): the env python is what
+    # every stage runs, so its site-packages + bin/ scripts (e.g. the `pytest`
+    # console entry) are found natively. The checked-out source still shadows
+    # installed copies because the repo roots come first on PYTHONPATH, so the
+    # agent's patches still take effect.
     if os.getenv("AUTODEBUG_PIP_INSTALL", "1") != "0":
-        deps = shlex.quote(_DEPS_DIR)
         # Wrapped in a subshell that always exits 0 so a missing optional dep never
         # aborts the rest of the setup chain (test sync, pyc cleanup).
         cmd += (
             f" && cd {shlex.quote(REPO_DIR)} && ( "
-            # 1) the checkout's own RUNTIME deps (the image pins a newer version; the
-            #    older checkout often needs different deps — e.g. old black imports `regex`).
-            f"(timeout 600 {pip} install --target={deps} . "
-            f"|| timeout 300 {pip} install --target={deps} -r requirements.txt || true) ; "
-            # 2) TEST/dev deps layered on top. The official FAIL_TO_PASS test routinely
-            #    imports test-only deps (pytest plugins, hypothesis, aiohttp for black's
-            #    blackd tests, ...). Without them the test MODULE fails to import, which
-            #    the eval would otherwise misread as a failed fix rather than a broken
-            #    env. Best-effort across the common extra names and dev-requirement files.
+            # 0) Baseline TEST TOOLCHAIN. In BugsInPy the test runner is provided by
+            #    the environment (tox/CI), not a bug's runtime freeze, so most bugs
+            #    don't list pytest — without this the gold test can't even start
+            #    ("No module named pytest"). A bug that DOES pin pytest overrides
+            #    this via the --upgrade pinned install below.
+            f"timeout 300 {pip} pytest pytest-asyncio pytest-cov pytest-mock tox || true ; "
+            # 1) the checkout's own RUNTIME deps (older checkouts need older deps —
+            #    e.g. old black imports `regex`). The env's Python version matches the
+            #    bug, so pip finds matching wheels.
+            f"(timeout 600 {pip} . "
+            f"|| timeout 300 {pip} -r requirements.txt || true) ; "
+            # 2) TEST/dev extras on top (the official test often imports test-only
+            #    deps: pytest plugins, hypothesis, aiohttp for black's blackd, ...).
             f"for e in d test tests dev testing; do "
-            f"timeout 300 {pip} install --target={deps} \".[$e]\" >/dev/null 2>&1 || true; done ; "
+            f"timeout 300 {pip} \".[$e]\" >/dev/null 2>&1 || true; done ; "
             f"for f in test-requirements.txt requirements-test.txt requirements-dev.txt "
             f"dev-requirements.txt requirements/test.txt requirements/dev.txt; do "
-            f"if [ -f \"$f\" ]; then timeout 300 {pip} install --target={deps} -r \"$f\" || true; fi; done ; "
+            f"if [ -f \"$f\" ]; then timeout 300 {pip} -r \"$f\" || true; fi; done ; "
             f"true )"
         )
-        # 3) Pin the env to the bug's recorded versions, layered ON TOP of the
-        #    generic install. Old checkouts need old pytest/pluggy/plugins; the
-        #    generic install pulls newer, incompatible ones, so the gold test can't
-        #    even run (scored harness_invalid). --upgrade lets the pins REPLACE the
-        #    generic versions; --no-deps installs only the frozen set (no newer
-        #    transitive pulls). Best-effort: pins that won't build on this image's
-        #    Python are skipped, leaving the generic fallback in place.
+        # 3) Pin to the bug's recorded versions, layered ON TOP. --upgrade lets the
+        #    pins REPLACE generic/baseline versions (incl. an old pinned pytest);
+        #    --no-deps installs only the frozen set. Best-effort: pins that won't
+        #    build are skipped, leaving the generic fallback in place.
         sanitized = _sanitize_requirements(requirements or "")
         if sanitized:
             enc_req = base64.b64encode(sanitized.encode("utf-8")).decode("ascii")
             cmd += (
                 f" && ( echo {enc_req} | base64 -d > /tmp/reqs.txt ; "
-                f"timeout 900 {pip} install --target={deps} --upgrade --no-deps "
-                f"-r /tmp/reqs.txt || true )"
+                f"timeout 900 {pip} --upgrade --no-deps -r /tmp/reqs.txt || true )"
             )
         if setup_command and setup_command.strip():
             cmd += f" && ( cd {shlex.quote(REPO_DIR)} && ({setup_command}) || true )"
