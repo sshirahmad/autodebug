@@ -338,12 +338,6 @@ def clone_into_volume(
         # aborts the rest of the setup chain (test sync, pyc cleanup).
         cmd += (
             f" && cd {shlex.quote(REPO_DIR)} && ( "
-            # 0) Baseline TEST TOOLCHAIN. In BugsInPy the test runner is provided by
-            #    the environment (tox/CI), not a bug's runtime freeze, so most bugs
-            #    don't list pytest — without this the gold test can't even start
-            #    ("No module named pytest"). A bug that DOES pin pytest overrides
-            #    this via the --upgrade pinned install below.
-            f"timeout 300 {pip} pytest pytest-asyncio pytest-cov pytest-mock tox || true ; "
             # 1) the checkout's own RUNTIME deps (older checkouts need older deps —
             #    e.g. old black imports `regex`). The env's Python version matches the
             #    bug, so pip finds matching wheels.
@@ -369,6 +363,20 @@ def clone_into_volume(
                 f" && ( echo {enc_req} | base64 -d > /tmp/reqs.txt ; "
                 f"timeout 900 {pip} --upgrade --no-deps -r /tmp/reqs.txt || true )"
             )
+        # Baseline TEST TOOLCHAIN, installed LAST so it fits the env that now
+        # exists. In BugsInPy the test runner is environment-provided (tox/CI), not
+        # a bug's runtime freeze, so most bugs omit pytest — without this the gold
+        # test can't start ("No module named pytest"). If a pytest is already
+        # present (a bug that pinned one), constrain to that exact version so pip
+        # resolves COMPATIBLE plugins (e.g. an old pytest-asyncio for pytest 5.4.2)
+        # instead of pulling a newer plugin that breaks against the old pytest.
+        py = f"{_CONDA_ENV}/bin/python"
+        cmd += (
+            f" && ( PV=$({py} -c 'import pytest;print(pytest.__version__)' 2>/dev/null) ; "
+            f"if [ -n \"$PV\" ]; then "
+            f"timeout 300 {pip} \"pytest==$PV\" pytest-asyncio pytest-cov pytest-mock tox || true ; "
+            f"else timeout 300 {pip} pytest pytest-asyncio pytest-cov pytest-mock tox || true ; fi )"
+        )
         if setup_command and setup_command.strip():
             cmd += f" && ( cd {shlex.quote(REPO_DIR)} && ({setup_command}) || true )"
     # Clear any compiled bytecode so the agents always execute the live source

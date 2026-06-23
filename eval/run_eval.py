@@ -103,13 +103,18 @@ def _normalize_test_command(cmd: str | None) -> str:
     """Make a dataset test_command runnable in our sandbox.
 
     `tox <pytest-node-id>` can't take a pytest path as a positional arg (tox
-    rejects it). We install the bug's pinned deps directly, so run the test via
-    pytest in that env instead of spinning a fresh tox virtualenv.
+    rejects it) and tox would spin envs for Python versions we don't have. We
+    install the bug's deps into the env directly, so run each test line via
+    pytest instead. Some commands are MULTIPLE lines (one per test) — normalize
+    every line and chain them with && so all must pass.
     """
-    cmd = (cmd or "").strip()
-    if cmd.startswith("tox "):
-        return "python -m pytest " + cmd[len("tox "):].strip()
-    return cmd
+    lines = [l.strip() for l in (cmd or "").splitlines() if l.strip()]
+    out = []
+    for l in lines:
+        if l.startswith("tox "):
+            l = "python -m pytest " + l[len("tox "):].strip()
+        out.append(l)
+    return " && ".join(out)
 
 
 def _reset_apply_test(sb, test_command: str, *, reset_to: str, patch: str | None = None):

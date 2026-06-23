@@ -22,6 +22,10 @@ class TestNormalizeTestCommand:
         cmd = "pytest tests/test_x.py::test_y"
         assert _normalize_test_command(cmd) == cmd
 
+    def test_multiline_tox_each_line_normalized_and_chained(self):
+        out = _normalize_test_command("tox tests/a.py::t1\ntox tests/b.py::t2")
+        assert out == "python -m pytest tests/a.py::t1 && python -m pytest tests/b.py::t2"
+
     def test_none_is_empty(self):
         assert _normalize_test_command(None) == ""
 
