@@ -35,6 +35,10 @@ class TestCondaClone:
         # pytest from their runtime freeze), and into the env — not a --target dir.
         assert "pytest" in cmd
         assert "--target" not in cmd
+        # pinned reqs install per-package (a loop), not one `-r` batch, so one bad
+        # pin can't starve later packages (e.g. tensorflow for keras).
+        assert "while IFS= read -r req" in cmd
+        assert "-r /tmp/reqs.txt" not in cmd
         # shared package cache mounted + root prefix set.
         assert runner._CONDA_PKGS_VOLUME in cap["volumes"]
         assert cap["environment"] == {"MAMBA_ROOT_PREFIX": runner._CONDA_ROOT}

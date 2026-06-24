@@ -361,7 +361,14 @@ def clone_into_volume(
             enc_req = base64.b64encode(sanitized.encode("utf-8")).decode("ascii")
             cmd += (
                 f" && ( echo {enc_req} | base64 -d > /tmp/reqs.txt ; "
-                f"timeout 900 {pip} --upgrade --no-deps -r /tmp/reqs.txt || true )"
+                # Install each pin INDEPENDENTLY. A single `pip install -r` aborts the
+                # whole batch on the first bad pin (e.g. an RC numpy that won't
+                # resolve), starving later packages — notably tensorflow, the keras
+                # backend, whose absence breaks the gold test's imports and looks like
+                # harness_invalid. Per-line + `|| true` installs everything that can.
+                f"while IFS= read -r req; do [ -n \"$req\" ] && "
+                f"timeout 300 {pip} --upgrade --no-deps \"$req\" || true; "
+                f"done < /tmp/reqs.txt )"
             )
         # Baseline TEST TOOLCHAIN, installed LAST so it fits the env that now
         # exists. In BugsInPy the test runner is environment-provided (tox/CI), not
