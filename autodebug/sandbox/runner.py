@@ -370,19 +370,18 @@ def clone_into_volume(
                 f"timeout 300 {pip} --upgrade --no-deps \"$req\" || true; "
                 f"done < /tmp/reqs.txt )"
             )
-        # Baseline TEST TOOLCHAIN, installed LAST so it fits the env that now
-        # exists. In BugsInPy the test runner is environment-provided (tox/CI), not
-        # a bug's runtime freeze, so most bugs omit pytest — without this the gold
-        # test can't start ("No module named pytest"). If a pytest is already
-        # present (a bug that pinned one), constrain to that exact version so pip
-        # resolves COMPATIBLE plugins (e.g. an old pytest-asyncio for pytest 5.4.2)
-        # instead of pulling a newer plugin that breaks against the old pytest.
+        # Ensure a test RUNNER exists, installed LAST. BugsInPy's runner is
+        # environment-provided (tox/CI), so many bugs omit pytest from their freeze
+        # — install it only if it's not already present (a bug that pinned pytest
+        # already has the right one). Do NOT install pytest PLUGINS here: an
+        # auto-loaded plugin built for a newer pytest (e.g. pytest-asyncio) crashes
+        # collection against an old pinned pytest, taking down EVERY test — even
+        # ones that don't use it (this broke keras, which isn't async). Plugins a
+        # test genuinely needs come from the bug's own pinned freeze.
         py = f"{_CONDA_ENV}/bin/python"
         cmd += (
-            f" && ( PV=$({py} -c 'import pytest;print(pytest.__version__)' 2>/dev/null) ; "
-            f"if [ -n \"$PV\" ]; then "
-            f"timeout 300 {pip} \"pytest==$PV\" pytest-asyncio pytest-cov pytest-mock tox || true ; "
-            f"else timeout 300 {pip} pytest pytest-asyncio pytest-cov pytest-mock tox || true ; fi )"
+            f" && ( {py} -c 'import pytest' 2>/dev/null "
+            f"|| timeout 300 {pip} pytest || true )"
         )
         if setup_command and setup_command.strip():
             cmd += f" && ( cd {shlex.quote(REPO_DIR)} && ({setup_command}) || true )"

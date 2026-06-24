@@ -31,9 +31,12 @@ class TestCondaClone:
         # every pip install routes through the env, never a bare image pip.
         assert "/workspace/env/bin/pip install" in cmd
         assert "pip install" not in cmd.replace("/workspace/env/bin/pip install", "")
-        # a baseline test runner is always installed (BugsInPy bugs often omit
-        # pytest from their runtime freeze), and into the env — not a --target dir.
+        # a baseline test RUNNER is installed (BugsInPy bugs often omit pytest from
+        # their runtime freeze), into the env — not a --target dir. But NO plugins:
+        # an auto-loaded plugin built for newer pytest crashes collection against an
+        # old pinned pytest (broke keras), so plugins come only from the bug's freeze.
         assert "pytest" in cmd
+        assert "pytest-asyncio" not in cmd
         assert "--target" not in cmd
         # pinned reqs install per-package (a loop), not one `-r` batch, so one bad
         # pin can't starve later packages (e.g. tensorflow for keras).
