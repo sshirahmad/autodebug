@@ -232,3 +232,67 @@ A report whose `evidence` was not observed at runtime is rejected.
 ### Test location
 - Tests for playbook units: `test/units/playbook/`
 - Collection search test: `test/units/playbook/test_collectionsearch.py` (was missing before the fix)
+
+# Additional Pattern: Grammar Selection Bug
+
+When a formatter uses different grammars for different target versions, the grammar
+selection logic determines how source code is parsed. If the wrong grammar is selected:
+
+- `python_grammar` treats `print` as a **statement** → `print("hello")` becomes `print ("hello")`
+- `python_grammar_no_print_statement` treats `print` as a **function** → `print("hello")` stays as-is
+
+The `get_grammars()` function must return the correct grammar for the target version.
+When targeting Python 2, if only `python_grammar` is returned, print-as-function-call
+will be misinterpreted as a print statement with a parenthesized expression.
+
+**Debugging tip:** Parse the same source with both grammars and compare the parse tree:
+```python
+from blib2to3 import pygram, pytree
+from blib2to3.pgen2 import driver
+from blib2to3.pytree import Node, Leaf
+
+for grammar, name in [(pygram.python_grammar, "python_grammar"), 
+                       (pygram.python_grammar_no_print_statement, "no_print_statement")]:
+    drv = driver.Driver(grammar, pytree.convert)
+    result = drv.parse_string(source, True)
+    for node in result.pre_order():
+        if isinstance(node, Leaf):
+            print(f'  Leaf type={node.type}, value={node.value!r}')
+        else:
+            print(f'  Node type={node.type}')
+```
+
+### FastAPI-specific pattern: Missing parameters in decorator chain
+
+In FastAPI, route decorator methods (`.get()`, `.post()`, etc.) exist on both `FastAPI` (in `applications.py`) and `APIRouter` (in `routing.py`). Both must accept the same parameters. When adding a new parameter like `response_model_exclude_none` or `response_model_exclude_defaults`, it must be added to:
+
+1. `FastAPI.get()` / `APIRouter.get()` (and all HTTP method variants)
+2. `FastAPI.api_route()` / `APIRouter.api_route()` 
+3. `FastAPI.add_api_route()` / `APIRouter.add_api_route()`
+4. `APIRoute.__init__()` (the route class itself)
+5. `get_request_handler()` (the actual request handler factory)
+6. `serialize_response()` (the response serialization function)
+
+If the parameter is missing from ANY of these, users will get `TypeError: FastAPI.get() got an unexpected keyword argument`.
+
+**Debugging tip:** When `TypeError: FastAPI.get() got an unexpected keyword argument 'X'` appears, grep for the parameter name across all the files in the chain. The break is usually at the outermost layer (FastAPI class methods) where the parameter was not added to the function signature.
+
+### FastAPI response_model_exclude_none / response_model_exclude_defaults missing parameters
+
+When `response_model_exclude_none` and `response_model_exclude_defaults` are completely absent from FastAPI, the parameters need to be added to the entire decorator/handler chain:
+
+**Files and functions that need the parameters:**
+1. `fastapi/routing.py` - `_prepare_response_content()` - needs `exclude_none` and `exclude_defaults` 
+2. `fastapi/routing.py` - `serialize_response()` - needs `exclude_none` and `exclude_defaults`
+3. `fastapi/routing.py` - `get_request_handler()` - needs `response_model_exclude_none` and `response_model_exclude_defaults`
+4. `fastapi/routing.py` - `APIRoute.__init__()` - needs `response_model_exclude_none` and `response_model_exclude_defaults`
+5. `fastapi/routing.py` - `APIRouter.add_api_route()` - needs `response_model_exclude_none` and `response_model_exclude_defaults`
+6. `fastapi/routing.py` - `APIRouter.api_route()` - needs `response_model_exclude_none` and `response_model_exclude_defaults`
+7. `fastapi/routing.py` - `APIRouter.get/post/put/delete/options/head/patch/trace()` - needs both params
+8. `fastapi/applications.py` - `FastAPI.add_api_route()` - needs both params
+9. `fastapi/applications.py` - `FastAPI.api_route()` - needs both params
+10. `fastapi/applications.py` - `FastAPI.get/post/put/delete/options/head/patch/trace()` - needs both params
+
+**Note on `jsonable_encoder`:** It already has `include_none` parameter. The fix needs to either add `exclude_none` support or pass `include_none=not exclude_none`. For `exclude_defaults`, Pydantic's `dict()` method supports it directly.
+
+**Pydantic's `dict()` supports:** `exclude_none` and `exclude_defaults` parameters natively in Pydantic v1.

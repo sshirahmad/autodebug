@@ -37,3 +37,22 @@ one commit `c26daa4` — that's the culprit.
 
 Always try the pickaxe search first with a distinctive function/method name from
 the bug report before resorting to bisect.
+
+## ios_banner whitespace stripping bug
+
+The bug was introduced in the very first commit that created the ios_banner module (6e56a61535). The `.strip()` calls were present from the very beginning — they weren't added by a later commit. The fix came later in commit 52f3ce8a80 which changed `.strip()` to `.strip('\n')` and removed the `str(text).strip()` from `map_params_to_obj`.
+
+Key lesson: When a bug is in the original commit that created a file, pickaxe `-S '.strip()'` with `--reverse` will find it as the first commit introducing that code.
+
+## Debugging skip_defaults issue in FastAPI
+
+When `response_model_skip_defaults=True` is set on a path operation:
+1. `serialize_response` is called with `skip_defaults=True` and a `field` (response_field)
+2. `field.validate(response, ...)` creates a new model instance via a CLONED field class (from `create_cloned_field`)
+3. The cloned field creates a new subclass, and validation creates an instance where `__fields_set__` contains ALL fields
+4. When `jsonable_encoder(value, skip_defaults=True)` then calls `value.dict(skip_defaults=True)`, nothing is skipped because Pydantic thinks all fields were explicitly set
+5. This means `skip_defaults` has no effect when there's a response_model
+
+The `else` branch (no field) also has a bug: `skip_defaults` is not forwarded to `jsonable_encoder`.
+
+Root cause: `field.validate()` through the cloned field loses the original `__fields_set__` information, making `skip_defaults` ineffective.
