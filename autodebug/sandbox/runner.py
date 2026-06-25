@@ -71,12 +71,24 @@ def _pytest_env() -> dict:
 
     A bug whose tests GENUINELY need a plugin (async projects) can re-enable just
     that one via ``AUTODEBUG_PYTEST_PLUGINS=pytest_asyncio[,...]`` — loaded with
-    ``-p`` through PYTEST_ADDOPTS, which still works while autoload is off."""
-    env = {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
-    plugins = [p.strip() for p in os.getenv("AUTODEBUG_PYTEST_PLUGINS", "").split(",") if p.strip()]
-    if plugins:
-        env["PYTEST_ADDOPTS"] = " ".join(f"-p {p}" for p in plugins)
-    return env
+    ``-p`` through PYTEST_ADDOPTS, which still works while autoload is off.
+
+    Disabling autoload alone isn't enough: a repo's ``pytest.ini`` often sets
+    ``addopts`` that REQUIRE a plugin (e.g. ``-n auto`` from pytest-xdist), and with
+    that plugin no longer loaded pytest fails with "unrecognized arguments: -n".
+    So we also CLEAR the ini addopts with ``-o addopts=`` (verified: this drops the
+    inherited ``-n``/``--timeout``/``--cov`` …). None of those affect a single
+    test's pass/fail, so the gold test runs plain — no plugin, no plugin-args."""
+    # `-o addopts=` neutralizes the repo's pytest.ini addopts; `-p <name>` re-enables
+    # any explicitly allow-listed plugin (async projects).
+    addopts = ["-o", "addopts="]
+    for p in (p.strip() for p in os.getenv("AUTODEBUG_PYTEST_PLUGINS", "").split(",")):
+        if p:
+            addopts += ["-p", p]
+    return {
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        "PYTEST_ADDOPTS": " ".join(addopts),
+    }
 
 
 @dataclass

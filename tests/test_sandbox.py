@@ -69,16 +69,18 @@ class TestCondaClone:
         sb.exec(command)
         return sb.container.exec_run.call_args.kwargs["environment"]
 
-    def test_exec_disables_pytest_plugin_autoload(self):
+    def test_exec_disables_autoload_and_clears_ini_addopts(self):
         # A version-skewed plugin (e.g. pytest-timeout on pytest 5.x) auto-loads and
-        # crashes collection — so it must never auto-load in the scoring sandbox.
+        # crashes collection -> autoload off. And a repo pytest.ini's `addopts` can
+        # require a now-unloaded plugin (e.g. `-n` from xdist) -> clear addopts.
         env = self._exec_env()
         assert env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
-        assert "PYTEST_ADDOPTS" not in env  # nothing force-enabled by default
+        assert env["PYTEST_ADDOPTS"] == "-o addopts="
 
     def test_exec_reenables_allowlisted_plugins(self, monkeypatch):
-        # Async projects can opt a specific plugin back in via `-p`.
+        # Async projects can opt a specific plugin back in via `-p`, on top of the
+        # addopts clear.
         monkeypatch.setenv("AUTODEBUG_PYTEST_PLUGINS", "pytest_asyncio, pytest_trio")
         env = self._exec_env()
         assert env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
-        assert env["PYTEST_ADDOPTS"] == "-p pytest_asyncio -p pytest_trio"
+        assert env["PYTEST_ADDOPTS"] == "-o addopts= -p pytest_asyncio -p pytest_trio"
