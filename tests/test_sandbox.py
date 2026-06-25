@@ -60,3 +60,25 @@ class TestCondaClone:
         sb.exec("python --version")
         sent = sb.container.exec_run.call_args.kwargs["cmd"]
         assert 'export PATH="/workspace/env/bin:$PATH";' in sent[-1]
+
+    def _exec_env(self, command="python -m pytest x"):
+        sb = runner.Sandbox.__new__(runner.Sandbox)
+        sb.container = MagicMock()
+        sb.container.exec_run.return_value = MagicMock(output=(b"", b""), exit_code=0)
+        sb.exec_timeout = 30
+        sb.exec(command)
+        return sb.container.exec_run.call_args.kwargs["environment"]
+
+    def test_exec_disables_pytest_plugin_autoload(self):
+        # A version-skewed plugin (e.g. pytest-timeout on pytest 5.x) auto-loads and
+        # crashes collection — so it must never auto-load in the scoring sandbox.
+        env = self._exec_env()
+        assert env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
+        assert "PYTEST_ADDOPTS" not in env  # nothing force-enabled by default
+
+    def test_exec_reenables_allowlisted_plugins(self, monkeypatch):
+        # Async projects can opt a specific plugin back in via `-p`.
+        monkeypatch.setenv("AUTODEBUG_PYTEST_PLUGINS", "pytest_asyncio, pytest_trio")
+        env = self._exec_env()
+        assert env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
+        assert env["PYTEST_ADDOPTS"] == "-p pytest_asyncio -p pytest_trio"

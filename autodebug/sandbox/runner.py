@@ -57,6 +57,28 @@ def _default_python() -> str:
     return os.getenv("AUTODEBUG_DEFAULT_PYTHON", "3.11")
 
 
+def _pytest_env() -> dict:
+    """Env that makes pytest collection robust across the version-pinned sandboxes.
+
+    BugsInPy freezes a bug's RUNTIME deps, but its test RUNNER is environment-
+    provided — so a project's test extras routinely drag in a pytest PLUGIN newer
+    than the (old) pinned pytest. Such a plugin auto-loads via its ``pytest11``
+    entrypoint and crashes collection on IMPORT — e.g. pytest-timeout doing
+    ``pytest.StashKey`` against pytest 5.x, or pytest-asyncio's ``addini`` — which
+    makes the gold test unrunnable and the instance look ``harness_invalid`` even
+    though the fix is fine. Disabling plugin autoload kills that whole class: the
+    pass/fail assertion needs no third-party plugin.
+
+    A bug whose tests GENUINELY need a plugin (async projects) can re-enable just
+    that one via ``AUTODEBUG_PYTEST_PLUGINS=pytest_asyncio[,...]`` — loaded with
+    ``-p`` through PYTEST_ADDOPTS, which still works while autoload is off."""
+    env = {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
+    plugins = [p.strip() for p in os.getenv("AUTODEBUG_PYTEST_PLUGINS", "").split(",") if p.strip()]
+    if plugins:
+        env["PYTEST_ADDOPTS"] = " ".join(f"-p {p}" for p in plugins)
+    return env
+
+
 @dataclass
 class RunResult:
     exit_code: int
@@ -160,7 +182,8 @@ class Sandbox:
             # caches bytecode and a later apply_patch to the .py is masked by the
             # stale .pyc (Python reuses it when mtimes collide on the volume) — so
             # the fixer's patches silently never execute.
-            environment={"PYTHONPATH": _PYTHONPATH, "PYTHONDONTWRITEBYTECODE": "1"},
+            environment={"PYTHONPATH": _PYTHONPATH, "PYTHONDONTWRITEBYTECODE": "1",
+                          **_pytest_env()},
         )
         stdout_bytes, stderr_bytes = (
             result.output if isinstance(result.output, tuple) else (result.output, b"")
