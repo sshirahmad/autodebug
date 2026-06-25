@@ -27,6 +27,9 @@ dependencies = [
     "langgraph-checkpoint-sqlite>=2.0.0",
     "langchain-huggingface>=0.1.0",
     "sentence-transformers>=3.0.0",
+    # Imported unconditionally by graph/pipeline.py (no-op tracer without an SDK);
+    # the full SDK + exporters live in the optional [tracing] extra.
+    "opentelemetry-api>=1.25.0",
 ]
 
 [project.optional-dependencies]
