@@ -381,6 +381,69 @@ def report_only(jsonl_path: str) -> None:
         print(f"  {k}: {v:.1%}" if isinstance(v, float) and v <= 1 else f"  {k}: {v}")
 
 
+def compare_runs(path_a: str, path_b: str) -> None:
+    """Diff two result JSONLs: aggregate metric deltas + per-instance category
+    changes. A local, vendor-free stand-in for an experiment-vs-experiment view —
+    e.g. `--compare run_old.jsonl run_new.jsonl` to see what a change moved."""
+    (ra, _), (rb, _) = load_partial(Path(path_a)), load_partial(Path(path_b))
+    if not ra or not rb:
+        print("one or both result files are empty / missing")
+        return
+    a = {str(r.get("instance_id")): r for r in ra}
+    b = {str(r.get("instance_id")): r for r in rb}
+    ma, mb = compute_metrics(list(a.values())), compute_metrics(list(b.values()))
+
+    print(f"A = {path_a}  ({ma['total']} instances)")
+    print(f"B = {path_b}  ({mb['total']} instances)\n")
+
+    # --- aggregate metric deltas (rates as %, counts as ints) ---
+    rate_keys = ("repro_rate", "bisect_accuracy", "fix_rate")
+    int_keys = ("total", "fix_scoreable", "harness_invalid")
+    print(f"{'metric':22} {'A':>10} {'B':>10} {'delta':>10}")
+    for k in rate_keys + int_keys:
+        va, vb = ma.get(k, 0), mb.get(k, 0)
+        if k in rate_keys:
+            print(f"{k:22} {va:>9.1%} {vb:>9.1%} {vb - va:>+9.1%}")
+        else:
+            print(f"{k:22} {va:>10} {vb:>10} {vb - va:>+10}")
+
+    # --- per-instance category changes (only ids present in BOTH) ---
+    gained, lost, hi_cleared, hi_new, other = [], [], [], [], []
+    for iid in sorted(set(a) & set(b)):
+        ca, cb = a[iid].get("fix_category"), b[iid].get("fix_category")
+        if ca == cb:
+            continue
+        row = (iid, ca, cb)
+        if cb == "fix_pass":
+            gained.append(row)
+        elif ca == "fix_pass":
+            lost.append(row)
+        elif ca == "harness_invalid":
+            hi_cleared.append(row)
+        elif cb == "harness_invalid":
+            hi_new.append(row)
+        else:
+            other.append(row)
+
+    def _section(title, rows):
+        print(f"\n{title} ({len(rows)})")
+        for iid, ca, cb in rows:
+            print(f"  {iid:16} {ca} -> {cb}")
+
+    _section("[+] newly passing", gained)
+    _section("[-] newly failing (lost fix_pass)", lost)
+    _section("[fixed] harness_invalid cleared", hi_cleared)
+    _section("[broke] became harness_invalid", hi_new)
+    _section("[.] other category changes", other)
+
+    only_a = sorted(set(a) - set(b))
+    only_b = sorted(set(b) - set(a))
+    if only_a:
+        print(f"\nonly in A ({len(only_a)}): {', '.join(only_a)}")
+    if only_b:
+        print(f"\nonly in B ({len(only_b)}): {', '.join(only_b)}")
+
+
 def _persist(fh, results: list, result: dict) -> None:
     results.append(result)
     # flush + fsync so a kill keeps every finished row.
@@ -496,13 +559,20 @@ if __name__ == "__main__":
              "(no runs). Use after a cancelled run to score what completed.",
     )
     parser.add_argument(
+        "--compare", nargs=2, metavar=("RUN_A", "RUN_B"), default=None,
+        help="Diff two result JSONLs (metric deltas + per-instance category changes) "
+             "and exit. Local stand-in for an experiment-vs-experiment view.",
+    )
+    parser.add_argument(
         "--workers", type=int, default=1,
         help="Run this many instances in parallel (separate processes). Each bug is "
              "independent; the limit is Docker/RAM/CPU, LLM rate limits, and cost. "
              "Default 1 (sequential).",
     )
     args = parser.parse_args()
-    if args.report:
+    if args.compare:
+        compare_runs(args.compare[0], args.compare[1])
+    elif args.report:
         report_only(args.report)
     else:
         main(args.dataset, args.limit, args.ids, args.resume, args.workers)

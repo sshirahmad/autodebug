@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -9,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from eval.run_eval import (  # noqa: E402
     bisect_signals, compute_metrics, validate_fix, _source_files, _HARNESS_ERROR_RE,
-    load_partial, _normalize_test_command,
+    load_partial, _normalize_test_command, compare_runs,
 )
 
 
@@ -63,6 +64,45 @@ class TestLoadPartial:
         results, done = load_partial(p)
         assert done == {"ansible-1", "ansible-2"}
         assert len(results) == 2
+
+
+class TestCompareRuns:
+    """Local experiment-vs-experiment diff: classify per-instance category moves."""
+
+    def _write(self, path, rows):
+        path.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+
+    def _row(self, iid, cat, repro=True, fix=False):
+        return {"instance_id": iid, "fix_category": cat, "fix_success": fix,
+                "repro_success": repro, "bisect_correct": False}
+
+    def test_classifies_moves_and_metric_delta(self, tmp_path, capsys):
+        a = tmp_path / "a.jsonl"; b = tmp_path / "b.jsonl"
+        self._write(a, [
+            self._row("k-1", "harness_invalid"),
+            self._row("k-2", "fix_pass", fix=True),
+            self._row("k-3", "harness_invalid"),
+        ])
+        self._write(b, [
+            self._row("k-1", "fix_pass", fix=True),   # newly passing
+            self._row("k-2", "fix_fail"),             # lost fix_pass
+            self._row("k-3", "no_patch"),             # harness cleared (not to pass)
+        ])
+        compare_runs(str(a), str(b))
+        out = " ".join(capsys.readouterr().out.split())  # collapse column padding
+        assert "k-1 harness_invalid -> fix_pass" in out          # newly passing
+        assert "k-2 fix_pass -> fix_fail" in out                 # newly failing
+        assert "k-3 harness_invalid -> no_patch" in out          # harness cleared
+        assert "harness_invalid 2 0 -2" in out                   # count delta 2 -> 0
+
+    def test_reports_ids_only_in_one_file(self, tmp_path, capsys):
+        a = tmp_path / "a.jsonl"; b = tmp_path / "b.jsonl"
+        self._write(a, [self._row("only-a", "fix_pass", fix=True)])
+        self._write(b, [self._row("only-b", "fix_fail")])
+        compare_runs(str(a), str(b))
+        out = " ".join(capsys.readouterr().out.split())
+        assert "only in A (1): only-a" in out
+        assert "only in B (1): only-b" in out
 
 
 class TestValidateFixGuards:
