@@ -35,3 +35,11 @@ data/
 
 # skill update lock files
 .skills/**/.lock
+
+# LangGraph dev server cache (`langgraph dev`)
+.langgraph_api/
+
+# Local-only: trace-recovery helper + personal notes (not for publication)
+eval/recover_from_traces.py
+ideas.txt
+TODO.md

@@ -86,6 +86,15 @@ autodebug debug https://github.com/psf/black \
   --good <known-good-commit-or-date>     # optional, helps bisect
 ```
 
+Pass `--stream` to watch progress live instead of waiting in silence — and to be
+prompted for guidance if the run gets stuck (human-in-the-loop, see below). Add
+`--tokens` to also stream the sub-agents' LLM output token-by-token:
+
+```bash
+autodebug debug https://github.com/psf/black --bug "..." --stream
+autodebug debug https://github.com/psf/black --bug "..." --tokens   # live token stream
+```
+
 Or from Python:
 
 ```python
@@ -98,6 +107,57 @@ state = run_pipeline(
 )
 print(state.stage, state.fix and state.fix.patch)
 ```
+
+---
+
+## Interactive serving (Agent Chat UI + human-in-the-loop)
+
+The blocking CLI runs a bug to completion in silence. For an interactive workflow —
+live progress, a chat UI, and the ability to step in when the agent gets stuck —
+AutoDebug also ships as a **compiled LangGraph graph** ([autodebug/graph/interactive.py](autodebug/graph/interactive.py))
+with a `messages` channel and a human-in-the-loop (HITL) review step.
+
+```bash
+# Install the serving extra (the LangGraph dev server)
+pip install -e ".[serve]"
+
+# Serve the graph on http://localhost:2024 (also prints a LangGraph Studio URL)
+langgraph dev
+```
+
+`langgraph dev` reads [langgraph.json](langgraph.json), serves the `autodebug` graph
+over the standard LangGraph protocol, and provides persistence so threads, streaming,
+and interrupts work. Two ways to use it — **no custom backend needed**:
+
+- **LangGraph Studio** — open the `smith.langchain.com/studio?baseUrl=…` URL printed
+  by `langgraph dev`. It has a **config panel**, so set `repo_url` (and optional
+  `ref`/`known_good`/`requirements`/…) there and type the bug report as the message.
+  This is the quickest way to drive a run and watch its state.
+- **Agent Chat UI** — point [Agent Chat UI](https://github.com/langchain-ai/agent-chat-ui)
+  (a separate Next.js frontend) at `http://localhost:2024` with assistant id
+  `autodebug`. (It has no config panel, so the run target must come from Studio or be
+  parsed from the first message.)
+
+**Streaming granularity.** The chat shows **milestone** messages (one per stage + the
+failure/summary). For a **live token stream** of the sub-agents, set
+`AUTODEBUG_STREAM_TOKENS=1` (or the CLI `--tokens` flag). Tokens are forwarded from
+every sub-agent's model through the graph stream as LangGraph `custom` events
+(`{"token": …}`) / inline CLI output. It's gated because the default and the eval
+harness want clean, non-streaming behavior; the toggle uses a contextvar (not a
+global), so a server can stream per-run without a race.
+
+**Human-in-the-loop.** When a run exhausts its retries or is about to fail, the
+graph's `human_review` node `interrupt()`s with a summary of what was tried and
+why it failed, instead of silently returning a failure. Clients stream the run,
+detect the `__interrupt__`, and resume with `Command(resume=<feedback>)` (Studio /
+Agent Chat UI render this automatically; the CLI `--stream` prompts at the terminal).
+The feedback is threaded into the next attempt's prompt, so the retry is **steered**,
+not a blind replay. Each sub-agent keeps its own checkpointer threads (so
+already-paid-for repro/bisect/root-cause are served from cache); only the top graph
+interrupts.
+
+> The non-interactive `run_pipeline` and the eval harness are unchanged — the graph
+> is an additive surface that reuses the same stage runners.
 
 ---
 
@@ -191,10 +251,11 @@ autodebug/
   agents/      manager + repro/bisect/root_cause/fix sub-agents
   tools/       auto-discovered make_<name>_tool factories
   sandbox/     Docker volume + long-lived container runner
-  graph/       pipeline orchestration (clone → stages)
+  graph/       pipeline.py (imperative run_pipeline) + interactive.py (compiled graph + HITL)
   fsm.py       Manager finite state machine
   registry.py  config loading + tool building
   state.py     DebugState and per-stage result models
+langgraph.json   serves the graph for `langgraph dev` / Studio / Agent Chat UI
 config/
   agents/      per-agent model/budget/tool config (JSON)
   prompts/     per-agent system prompts (YAML)
@@ -205,3 +266,18 @@ eval/
 docker/sandbox Dockerfile for the execution image
 fetch_traces.py  pretty-print the latest Phoenix traces
 ```
+
+---
+
+## Contributing
+
+Contributions are very welcome — agents, tools, sandbox improvements, eval
+coverage, docs, and bug fixes alike. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for
+setup, the test workflow, and code style. Good first issues include tidying lint
+findings and adding eval coverage. Please open an issue to discuss anything
+non-trivial before sending a large PR.
+
+## License
+
+[MIT](LICENSE) © 2026 Shayan Shirahmad
+
