@@ -73,8 +73,8 @@ what happened, and environment details (OS, Python, Docker version).
 
 ## Security
 
-Please **do not** open public issues for security vulnerabilities. Instead, report
-them privately to the maintainer (see the repository's security policy / contact).
+Please **do not** open public issues for security vulnerabilities. See
+[SECURITY.md](SECURITY.md) for how to report them privately.
 
 ## License
 
