@@ -66,6 +66,13 @@ def run_manager(state: DebugState, *, registry) -> DebugState:
         "bug. The reproduction your repro agent builds is the success criterion — "
         "there is no provided test. Begin by reproducing it."
     )
+    # A previous attempt failed and a developer stepped in (human-in-the-loop);
+    # surface their guidance so this attempt is steered rather than a blind replay.
+    if state.user_feedback and state.user_feedback.strip():
+        initial_text += (
+            "\n\nA previous attempt did NOT succeed. A developer reviewed it and "
+            f"gave this guidance — follow it:\n\n{state.user_feedback.strip()}"
+        )
 
     # Session-wide ceiling across the manager + every sub-agent it delegates to.
     # Per-agent budgets don't bound the REVISING loop, so cap the whole session.

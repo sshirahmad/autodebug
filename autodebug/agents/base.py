@@ -7,6 +7,7 @@ via the `budget_middleware` (a pair of before_model/after_model hooks).
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 import time
@@ -23,6 +24,7 @@ from langchain.agents.middleware import (
     before_model,
 )
 from langchain.chat_models import init_chat_model
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import HumanMessage
 from langgraph.runtime import Runtime
 
@@ -32,6 +34,61 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "claude-sonnet-4-6"
 _DEFAULT_PROVIDER = "anthropic"
+
+
+# --- Token-level streaming -------------------------------------------------
+# When enabled, every sub-agent's LLM tokens are forwarded to the active LangGraph
+# stream writer as ``{"token": ...}`` custom events, so the interactive graph can
+# surface them live (Studio / Agent Chat UI custom events, CLI inline). Gated so the
+# default (and the eval harness) keep their clean, non-streaming behavior.
+#
+# Two switches: a process-wide env var (AUTODEBUG_STREAM_TOKENS=1) and a contextvar
+# the graph sets per-run from its config (so a server can stream per-request without
+# a global, race-free toggle). The contextvar is copied into the worker thread by
+# ``asyncio.to_thread``, so a forwarder built inside a stage runner still sees it.
+_STREAM_TOKENS: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "autodebug_stream_tokens", default=False
+)
+
+
+def set_stream_tokens(on: bool) -> None:
+    """Enable/disable token forwarding for the current execution context."""
+    _STREAM_TOKENS.set(bool(on))
+
+
+def _stream_tokens_active() -> bool:
+    return _STREAM_TOKENS.get() or os.getenv("AUTODEBUG_STREAM_TOKENS", "0") == "1"
+
+
+class _TokenStreamForwarder(BaseCallbackHandler):
+    """Forwards each new LLM token to a LangGraph stream writer. Best-effort: a
+    failed write (e.g. no live consumer) is swallowed so it never breaks the run."""
+
+    def __init__(self, writer, agent: str | None = None):
+        self._writer = writer
+        self._agent = agent
+
+    def on_llm_new_token(self, token: str, **kwargs) -> None:
+        if not token:
+            return
+        try:
+            self._writer({"token": token, "agent": self._agent})
+        except Exception:  # noqa: BLE001 — streaming is decorative, never fatal
+            pass
+
+
+def _token_forwarder(agent: str | None = None):
+    """A forwarder callback if token streaming is on AND a stream writer is live in
+    this context; otherwise None (so models are built unchanged)."""
+    if not _stream_tokens_active():
+        return None
+    try:
+        from langgraph.config import get_stream_writer
+
+        writer = get_stream_writer()
+    except Exception:
+        return None
+    return _TokenStreamForwarder(writer, agent) if callable(writer) else None
 
 
 class BudgetExceeded(Exception):
@@ -535,7 +592,17 @@ def build_model(
     timeout = float(os.getenv("AUTODEBUG_MODEL_TIMEOUT", "120"))
     if timeout > 0:
         kwargs["timeout"] = timeout
-    return init_chat_model(mid, model_provider=prv, **kwargs)
+    # Token streaming: with streaming=True, even .invoke() streams the response
+    # internally and fires on_llm_new_token, which our forwarder relays to the
+    # graph stream. No-op (model built unchanged) unless streaming is enabled and a
+    # writer is live.
+    forwarder = _token_forwarder()
+    if forwarder is not None:
+        kwargs["streaming"] = True
+    model = init_chat_model(mid, model_provider=prv, **kwargs)
+    if forwarder is not None:
+        model = model.with_config({"callbacks": [forwarder]})
+    return model
 
 
 def model_for_attempt(attempt: int, model_id: str | None, provider: str | None):

@@ -69,6 +69,10 @@ class DebugState(BaseModel):
     manager_phase: Optional[str] = None  # last Manager FSM phase (manager mode only)
     repo_volume: Optional[str] = None  # Docker volume name holding the cloned repo
     error: Optional[str] = None
+    # Free-text guidance a developer supplied via human-in-the-loop after a failed
+    # attempt (see autodebug/graph/interactive.py's human_review node). Threaded into the
+    # next attempt's prompt so the retry is steered, not a blind replay.
+    user_feedback: Optional[str] = None
 
     # --- Agent outputs (filled in as pipeline progresses) ---
     repro: Optional[ReproResult] = None
