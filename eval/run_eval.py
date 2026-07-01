@@ -107,12 +107,20 @@ def _normalize_test_command(cmd: str | None) -> str:
     install the bug's deps into the env directly, so run each test line via
     pytest instead. Some commands are MULTIPLE lines (one per test) — normalize
     every line and chain them with && so all must pass.
+
+    Also rewrite the legacy `py.test` console alias to `python -m pytest`: modern
+    pytest no longer installs a `py.test` entry point, so the raw command dies with
+    `bash: py.test: command not found` (this made all 10 spacy instances
+    harness_invalid). `python -m pytest` is invariant to the entry-point name.
     """
     lines = [l.strip() for l in (cmd or "").splitlines() if l.strip()]
     out = []
     for l in lines:
         if l.startswith("tox "):
             l = "python -m pytest " + l[len("tox "):].strip()
+        # `py.test ...` / `py.test-3 ...` -> `python -m pytest ...` (bare `pytest` is
+        # left alone — its entry point exists; only the legacy `py.test` alias is gone).
+        l = re.sub(r"^py\.test(-\d+(\.\d+)?)?\b", "python -m pytest", l)
         out.append(l)
     return " && ".join(out)
 
@@ -444,6 +452,89 @@ def compare_runs(path_a: str, path_b: str) -> None:
         print(f"\nonly in B ({len(only_b)}): {', '.join(only_b)}")
 
 
+def calibrate_instance(instance: dict) -> dict:
+    """Pre-flight scoreability check (NO agent run): the official test must PASS at
+    the fixed commit and FAIL at the buggy commit. Returns {instance_id, scoreable,
+    reason}. This is the gate that turns `harness_invalid` from a per-run surprise
+    into a known, pre-measured *excluded* set — the agent then only runs on the
+    instances that can actually be scored."""
+    iid = str(instance.get("id"))
+    proj = instance.get("project", "")
+    base = {"instance_id": iid, "project": proj}
+    test_command = _normalize_test_command(instance.get("test_command"))
+    fixed_commit = instance.get("fixed_commit_id")
+    if not test_command:
+        return {**base, "scoreable": False, "reason": "no test_command"}
+    if not fixed_commit:
+        return {**base, "scoreable": False, "reason": "no fixed_commit_id"}
+
+    from autodebug.sandbox import (
+        Sandbox, clone_into_volume, create_repo_volume, remove_repo_volume,
+    )
+
+    volume = create_repo_volume()
+    try:
+        clone_into_volume(
+            volume, instance["repo_url"], instance.get("pre_fix_commit"),
+            test_patch=instance.get("test_patch"), fixed_commit=fixed_commit,
+            requirements=instance.get("requirements"),
+            setup_command=instance.get("setup_command"),
+            python_version=instance.get("python_version"),
+        )
+        with Sandbox(volume=volume) as sb:
+            sb.exec("git add -A && git -c user.email=eval@autodebug -c user.name=eval "
+                    "commit -q -m baseline --no-verify || true")
+            baseline = sb.exec("git rev-parse HEAD").stdout.strip() or "HEAD"
+            gold_status, gold_run = _reset_apply_test(sb, test_command, reset_to=fixed_commit)
+            if gold_status != "pass":
+                return {**base, "scoreable": False, "reason": "gold (fixed) commit does not pass",
+                        "test_output": gold_run.output[-800:]}
+            buggy_status, _ = _reset_apply_test(sb, test_command, reset_to=baseline)
+            if buggy_status == "pass":
+                return {**base, "scoreable": False,
+                        "reason": "test passes on buggy commit (does not detect the bug)"}
+            return {**base, "scoreable": True, "reason": "gold passes, buggy fails"}
+    except Exception as e:  # noqa: BLE001
+        return {**base, "scoreable": False, "reason": f"calibration error: {e}"}
+    finally:
+        remove_repo_volume(volume)
+
+
+def calibrate(dataset_path: str, limit: int = 0, ids: str = "", resume: str = "",
+              workers: int = 1) -> None:
+    """Run the scoreability gate over the dataset, writing a resumable calibration
+    JSONL (one {instance_id, scoreable, reason} per line). Feed it to a run with
+    `--scoreable <file>` so the agent only runs on scoreable instances."""
+    dataset = json.loads(Path(dataset_path).read_text(encoding="utf-8"))
+    instances = select_instances(dataset, limit, ids)
+    if not instances:
+        print("No instances selected.")
+        return
+    RESULTS_DIR.mkdir(exist_ok=True)
+    path = Path(resume) if resume else RESULTS_DIR / "calibration.jsonl"
+    results, done = load_partial(path)
+    todo = [i for i in instances if str(i["id"]) not in done]
+    if done:
+        print(f"Resuming calibration from {path.name}: {len(done)} already done.")
+
+    def _status(r):
+        return "scoreable" if r.get("scoreable") else f"EXCLUDED: {(r.get('reason') or '')[:45]}"
+
+    with path.open("a", encoding="utf-8") as fh:
+        if workers > 1 and len(todo) > 1:
+            _run_parallel(todo, fh, results, workers, fn=calibrate_instance, status=_status)
+        elif todo:
+            _run_sequential(todo, fh, results, fn=calibrate_instance, status=_status)
+
+    from collections import Counter
+    sc = [r for r in results if r.get("scoreable")]
+    print(f"\n--- Calibration: {len(sc)}/{len(results)} scoreable ---")
+    for reason, n in Counter((r.get("reason") or "")[:55] for r in results
+                             if not r.get("scoreable")).most_common():
+        print(f"  excluded {n:>3}: {reason}")
+    print(f"\nCalibration saved to {path}\nRun with: --scoreable {path}")
+
+
 def _persist(fh, results: list, result: dict) -> None:
     results.append(result)
     # flush + fsync so a kill keeps every finished row.
@@ -452,39 +543,41 @@ def _persist(fh, results: list, result: dict) -> None:
     os.fsync(fh.fileno())
 
 
-def _run_sequential(todo: list, fh, results: list) -> None:
+def _run_sequential(todo: list, fh, results: list, fn=None, status=_status_for) -> None:
+    fn = fn or run_on_instance
     for i, instance in enumerate(todo, 1):
         print(f"[{i}/{len(todo)}] {instance['id']} ...", end=" ", flush=True)
-        result = run_on_instance(instance)
+        result = fn(instance)
         _persist(fh, results, result)
-        print(_status_for(result))
+        print(status(result))
 
 
-def _run_parallel(todo: list, fh, results: list, workers: int) -> None:
+def _run_parallel(todo: list, fh, results: list, workers: int, fn=None, status=_status_for) -> None:
     """Run instances concurrently. Each bug is independent and the pipeline is
     blocking (Docker), so separate processes give true parallelism. The PARENT is
     the only JSONL writer (results funnel back via futures), so no file locking is
     needed; results land out of order, which is fine for a line-per-bug log."""
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
+    fn = fn or run_on_instance
     print(f"Running {len(todo)} instance(s) on {workers} workers...")
     with ProcessPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(run_on_instance, inst): inst for inst in todo}
+        futs = {ex.submit(fn, inst): inst for inst in todo}
         for done_n, fut in enumerate(as_completed(futs), 1):
             inst = futs[fut]
             try:
                 result = fut.result()
             except Exception as e:  # noqa: BLE001 — a worker crash shouldn't sink the run
                 result = {"instance_id": inst["id"], "project": inst.get("project", ""),
-                          "repro_success": False, "bisect_correct": False,
+                          "repro_success": False, "bisect_correct": False, "scoreable": False,
                           "fix_success": False, "fix_category": "error", "error": str(e),
-                          "stage_reached": PipelineStage.FAILED}
+                          "reason": str(e), "stage_reached": str(PipelineStage.FAILED)}
             _persist(fh, results, result)
-            print(f"[{done_n}/{len(todo)}] {inst['id']} {_status_for(result)}", flush=True)
+            print(f"[{done_n}/{len(todo)}] {inst['id']} {status(result)}", flush=True)
 
 
 def main(dataset_path: str, limit: int = 0, ids: str = "", resume: str = "",
-         workers: int = 1) -> None:
+         workers: int = 1, scoreable: str = "") -> None:
     # Agents mutate a single shared .skills/ path; during a (possibly parallel)
     # eval that's a race + a reproducibility hazard, so disable skill writes
     # unless the user explicitly opts in. Set before workers spawn so they inherit.
@@ -506,13 +599,38 @@ def main(dataset_path: str, limit: int = 0, ids: str = "", resume: str = "",
         print(f"Resuming from {jsonl_path.name}: {len(done)} instance(s) already "
               f"complete — skipping them.")
 
+    # Scoreability gate (from `--calibrate`): never run the agent on an instance the
+    # harness already proved unscoreable — record it as harness_invalid up front with
+    # the calibration reason, so it's a known excluded set instead of a paid surprise.
+    excluded = []
+    if scoreable:
+        calib = {r["instance_id"]: r for r in load_partial(Path(scoreable))[0]}
+        kept = []
+        for inst in instances:
+            c = calib.get(str(inst["id"]))
+            if c is not None and not c.get("scoreable", True):
+                if str(inst["id"]) not in done:
+                    excluded.append({
+                        "instance_id": inst["id"], "project": inst.get("project", ""),
+                        "repro_success": False, "bisect_correct": False, "fix_success": False,
+                        "fix_category": "harness_invalid", "harness_valid": False,
+                        "reason": c.get("reason", "excluded by calibration"),
+                        "stage_reached": "excluded"})
+            else:
+                kept.append(inst)
+        print(f"Scoreability gate: {len(kept)} scoreable to run, "
+              f"{len(excluded)} excluded up front.")
+        instances = kept
+
     todo = [inst for inst in instances if str(inst["id"]) not in done]
-    if not todo:
+    if not todo and not excluded:
         print("All selected instances are already complete in the resume file.")
     with jsonl_path.open("a", encoding="utf-8") as fh:
+        for r in excluded:                       # record the gated-out instances first
+            _persist(fh, results, r)
         if workers > 1 and len(todo) > 1:
             _run_parallel(todo, fh, results, workers)
-        else:
+        elif todo:
             _run_sequential(todo, fh, results)
 
     metrics = compute_metrics(results)
@@ -569,10 +687,24 @@ if __name__ == "__main__":
              "independent; the limit is Docker/RAM/CPU, LLM rate limits, and cost. "
              "Default 1 (sequential).",
     )
+    parser.add_argument(
+        "--calibrate", action="store_true",
+        help="Scoreability gate: for each instance check the gold (fixed) commit "
+             "PASSES the test and the buggy commit FAILS it — no agent run. Writes a "
+             "resumable calibration JSONL. Pair with --workers/--resume/--ids.",
+    )
+    parser.add_argument(
+        "--scoreable", default="",
+        help="Path to a calibration JSONL (from --calibrate). The agent runs only on "
+             "scoreable instances; unscoreable ones are recorded as harness_invalid "
+             "up front (never sent to the agent).",
+    )
     args = parser.parse_args()
     if args.compare:
         compare_runs(args.compare[0], args.compare[1])
     elif args.report:
         report_only(args.report)
+    elif args.calibrate:
+        calibrate(args.dataset, args.limit, args.ids, args.resume, args.workers)
     else:
-        main(args.dataset, args.limit, args.ids, args.resume, args.workers)
+        main(args.dataset, args.limit, args.ids, args.resume, args.workers, args.scoreable)

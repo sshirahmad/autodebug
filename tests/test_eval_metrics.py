@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from eval.run_eval import (  # noqa: E402
     bisect_signals, compute_metrics, validate_fix, _source_files, _HARNESS_ERROR_RE,
-    load_partial, _normalize_test_command, compare_runs,
+    load_partial, _normalize_test_command, compare_runs, calibrate_instance,
 )
 
 
@@ -22,6 +22,13 @@ class TestNormalizeTestCommand:
     def test_pytest_command_is_unchanged(self):
         cmd = "pytest tests/test_x.py::test_y"
         assert _normalize_test_command(cmd) == cmd
+
+    def test_py_dot_test_alias_rewritten_to_python_m_pytest(self):
+        # Modern pytest drops the `py.test` console entry point -> `command not found`
+        # (broke all 10 spacy instances). Rewrite to the entry-point-invariant form.
+        assert _normalize_test_command("py.test spacy/tests/test_x.py::test_y") == \
+            "python -m pytest spacy/tests/test_x.py::test_y"
+        assert _normalize_test_command("py.test-3 a.py").startswith("python -m pytest a.py")
 
     def test_multiline_tox_each_line_normalized_and_chained(self):
         out = _normalize_test_command("tox tests/a.py::t1\ntox tests/b.py::t2")
@@ -103,6 +110,20 @@ class TestCompareRuns:
         out = " ".join(capsys.readouterr().out.split())
         assert "only in A (1): only-a" in out
         assert "only in B (1): only-b" in out
+
+
+class TestCalibrateGate:
+    """The scoreability gate short-circuits (no Docker) when an instance can't be
+    scored at all, so it's recorded as unscoreable up front."""
+
+    def test_no_test_command_is_unscoreable(self):
+        r = calibrate_instance({"id": "x-1", "repo_url": "u", "fixed_commit_id": "abc"})
+        assert r["scoreable"] is False and "test_command" in r["reason"]
+        assert r["instance_id"] == "x-1"
+
+    def test_no_fixed_commit_is_unscoreable(self):
+        r = calibrate_instance({"id": "x-1", "repo_url": "u", "test_command": "pytest x"})
+        assert r["scoreable"] is False and "fixed_commit" in r["reason"]
 
 
 class TestValidateFixGuards:
