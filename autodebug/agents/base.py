@@ -213,31 +213,59 @@ def budget_nudge_middleware(budget: Budget, submit_tool: str, threshold: float =
     return [_nudge]
 
 
-def session_budget_middleware(state, max_cost: float | None, max_seconds: int | None) -> list:
+def session_budget_middleware(max_cost: float | None, max_seconds: int | None,
+                              hitl: bool = False) -> list:
     """Global ceiling across an orchestrated session (manager + all sub-agents).
 
     Per-agent budgets only bound a single sub-agent run; a manager that loops
-    through REVISING can rack up many full sub-agent runs (black-1 hit ~$31).
-    This before_model hook runs on each *manager* turn and inspects the cumulative
-    `state.total_cost` (sub-agent costs are added to it as each sub-agent finishes)
-    plus wall-clock time, raising BudgetExceeded once either ceiling is crossed —
-    which stops the manager from delegating further.
-    """
-    start = time.monotonic()
+    through REVISING can rack up many full sub-agent runs (black-1 hit ~$31). This
+    before_model hook runs on each *manager* turn and inspects the cumulative spend
+    in the ``debug`` graph-state channel (each sub-agent adds its cost there) plus
+    wall-clock time.
 
-    # NB: the hook arg is the agent's graph state — deliberately *not* named
-    # `state` so it doesn't shadow the captured DebugState we're measuring.
+    Unattended (``hitl=False``): raise BudgetExceeded once a ceiling is crossed — the
+    run ends. Interactive (``hitl=True``): ``interrupt()`` with a summary instead; on
+    resume the developer's reply is injected as guidance and another budget window is
+    granted (``budget_extra`` += max_cost, clock reset) so the Manager keeps going —
+    or ``skip`` ends it. This is the "budget exhausted" HITL trigger.
+    """
+    start = [time.monotonic()]  # mutable so a HITL resume can reset the clock
+
     @before_model
-    def _check_session(_graph_state: AgentState, runtime: Runtime) -> None:
-        if max_cost is not None and state.total_cost > max_cost:
-            raise BudgetExceeded(
-                f"Session cost budget exceeded (${state.total_cost:.4f} > ${max_cost})"
-            )
-        if max_seconds is not None and (time.monotonic() - start) > max_seconds:
-            raise BudgetExceeded(
-                f"Session time budget exceeded ({time.monotonic() - start:.0f}s > {max_seconds}s)"
-            )
-        return None
+    def _check_session(graph_state: AgentState, runtime: Runtime):
+        total_cost = float((graph_state.get("debug") or {}).get("total_cost", 0.0))
+        extra = float(graph_state.get("budget_extra") or 0.0)
+        elapsed = time.monotonic() - start[0]
+        over_cost = max_cost is not None and total_cost > max_cost + extra
+        over_time = max_seconds is not None and elapsed > max_seconds
+        if not (over_cost or over_time):
+            return None
+
+        why = (f"cost ${total_cost:.2f} > ${max_cost + extra:.2f}" if over_cost
+               else f"time {elapsed:.0f}s > {max_seconds}s")
+        if not hitl:
+            raise BudgetExceeded(f"Session budget exceeded ({why})")
+
+        from langgraph.types import interrupt
+        from langchain_core.messages import HumanMessage
+
+        recap = ""
+        ds = (graph_state.get("debug") or {})
+        if ds.get("fix"):
+            recap = "a fix was produced but not verified; "
+        feedback = interrupt({
+            "type": "budget_exhausted",
+            "summary": (f"Session budget reached ({why}). {recap}Reply with guidance to "
+                        "continue with a fresh budget window, or 'skip' to stop here."),
+        })
+        fb = str(feedback or "").strip()
+        if fb.lower() == "skip":
+            raise BudgetExceeded(f"Session budget exceeded ({why}); developer chose to stop")
+        start[0] = time.monotonic()  # reset the time window
+        update = {"budget_extra": extra + (max_cost or 0.0)}
+        if fb:
+            update["messages"] = [HumanMessage(content=f"[developer guidance — follow this]: {fb}")]
+        return update
 
     return [_check_session]
 

@@ -36,3 +36,14 @@ class FixAgentState(AgentState):
 
 class ManagerAgentState(AgentState):
     outcome: Optional[dict]
+    # The whole pipeline state (DebugState.model_dump()) and the FSM phase live in
+    # the graph state so they're checkpointed per-thread. This lets the Manager run
+    # as a SERVED, resumable subgraph — its sub-agent results and phase survive an
+    # interrupt instead of living in external closures (see autodebug/tools/manager.py
+    # and autodebug/agents/manager.py). Plain dict/str to keep the checkpoint
+    # serializer happy; tools rebuild the pydantic DebugState on the way in/out.
+    debug: Optional[dict]
+    fsm_phase: Optional[str]
+    # Extra session-budget granted by a human at a budget-HITL interrupt (each resume
+    # adds another window so the Manager can keep going). 0/None until the first grant.
+    budget_extra: Optional[float]

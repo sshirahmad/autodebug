@@ -508,41 +508,52 @@ class TestReviseRefinement:
 class TestSessionBudgetMiddleware:
     """Global ceiling across the whole orchestrated session (manager + sub-agents)."""
 
-    def _hook(self, state, max_cost=None, max_seconds=None):
+    def _hook(self, max_cost=None, max_seconds=None):
         from autodebug.agents.base import session_budget_middleware
-        return session_budget_middleware(state, max_cost, max_seconds)[0]
+        return session_budget_middleware(max_cost, max_seconds)[0]
+
+    def _state(self, cost):
+        # cumulative session cost lives in the checkpointed `debug` channel.
+        return {"messages": [], "debug": {"total_cost": cost}}
 
     def test_passes_under_cost_cap(self):
-        from autodebug.state import DebugState
-        st = DebugState(repo_url="u", bug_report="b")
-        st.total_cost = 5.0
-        assert self._hook(st, max_cost=8.0).before_model(state={"messages": []}, runtime=None) is None
+        assert self._hook(max_cost=8.0).before_model(state=self._state(5.0), runtime=None) is None
 
     def test_raises_over_cost_cap(self):
         from autodebug.agents.base import BudgetExceeded
-        from autodebug.state import DebugState
-        st = DebugState(repo_url="u", bug_report="b")
-        st.total_cost = 9.5
-        with pytest.raises(BudgetExceeded, match="Session cost budget"):
-            self._hook(st, max_cost=8.0).before_model(state={"messages": []}, runtime=None)
+        with pytest.raises(BudgetExceeded, match="Session budget exceeded"):
+            self._hook(max_cost=8.0).before_model(state=self._state(9.5), runtime=None)
 
     def test_no_caps_never_raises(self):
-        from autodebug.state import DebugState
-        st = DebugState(repo_url="u", bug_report="b")
-        st.total_cost = 9999
-        assert self._hook(st).before_model(state={"messages": []}, runtime=None) is None
+        assert self._hook().before_model(state=self._state(9999), runtime=None) is None
 
     def test_cap_reads_cumulative_state_cost_live(self):
-        # The hook closes over the DebugState, so later sub-agent spend is seen.
+        # Cost is read from the graph state each turn, so later sub-agent spend
+        # (written to debug.total_cost) is seen.
         from autodebug.agents.base import BudgetExceeded
-        from autodebug.state import DebugState
-        st = DebugState(repo_url="u", bug_report="b")
-        hook = self._hook(st, max_cost=2.0)
-        st.total_cost = 1.0
-        assert hook.before_model(state={"messages": []}, runtime=None) is None
-        st.total_cost = 2.5  # a sub-agent finished and pushed cost over the cap
+        hook = self._hook(max_cost=2.0)
+        assert hook.before_model(state=self._state(1.0), runtime=None) is None
         with pytest.raises(BudgetExceeded):
-            hook.before_model(state={"messages": []}, runtime=None)
+            hook.before_model(state=self._state(2.5), runtime=None)  # sub-agent pushed over cap
+
+    def test_hitl_mode_interrupts_and_grants_fresh_window(self, monkeypatch):
+        # Interactive: over-budget -> interrupt (not raise); resume grants another
+        # window (budget_extra += max_cost) and injects the developer's guidance.
+        import langgraph.types as lt
+        from autodebug.agents.base import session_budget_middleware
+        monkeypatch.setattr(lt, "interrupt", lambda payload: "look at the parser")
+        hook = session_budget_middleware(2.0, None, hitl=True)[0]
+        out = hook.before_model(state=self._state(2.5), runtime=None)
+        assert out["budget_extra"] == 2.0                       # +max_cost granted
+        assert "look at the parser" in out["messages"][0].content
+
+    def test_hitl_skip_stops(self, monkeypatch):
+        import langgraph.types as lt
+        from autodebug.agents.base import session_budget_middleware, BudgetExceeded
+        monkeypatch.setattr(lt, "interrupt", lambda payload: "skip")
+        hook = session_budget_middleware(2.0, None, hitl=True)[0]
+        with pytest.raises(BudgetExceeded):
+            hook.before_model(state=self._state(2.5), runtime=None)
 
 
 class TestSubmissionMiddleware:

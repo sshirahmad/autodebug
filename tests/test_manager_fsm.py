@@ -108,7 +108,7 @@ class TestToolEnforcement:
         from types import SimpleNamespace
         from langchain_core.messages import ToolMessage
 
-        mw = fsm_tool_enforce(fsm, MANAGER_ALLOWED_TOOLS)
+        mw = fsm_tool_enforce(MANAGER_ALLOWED_TOOLS)
         ran = {"n": 0}
 
         def handler(req):
@@ -116,8 +116,9 @@ class TestToolEnforcement:
             return ToolMessage(content="EXECUTED", tool_call_id=req.tool_call["id"],
                                name=req.tool_call["name"])
 
+        # phase now lives in the graph state, not a closure FSM.
         req = SimpleNamespace(tool_call={"name": name, "id": "x"}, tool=None,
-                              state={}, runtime=None)
+                              state={"fsm_phase": fsm.phase.value}, runtime=None)
         return mw.wrap_tool_call(req, handler), ran["n"]
 
     def test_blocks_disallowed_tool_without_running_it(self):
@@ -199,128 +200,171 @@ def _import_manager_tools():
 
 
 class TestManagerTools:
+    """The pure `_*_step` functions hold the transition logic: they mutate the
+    DebugState via the (stubbed) driver and return (new_phase | None, signal). The
+    `@tool` wrappers are thin InjectedState adapters, exercised separately."""
+
     def test_repro_confirmed_advances_to_reproduced(self, fake_agents, state):
         m = _import_manager_tools()
-        fsm = FSM()
         fake_agents.run_repro = lambda s, *, registry=None: setattr(
             s, "repro", ReproResult(repro_script="x", error_output="boom", confirmed=True)
         )
-        tool = m.make_run_repro_agent_tool(state=state, registry=None, fsm=fsm)
-        out = tool.invoke({})
-        assert fsm.phase == ManagerPhase.REPRODUCED
-        assert "REPRO CONFIRMED" in out and "boom" in out
+        new_phase, signal = m._repro_step(state, ManagerPhase.INIT.value, None)
+        assert new_phase == ManagerPhase.REPRODUCED
+        assert "REPRO CONFIRMED" in signal and "boom" in signal
 
     def test_repro_failure_stays_and_signals(self, fake_agents, state):
         m = _import_manager_tools()
-        fsm = FSM()
         fake_agents.run_repro = lambda s, *, registry=None: None
-        tool = m.make_run_repro_agent_tool(state=state, registry=None, fsm=fsm)
-        out = tool.invoke({})
-        assert fsm.phase == ManagerPhase.INIT
-        assert "REPRO FAILED" in out
+        new_phase, signal = m._repro_step(state, ManagerPhase.INIT.value, None)
+        assert new_phase is None  # stays in current phase
+        assert "REPRO FAILED" in signal
 
     def test_bisect_requires_repro(self, fake_agents, state):
         m = _import_manager_tools()
-        fsm = FSM(phase=ManagerPhase.REPRODUCED)
-        tool = m.make_run_bisect_agent_tool(state=state, registry=None, fsm=fsm)
-        out = tool.invoke({})  # no repro on state
-        assert "Cannot bisect" in out
-        assert fsm.phase == ManagerPhase.REPRODUCED
+        new_phase, signal = m._bisect_step(state, ManagerPhase.REPRODUCED.value, None)
+        assert "Cannot bisect" in signal and new_phase is None
 
     def test_bisect_blank_culprit_is_rejected(self, fake_agents, state):
         # A sub-agent that submits an empty SHA must NOT be treated as a real find:
-        # the culprit is cleared and the FSM stays in REPRODUCED (no advance on a
-        # bogus culprit). The signal points the manager to root_cause-without-culprit.
+        # the culprit is cleared and the FSM stays (no advance on a bogus culprit).
         m = _import_manager_tools()
-        fsm = FSM(phase=ManagerPhase.REPRODUCED)
         state.repro = ReproResult(repro_script="x", error_output="boom", confirmed=True)
         fake_agents.run_bisect = lambda s, *, registry=None: setattr(
             s, "bisect", BisectResult(culprit_commit="   ", commit_message="",
                                       commit_diff="", steps_taken=0)
         )
-        tool = m.make_run_bisect_agent_tool(state=state, registry=None, fsm=fsm)
-        out = tool.invoke({})
-        assert "INCONCLUSIVE" in out and "run_root_cause_agent" in out
-        assert fsm.phase == ManagerPhase.REPRODUCED  # did NOT advance on a blank culprit
-        assert state.bisect is None                  # cleared
+        new_phase, signal = m._bisect_step(state, ManagerPhase.REPRODUCED.value, None)
+        assert "INCONCLUSIVE" in signal and "run_root_cause_agent" in signal
+        assert new_phase is None        # did NOT advance on a blank culprit
+        assert state.bisect is None     # cleared
 
     def test_bisect_valid_culprit_advances(self, fake_agents, state):
         m = _import_manager_tools()
-        fsm = FSM(phase=ManagerPhase.REPRODUCED)
         state.repro = ReproResult(repro_script="x", error_output="boom", confirmed=True)
         fake_agents.run_bisect = lambda s, *, registry=None: setattr(
             s, "bisect", BisectResult(culprit_commit="abc123", commit_message="bad commit",
                                       commit_diff="d", steps_taken=0)
         )
-        tool = m.make_run_bisect_agent_tool(state=state, registry=None, fsm=fsm)
-        out = tool.invoke({})
-        assert fsm.phase == ManagerPhase.BISECTED
-        assert "CULPRIT FOUND: abc123" in out
+        new_phase, signal = m._bisect_step(state, ManagerPhase.REPRODUCED.value, None)
+        assert new_phase == ManagerPhase.BISECTED
+        assert "CULPRIT FOUND: abc123" in signal
 
     def test_fix_verified_advances_to_done(self, fake_agents, state):
         m = _import_manager_tools()
-        fsm = FSM(phase=ManagerPhase.ANALYZED)
         state.root_cause = RootCauseResult(summary="s", relevant_lines=[], hypothesis="h")
         fake_agents.run_fix = lambda s, *, registry=None: setattr(
             s, "fix", FixResult(patch="p", attempts=1, test_output="ok")
         )
-        tool = m.make_run_fix_agent_tool(state=state, registry=None, fsm=fsm)
-        out = tool.invoke({})
-        assert fsm.phase == ManagerPhase.DONE
-        assert "FIX VERIFIED" in out
+        new_phase, signal = m._fix_step(state, ManagerPhase.ANALYZED.value, None)
+        assert new_phase == ManagerPhase.DONE
+        assert "FIX VERIFIED" in signal
 
     def test_fix_failure_enters_revising_with_options(self, fake_agents, state):
         m = _import_manager_tools()
-        fsm = FSM(phase=ManagerPhase.ANALYZED)
         state.root_cause = RootCauseResult(summary="s", relevant_lines=[], hypothesis="h")
         fake_agents.run_fix = lambda s, *, registry=None: None  # no state.fix
-        tool = m.make_run_fix_agent_tool(state=state, registry=None, fsm=fsm)
-        out = tool.invoke({})
-        assert fsm.phase == ManagerPhase.REVISING
-        assert "FIX FAILED" in out and "run_repro_agent" in out
+        new_phase, signal = m._fix_step(state, ManagerPhase.ANALYZED.value, None)
+        assert new_phase == ManagerPhase.REVISING
+        assert "FIX FAILED" in signal and "run_repro_agent" in signal
 
     def test_re_repro_during_revising_stays_in_revising(self, fake_agents, state):
         m = _import_manager_tools()
-        fsm = FSM(phase=ManagerPhase.REVISING)
         fake_agents.run_repro = lambda s, *, registry=None: setattr(
             s, "repro", ReproResult(repro_script="x", error_output="e", confirmed=True)
         )
-        tool = m.make_run_repro_agent_tool(state=state, registry=None, fsm=fsm)
-        tool.invoke({})
-        assert fsm.phase == ManagerPhase.REVISING
+        new_phase, _ = m._repro_step(state, ManagerPhase.REVISING.value, None)
+        assert new_phase is None  # stays in REVISING
 
     def test_subagent_crash_returns_signal_not_exception(self, fake_agents, state):
         """A sub-agent raising (e.g. a transient provider error) must not abort the
-        manager — the tool catches it and returns a retryable failure signal."""
+        manager — the step catches it and returns a retryable failure signal."""
         m = _import_manager_tools()
-        fsm = FSM()
 
         def boom(s, *, registry=None):
             raise RuntimeError("provider returned error 400")
 
         fake_agents.run_repro = boom
-        tool = m.make_run_repro_agent_tool(state=state, registry=None, fsm=fsm)
-        out = tool.invoke({})  # must not raise
-        assert "crashed" in out.lower() and "provider returned error 400" in out
-        assert fsm.phase == ManagerPhase.INIT  # phase unchanged — manager can retry
+        new_phase, signal = m._repro_step(state, ManagerPhase.INIT.value, None)  # must not raise
+        assert "crashed" in signal.lower() and "provider returned error 400" in signal
+        assert new_phase is None  # phase unchanged — manager can retry
+
+    def test_tool_wrapper_injects_state_and_writes_debug(self, fake_agents, state):
+        # The @tool wrapper reads `debug`/`fsm_phase` from injected state and returns
+        # a Command that writes the updated debug + phase + signal back.
+        m = _import_manager_tools()
+        fake_agents.run_repro = lambda s, *, registry=None: setattr(
+            s, "repro", ReproResult(repro_script="x", error_output="boom", confirmed=True)
+        )
+        tool = m.make_run_repro_agent_tool(registry=None)
+        cmd = tool.invoke({"name": "run_repro_agent", "id": "c1", "type": "tool_call",
+                           "args": {"state": {"debug": state.model_dump(),
+                                              "fsm_phase": ManagerPhase.INIT.value}}})
+        assert cmd.update["fsm_phase"] == ManagerPhase.REPRODUCED.value
+        assert cmd.update["debug"]["repro"]["confirmed"] is True
+        assert "REPRO CONFIRMED" in cmd.update["messages"][0].content
 
     def test_finish_success_and_failure(self, fake_agents, state):
         m = _import_manager_tools()
 
-        def _finish(fsm, outcome, summary):
-            tool = m.make_finish_tool(state=state, fsm=fsm)
+        def _finish(outcome, summary):
+            tool = m.make_finish_tool(registry=None)
             res = tool.invoke({"name": "finish",
                                "args": {"outcome": outcome, "summary": summary},
                                "id": "c1", "type": "tool_call"})
-            return res.update["outcome"]   # the Command's outcome-channel write
+            return res.update
 
-        fsm = FSM(phase=ManagerPhase.REVISING)
-        assert _finish(fsm, "success", "done") == {"outcome": "success", "summary": "done"}
-        assert fsm.phase == ManagerPhase.DONE
+        upd = _finish("success", "done")
+        assert upd["outcome"] == {"outcome": "success", "summary": "done"}
+        assert upd["fsm_phase"] == ManagerPhase.DONE.value
 
-        fsm2 = FSM(phase=ManagerPhase.REVISING)
-        assert _finish(fsm2, "failed", "stuck")["outcome"] == "failed"
-        assert fsm2.phase == ManagerPhase.FAILED
+        upd2 = _finish("failed", "stuck")
+        assert upd2["outcome"]["outcome"] == "failed"
+        assert upd2["fsm_phase"] == ManagerPhase.FAILED.value
+
+
+class TestStageHITL:
+    """stage_hitl_middleware: pause on a blocking stage's failure, fold the human's
+    reply into the tool result. interrupt() is monkeypatched to simulate a resume."""
+
+    def _run(self, monkeypatch, tool_name, signal, resume="focus on parser.py"):
+        import langgraph.types as lt
+        from types import SimpleNamespace
+        from langchain_core.messages import ToolMessage
+        from langgraph.types import Command
+
+        monkeypatch.setattr(lt, "interrupt", lambda payload: resume)
+        from autodebug.fsm import stage_hitl_middleware
+        mw = stage_hitl_middleware()[0]
+
+        tm = ToolMessage(content=signal, tool_call_id="c1")
+
+        def handler(req):
+            return Command(update={"messages": [tm], "debug": req.state["debug"]})
+
+        st = DebugState(repo_url="u", bug_report="b",
+                        repro=ReproResult(repro_script="x", error_output="e", confirmed=True))
+        req = SimpleNamespace(tool_call={"name": tool_name, "id": "c1"}, tool=None,
+                              state={"debug": st.model_dump()}, runtime=None)
+        return mw.wrap_tool_call(req, handler)
+
+    def test_interrupts_on_fix_failure_and_folds_feedback(self, monkeypatch):
+        out = self._run(monkeypatch, "run_fix_agent", "FIX FAILED — the patch did not pass.")
+        content = out.update["messages"][0].content
+        assert "Developer guidance" in content and "focus on parser.py" in content
+
+    def test_skip_leaves_signal_unchanged(self, monkeypatch):
+        out = self._run(monkeypatch, "run_fix_agent", "FIX FAILED — nope.", resume="skip")
+        assert "Developer guidance" not in out.update["messages"][0].content
+
+    def test_success_signal_passes_through(self, monkeypatch):
+        out = self._run(monkeypatch, "run_fix_agent", "FIX VERIFIED — all good.")
+        assert out.update["messages"][0].content == "FIX VERIFIED — all good."
+
+    def test_non_blocking_tool_ignored(self, monkeypatch):
+        # bisect is optional — its INCONCLUSIVE is not a HITL trigger.
+        out = self._run(monkeypatch, "run_bisect_agent", "BISECT INCONCLUSIVE — no culprit.")
+        assert "Developer guidance" not in out.update["messages"][0].content
 
 
 # ---------------------------------------------------------------------------

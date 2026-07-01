@@ -11,12 +11,8 @@ the per-agent sandbox containers attach to the same repo state.
 
 from __future__ import annotations
 
-import os
-
 from opentelemetry import trace
 
-from autodebug.agents import run_bisect, run_fix, run_repro, run_root_cause
-from autodebug.memory import store_agent_run
 from autodebug.sandbox import (
     clone_into_volume,
     create_repo_volume,
@@ -49,78 +45,51 @@ def clone_repo(state: DebugState) -> DebugState:
 
 
 # ---------------------------------------------------------------------------
-# Pipeline
+# Pipeline (a thin, unattended wrapper over THE graph — see registry.build_graph)
 # ---------------------------------------------------------------------------
-
-_STAGES = (
-    ("repro", run_repro),
-    ("bisect", run_bisect),
-    ("root_cause", run_root_cause),
-    ("fix", run_fix),
-)
-
-
-def _resolve_stages(registry):
-    """Pick the orchestration mode.
-
-    If a `manager` agent is configured (and not disabled via AUTODEBUG_MANAGER=0),
-    run the single FSM-driven Manager agent, which delegates to the sub-agents
-    itself. Otherwise fall back to the classic linear repro->...->fix sequence.
-    """
-    manager_on = (
-        "manager" in registry.config.agents
-        and os.getenv("AUTODEBUG_MANAGER", "1") != "0"
-    )
-    if manager_on:
-        from autodebug.agents import run_manager
-        return (("manager", run_manager),)
-    return _STAGES
-
-
-def _failed(state: DebugState) -> bool:
-    # state.stage may be enum or its string value depending on coercion path.
-    return str(state.stage) in (PipelineStage.FAILED.value, str(PipelineStage.FAILED))
 
 
 def run_pipeline(repo_url: str, bug_report: str, *, run_label: str | None = None,
                  **kwargs) -> DebugState:
-    """Run the full clone → repro → bisect → root_cause → fix sequence.
+    """Run AutoDebug unattended (no HITL) and return the final DebugState.
 
-    `run_label` names the root trace span (e.g. the bug id, "ansible-1") so runs
-    are identifiable in Phoenix; it's observability-only and never reaches the
-    agents. Defaults to "autodebug.pipeline".
+    This is a thin SYNCHRONOUS wrapper over THE graph — the exact same graph Studio
+    and the CLI serve, just built with ``hitl=False`` — so eval/CLI/Studio share one
+    orchestration. `run_label` names the root trace span (e.g. "ansible-1") for
+    Phoenix; it never reaches the agents. Production inputs go in the run config; the
+    agent graph never sees test metadata (that stays in the eval scorer).
     """
     setup_tracing()
-    from autodebug.registry import AutoDebugRegistry
-    registry = AutoDebugRegistry.from_file()
+    from langchain_core.messages import HumanMessage
+    from langgraph.checkpoint.memory import MemorySaver
 
+    from autodebug.registry import AutoDebugRegistry
+
+    graph = AutoDebugRegistry.from_file().build_graph(hitl=False, checkpointer=MemorySaver())
+    config = {"configurable": {
+        "thread_id": run_label or "autodebug",
+        "repo_url": repo_url, "bug_report": bug_report,
+        "ref": kwargs.get("ref"),
+        "known_good": kwargs.get("known_good_commit"),
+        "issue_url": kwargs.get("github_issue_url"),
+        "requirements": kwargs.get("requirements"),
+        "setup_command": kwargs.get("setup_command"),
+        "python_version": kwargs.get("python_version"),
+    }}
+    state = DebugState(repo_url=repo_url, bug_report=bug_report, **kwargs)
     with _tracer.start_as_current_span(run_label or "autodebug.pipeline") as span:
         span.set_attribute("repo_url", repo_url)
         span.set_attribute("bug_report", bug_report[:500])
         if run_label:
             span.set_attribute("instance_id", run_label)
-
-        state = DebugState(repo_url=repo_url, bug_report=bug_report, **kwargs)
         try:
-            state = clone_repo(state)
-
-            for name, runner in _resolve_stages(registry):
-                if _failed(state):
-                    break
-                with _tracer.start_as_current_span(f"autodebug.{name}"):
-                    state = runner(state, registry=registry)
-                # Always accumulate memories (best-effort, never raises). Whether
-                # agents RECALL them is gated separately by AUTODEBUG_MEMORY_ENABLED
-                # (see make_search_memory_tool), so the corpus grows even when recall
-                # is off for a clean/reproducible baseline.
-                store_agent_run(name, state)
-
+            final = graph.invoke({"messages": [HumanMessage(content=bug_report)]}, config=config)
+            debug = (final or {}).get("debug")
+            if debug:
+                state = DebugState(**debug)
             span.set_attribute("final_stage", str(state.stage))
             return state
         except Exception as e:  # noqa: BLE001 — surface as a FAILED state, don't crash
-            # Infra/transient failures (e.g. Docker not running, an unhandled
-            # provider error) should produce a clean FAILED result, not abort the
-            # caller. Record the span error for observability, then return state.
             span.record_exception(e)
             state.stage = PipelineStage.FAILED
             state.error = state.error or f"Pipeline: {type(e).__name__}: {str(e)[:300]}"

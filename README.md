@@ -86,36 +86,39 @@ autodebug debug https://github.com/psf/black \
   --good <known-good-commit-or-date>     # optional, helps bisect
 ```
 
-Pass `--stream` to watch progress live instead of waiting in silence — and to be
-prompted for guidance if the run gets stuck (human-in-the-loop, see below). Add
-`--tokens` to also stream the sub-agents' LLM output token-by-token:
+It streams progress live and **pauses to ask you when it gets stuck** — a stage
+exhausts its retries, or the session budget runs out (human-in-the-loop). Pass
+`--unattended` to disable the prompts (for CI/batch); it then runs to completion and
+reports the result.
 
 ```bash
-autodebug debug https://github.com/psf/black --bug "..." --stream
-autodebug debug https://github.com/psf/black --bug "..." --tokens   # live token stream
+autodebug debug https://github.com/psf/black --bug "..."               # interactive (HITL)
+autodebug debug https://github.com/psf/black --bug "..." --unattended  # no prompts (CI)
 ```
 
-Or from Python:
+Or from Python — **one graph** drives every entry point (CLI, Studio, eval):
 
 ```python
-from autodebug.graph import run_pipeline
+from autodebug.registry import AutoDebugRegistry
 
-state = run_pipeline(
-    repo_url="https://github.com/psf/black",
-    bug_report="black crashes in AWS Lambda ...",
-    known_good_commit=None,   # optional
+# unattended (no HITL); same graph Studio serves, just hitl=False
+graph = AutoDebugRegistry.from_file().build_graph(hitl=False)
+final = graph.invoke(
+    {"messages": [{"role": "user", "content": "black crashes in AWS Lambda ..."}]},
+    config={"configurable": {"thread_id": "demo", "repo_url": "https://github.com/psf/black"}},
 )
-print(state.stage, state.fix and state.fix.patch)
+print(final["debug"]["stage"], final["debug"].get("fix"))
 ```
 
 ---
 
 ## Interactive serving (Agent Chat UI + human-in-the-loop)
 
-The blocking CLI runs a bug to completion in silence. For an interactive workflow —
-live progress, a chat UI, and the ability to step in when the agent gets stuck —
-AutoDebug also ships as a **compiled LangGraph graph** ([autodebug/graph/interactive.py](autodebug/graph/interactive.py))
-with a `messages` channel and a human-in-the-loop (HITL) review step.
+There is **one graph** — `AutoDebugRegistry.build_graph(hitl=…)`
+([registry.py](autodebug/registry.py) → [graph/interactive.py](autodebug/graph/interactive.py)) —
+and **every** entry point runs it: the CLI, the eval harness, and the LangGraph dev
+server below. The only difference is the `hitl` toggle (interactive vs unattended).
+To serve it for a chat UI:
 
 ```bash
 # Install the serving extra (the LangGraph dev server)
@@ -138,26 +141,29 @@ and interrupts work. Two ways to use it — **no custom backend needed**:
   `autodebug`. (It has no config panel, so the run target must come from Studio or be
   parsed from the first message.)
 
-**Streaming granularity.** The chat shows **milestone** messages (one per stage + the
-failure/summary). For a **live token stream** of the sub-agents, set
-`AUTODEBUG_STREAM_TOKENS=1` (or the CLI `--tokens` flag). Tokens are forwarded from
-every sub-agent's model through the graph stream as LangGraph `custom` events
-(`{"token": …}`) / inline CLI output. It's gated because the default and the eval
-harness want clean, non-streaming behavior; the toggle uses a contextvar (not a
-global), so a server can stream per-run without a race.
+**Architecture.** The graph is `prepare → clone → manager`, where `manager` is the
+Manager `create_agent` graph compiled **as a subgraph node** that shares the parent's
+checkpointer. The Manager's pipeline state + FSM phase live in the checkpointed `debug` /
+`fsm_phase` channels, so the agent is **resumable** and its `interrupt()`s bubble natively
+to the stream (Studio renders them). The one factory, `registry.build_graph(hitl=…)`,
+builds this for everyone; `hitl=False` (eval/`--unattended`) just omits the HITL middleware.
 
-**Human-in-the-loop.** When a run exhausts its retries or is about to fail, the
-graph's `human_review` node `interrupt()`s with a summary of what was tried and
-why it failed, instead of silently returning a failure. Clients stream the run,
-detect the `__interrupt__`, and resume with `Command(resume=<feedback>)` (Studio /
-Agent Chat UI render this automatically; the CLI `--stream` prompts at the terminal).
-The feedback is threaded into the next attempt's prompt, so the retry is **steered**,
-not a blind replay. Each sub-agent keeps its own checkpointer threads (so
-already-paid-for repro/bisect/root-cause are served from cache); only the top graph
-interrupts.
+**Human-in-the-loop — two triggers, native.** With `hitl=True`:
+1. **Stage stuck** — a blocking stage (repro/root_cause/fix) exhausts its retries →
+   `interrupt()` with a summary *before* the Manager autonomously revises
+   (`stage_hitl_middleware`, [fsm.py](autodebug/fsm.py)).
+2. **Budget exhausted** — when the session cost/time cap is hit, `interrupt()` instead of
+   ending; on resume you grant a fresh budget window + guidance, or `skip` to stop
+   (`session_budget_middleware`'s hitl mode, [base.py](autodebug/agents/base.py)).
 
-> The non-interactive `run_pipeline` and the eval harness are unchanged — the graph
-> is an additive surface that reuses the same stage runners.
+Either way you reply with `Command(resume=<guidance>)` (or at the CLI prompt) and the
+Manager **continues the same conversation** — true mid-conversation resume, guidance
+folded in. With `hitl=False` (eval/CI) a stage failure records the failure and budget
+exhaustion ends the run — it never blocks on input that won't come.
+
+> The eval harness runs the **same graph** with `hitl=False` (via `run_pipeline`) and
+> scores the result with the held-out test in a **separate** sandbox — so the agent graph
+> never sees test metadata (production fidelity preserved).
 
 ---
 
