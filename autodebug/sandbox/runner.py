@@ -22,6 +22,7 @@ import os
 import shlex
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
 import docker
 from docker.errors import ImageNotFound, NotFound
@@ -49,6 +50,24 @@ _PYTHONPATH = ":".join(_SRC_ROOTS)
 _CONDA_ENV = "/workspace/env"
 _CONDA_PKGS_VOLUME = "autodebug-conda-pkgs"
 _CONDA_ROOT = "/opt/mamba"
+
+# Compiler shim dir + script. Old C-extension packages (pandas 1.0, matplotlib) hardcode
+# `-Werror` in their setup.py; the sandbox image ships a *modern* gcc (15.x) that emits
+# warnings the 2020-era code never saw, so a single new warning aborts the whole build
+# (observed: pandas `tslibs.parsing` failed to compile -> .so missing -> `import pandas`
+# fails -> every pandas bug scored harness_invalid). Rather than patch each package, we
+# put a wrapper earlier on PATH that strips `-Werror*` and execs the REAL compiler (found
+# by removing the shim dir from PATH). Generic across packages and warning types. The
+# script is $-laden, so it's base64'd into the container to dodge shell-quoting hell.
+_CC_SHIM_DIR = "/tmp/ccshim"
+_CC_SHIM = (
+    "#!/bin/sh\n"
+    'self=$(basename "$0")\n'
+    f'real=$(PATH=$(echo "$PATH" | sed "s#{_CC_SHIM_DIR}:##g") command -v "$self")\n'
+    "args=\n"
+    'for a in "$@"; do case "$a" in -Werror|-Werror=*) ;; *) args="$args $a";; esac; done\n'
+    'exec "$real" $args\n'
+)
 
 
 def _default_python() -> str:
@@ -79,9 +98,11 @@ def _pytest_env() -> dict:
     So we also CLEAR the ini addopts with ``-o addopts=`` (verified: this drops the
     inherited ``-n``/``--timeout``/``--cov`` …). None of those affect a single
     test's pass/fail, so the gold test runs plain — no plugin, no plugin-args."""
-    # `-o addopts=` neutralizes the repo's pytest.ini addopts; `-p <name>` re-enables
-    # any explicitly allow-listed plugin (async projects).
-    addopts = ["-o", "addopts="]
+    # `-o addopts=` neutralizes the repo's pytest.ini addopts; `-o filterwarnings=`
+    # clears a `filterwarnings = error` ini that would otherwise turn a benign import
+    # warning (e.g. matplotlib's distutils LooseVersion DeprecationWarning) into a
+    # fatal collection error; `-p <name>` re-enables an allow-listed plugin.
+    addopts = ["-o", "addopts=", "-o", "filterwarnings="]
     for p in (p.strip() for p in os.getenv("AUTODEBUG_PYTEST_PLUGINS", "").split(",")):
         if p:
             addopts += ["-p", p]
@@ -309,10 +330,21 @@ def _sanitize_requirements(reqs: str) -> str:
 
     Drops the self-editable install (the repo is already checked out and on
     PYTHONPATH) and `pkg-resources==0.0.0` (a Debian artifact that breaks pip).
+
+    Also NORMALIZES ENCODING: several BugsInPy freezes were captured as UTF-16 and
+    landed in the dataset mojibake'd — a NUL byte (U+0000) between every character
+    and a replacement-char BOM (U+FFFD U+FFFD) at the start. Fed straight to the
+    per-line `pip install "$req"` loop, those NUL-laden specs install unreliably:
+    e.g. scrapy got `attrs==19.3.0` but NOT `Twisted==20.3.0`, leaving a modern
+    Twisted from `pip -e .` that calls `attr.s(unsafe_hash=…)` against the old attrs
+    -> `TypeError: unsafe_hash` -> scrapy won't import -> all 34 scrapy bugs scored
+    harness_invalid. Stripping the NULs + U+FFFD recovers clean ASCII pins.
     """
     out = []
     for line in (reqs or "").splitlines():
-        s = line.strip()
+        # Drop NUL bytes, the mangled UTF-16 BOM (U+FFFD), and any other non-printable
+        # mojibake; pip specs are pure ASCII, so keep only printable ASCII per line.
+        s = "".join(c for c in line if "\x20" <= c <= "\x7e").strip()
         if not s or s.startswith("#") or s.startswith("-e ") or s.startswith("-e git+"):
             continue
         if s.lower().startswith("pkg-resources==0.0.0"):
@@ -361,6 +393,21 @@ def clone_into_volume(
         f" && micromamba create -y -p {_CONDA_ENV} -c conda-forge "
         f"python={shlex.quote(python_version or _default_python())} pip"
     )
+
+    # Install the -Werror-stripping compiler shim and put it FIRST on PATH, so every
+    # later compile (the editable `pip -e .` build AND the explicit build_ext) uses it.
+    # `export` persists across this single `bash -c` chain.
+    enc_shim = base64.b64encode(_CC_SHIM.encode("utf-8")).decode("ascii")
+    cmd += (
+        f" && ( mkdir -p {_CC_SHIM_DIR} "
+        f"&& echo {enc_shim} | base64 -d > {_CC_SHIM_DIR}/_wrap "
+        f"&& chmod +x {_CC_SHIM_DIR}/_wrap "
+        f"&& for c in cc gcc g++ c++ x86_64-conda-linux-gnu-cc x86_64-conda-linux-gnu-c++ "
+        f"x86_64-conda-linux-gnu-gcc x86_64-conda-linux-gnu-g++; do "
+        f"ln -sf {_CC_SHIM_DIR}/_wrap {_CC_SHIM_DIR}/$c; done )"
+        f" && export PATH={_CC_SHIM_DIR}:$PATH"
+    )
+
     pip = f"{_CONDA_ENV}/bin/pip install"
 
     # Install everything INTO the env (not a --target dir): the env python is what
@@ -375,8 +422,17 @@ def clone_into_volume(
             f" && cd {shlex.quote(REPO_DIR)} && ( "
             # 1) the checkout's own RUNTIME deps (older checkouts need older deps —
             #    e.g. old black imports `regex`). The env's Python version matches the
-            #    bug, so pip finds matching wheels.
-            f"(timeout 600 {pip} . "
+            #    bug, so pip finds matching wheels. EDITABLE first (`-e .`): for
+            #    C/Cython projects (pandas, matplotlib) it reads pyproject's
+            #    build-system.requires (Cython, numpy) into an isolated build env and
+            #    compiles the extensions IN-PLACE in the source tree — which is where
+            #    the PYTHONPATH-shadowed source is imported from. Falls back to a plain
+            #    install, then requirements, so pure-Python checkouts are unaffected.
+            #    Heavy C/Cython projects (pandas) compile many modules single-threaded,
+            #    so the editable build gets a generous, configurable timeout
+            #    (SANDBOX_BUILD_TIMEOUT, default 1800s); too short = "C extension not built".
+            f"(timeout ${{SANDBOX_BUILD_TIMEOUT:-1800}} {pip} -e . "
+            f"|| timeout 600 {pip} . "
             f"|| timeout 300 {pip} -r requirements.txt || true) ; "
             # 2) TEST/dev extras on top (the official test often imports test-only
             #    deps: pytest plugins, hypothesis, aiohttp for black's blackd, ...).
@@ -420,6 +476,43 @@ def clone_into_volume(
         )
         if setup_command and setup_command.strip():
             cmd += f" && ( cd {shlex.quote(REPO_DIR)} && ({setup_command}) || true )"
+        # Build C/Cython extensions IN-PLACE. C-extension projects (matplotlib's
+        # ft2font, pandas' Cython modules, …) are imported from the checked-out source
+        # on PYTHONPATH, which SHADOWS the pip-installed copy — so their compiled .so
+        # files must live in the source tree or `import` fails ("cannot import name
+        # 'ft2font'" / "C extension … not built").
+        #
+        # Primary: editable install WITHOUT build isolation. The earlier `pip install
+        # -e .` runs build isolation, which sets up an *isolated* env from pyproject's
+        # build-requires — and for pandas/matplotlib that step FAILS ("Installing build
+        # dependencies: error"). But the real build deps (Cython, numpy) are already in
+        # the env by now (from the pinned/dev requirements), so --no-build-isolation
+        # uses them and compiles the extensions in-place. No-op-ish for pure-Python.
+        bt = "${SANDBOX_BUILD_TIMEOUT:-1800}"
+        cmd += (
+            f" && ( cd {shlex.quote(REPO_DIR)} && "
+            f"timeout {bt} {pip} -e . --no-build-isolation || true )"
+        )
+        # In-place build via the LEGACY path (`setup.py build_ext`), which avoids the
+        # PEP 660 editable-metadata step that modern setuptools botches on old setup.py
+        # (pandas 1.0). Cython/numpy are present by now.
+        #
+        # TWO passes, because completeness matters more than speed:
+        #   1. PARALLEL (`--force -j $(nproc)`) — fast full rebuild. pandas has 50+
+        #      Cython extensions; a serial -O3 compile blew the timeout and got
+        #      SIGTERM-killed half-done. BUT the parallel builder is racy: it can drop a
+        #      single straggler's LINK step (observed: 40/41 .so built, only
+        #      `tslibs.parsing` missing) -> `import pandas` still fails -> harness_invalid.
+        #   2. SERIAL mop-up (`--inplace`, NO --force, NO -j) — idempotent: rebuilds only
+        #      extensions whose .so is missing/stale, i.e. exactly the dropped straggler.
+        #      Deterministically completes the build regardless of which one pass 1 lost.
+        # NOT silenced so AUTODEBUG_DEBUG_BUILD can show a real failure.
+        cmd += (
+            f" && ( cd {shlex.quote(REPO_DIR)} && [ -f setup.py ] && "
+            f"timeout {bt} {py} setup.py build_ext --inplace --force "
+            f'-j "$(nproc)" ; '
+            f"timeout {bt} {py} setup.py build_ext --inplace || true )"
+        )
     # Clear any compiled bytecode so the agents always execute the live source
     # (a stale .pyc would mask their patches).
     cmd += (
@@ -434,14 +527,26 @@ def clone_into_volume(
             f"echo {encoded} | base64 -d | git apply --whitespace=nowarn -"
         )
     elif fixed_commit:
-        pathspecs = " ".join(shlex.quote(p) for p in _TEST_PATHSPECS)
+        # Bring the OFFICIAL test files to their FIXED-commit version, so the
+        # FAIL_TO_PASS test the bug fix *added* actually exists at the buggy checkout.
+        #
+        # We must use the EXACT changed-test paths: `git checkout <commit> -- '*/tests/'`
+        # silently matches NOTHING (git checkout doesn't expand wildcard directory
+        # pathspecs — verified), so nested layouts (lib/<pkg>/tests/…) never synced and
+        # every such fix scored "not found" (this hid ALL matplotlib fixes AND made the
+        # buggy baseline a false-positive). So: diff buggy↔fixed, filter to test paths,
+        # and checkout each exact path from the fixed commit (exact paths always work).
+        test_re = r"(^|/)(test|tests)/|(^|/)test_[^/]*\.py$|_test\.py$|(^|/)conftest\.py$"
         cmd += (
-            f" && cd {shlex.quote(REPO_DIR)} && "
-            f"git diff HEAD {shlex.quote(fixed_commit)} -- {pathspecs} "
-            f"| git apply --whitespace=nowarn - || true"
+            f" && cd {shlex.quote(REPO_DIR)} && ( "
+            f"git diff --name-only HEAD {shlex.quote(fixed_commit)} "
+            f"| grep -E {shlex.quote(test_re)} "
+            f"| while IFS= read -r f; do "
+            f"git checkout {shlex.quote(fixed_commit)} -- \"$f\" 2>/dev/null || true; "
+            f"done ; true )"
         )
 
-    client.containers.run(
+    out = client.containers.run(
         image=image,
         command=["bash", "-c", cmd],
         # Share the conda package cache across bugs (a named volume) so each Python
@@ -452,5 +557,26 @@ def clone_into_volume(
             _CONDA_PKGS_VOLUME: {"bind": _CONDA_ROOT, "mode": "rw"},
         },
         environment={"MAMBA_ROOT_PREFIX": _CONDA_ROOT},
+        # Capture stderr too: compiler errors (gcc/Cython) go to stderr, so without this
+        # a failing build shows only the echoed command and then silence — the actual
+        # error (e.g. a -Werror warning) is invisible. We need it for AUTODEBUG_DEBUG_BUILD.
+        stdout=True,
+        stderr=True,
         remove=True,
     )
+    # The clone container builds the env (pip installs + C-extension compile). That
+    # output is normally discarded; set AUTODEBUG_DEBUG_BUILD=1 to capture it so a
+    # failing build (e.g. "pandas C extension not built") can be diagnosed instead of
+    # guessed at. Written to a FILE (and echoed to stderr). Best-effort — never let
+    # logging break the clone.
+    if os.getenv("AUTODEBUG_DEBUG_BUILD") == "1":
+        try:
+            import sys
+            log = out.decode("utf-8", "replace") if isinstance(out, (bytes, bytearray)) else str(out or "")
+            log_dir = Path(os.getenv("AUTODEBUG_BUILD_LOG_DIR", "build_logs"))
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / f"{volume}.log"
+            log_path.write_text(log, encoding="utf-8")
+            sys.stderr.write(f"\n[build log written to {log_path.resolve()}]\n")
+        except Exception:
+            pass

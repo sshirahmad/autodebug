@@ -15,6 +15,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         build-essential \
+        pkg-config \
         ca-certificates \
         curl \
         bzip2 \
@@ -23,6 +24,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxml2-dev \
         libxslt1-dev \
         zlib1g-dev \
+        # C-extension build deps: matplotlib's ft2font needs FreeType, _png needs
+        # libpng; pkg-config (above) lets their setup.py find both.
+        libfreetype6-dev \
+        libpng-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # micromamba: a single static binary. Envs are created by explicit prefix
