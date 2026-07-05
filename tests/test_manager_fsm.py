@@ -145,6 +145,40 @@ class TestToolEnforcement:
         }
 
 
+class TestAsyncMiddleware:
+    """The FSM wrap_* middlewares must implement the ASYNC hooks too: Studio / Agent
+    Chat UI drive the graph with ainvoke/astream, and langchain does NOT auto-derive
+    awrap_model_call/awrap_tool_call from the sync version — it raises
+    NotImplementedError by default (this took down Studio: 'Asynchronous implementation
+    of awrap_model_call is not available')."""
+
+    def test_all_fsm_wrap_middlewares_override_async_hooks(self):
+        from langchain.agents.middleware import AgentMiddleware
+        from autodebug.fsm import fsm_tool_gate, fsm_tool_enforce, stage_hitl_middleware
+
+        gate = fsm_tool_gate(MANAGER_ALLOWED_TOOLS)
+        enforce = fsm_tool_enforce(MANAGER_ALLOWED_TOOLS)
+        hitl = stage_hitl_middleware()[0]
+        assert type(gate).awrap_model_call is not AgentMiddleware.awrap_model_call
+        assert type(enforce).awrap_tool_call is not AgentMiddleware.awrap_tool_call
+        assert type(hitl).awrap_tool_call is not AgentMiddleware.awrap_tool_call
+
+    async def test_gate_awrap_model_call_filters_and_delegates(self):
+        # The async hook mirrors the sync one: filter tools for the phase, then await.
+        from types import SimpleNamespace
+
+        from autodebug.fsm import fsm_tool_gate
+        mw = fsm_tool_gate(MANAGER_ALLOWED_TOOLS)
+        req = SimpleNamespace(state={"fsm_phase": ManagerPhase.INIT.value},
+                              tools=[_FakeTool(n) for n in ("run_repro_agent", "run_fix_agent", "finish")])
+
+        async def handler(r):
+            return {"tools_seen": {t.name for t in r.tools}}
+
+        out = await mw.awrap_model_call(req, handler)
+        assert out["tools_seen"] == {"run_repro_agent", "finish"}  # INIT gate applied
+
+
 class TestPromptSelection:
     def test_picks_prompt_for_phase(self):
         prompts = {p.value: f"prompt for {p.value}" for p in ManagerPhase}

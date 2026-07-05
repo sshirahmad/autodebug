@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
-from langchain.agents.middleware import dynamic_prompt, wrap_model_call, wrap_tool_call
+from langchain.agents.middleware import AgentMiddleware, dynamic_prompt
 
 
 class ManagerPhase(str, Enum):
@@ -168,19 +168,33 @@ def fsm_prompt(prompts: dict, progress_fn=None):
     return _prompt
 
 
-def fsm_tool_gate(allowed: dict):
+class _FsmToolGate(AgentMiddleware):
     """`wrap_model_call` middleware: expose only the tools allowed in this phase.
 
     The tools stay registered with the agent — this only controls what the model
-    is offered on a given turn, which is how we steer the FSM.
-    """
+    is offered on a given turn, which is how we steer the FSM. Both sync and async
+    hooks are implemented: eval drives the graph with ``invoke`` but Studio / Agent
+    Chat UI use ``ainvoke``/``astream``, and the async hook is NOT auto-derived from
+    the sync one (it raises NotImplementedError by default)."""
 
-    @wrap_model_call
-    def _gate(request, handler):
-        request.tools = filter_tools(_phase_from_state(request.state), request.tools, allowed)
+    def __init__(self, allowed: dict):
+        super().__init__()
+        self._allowed = allowed
+
+    def _gate(self, request) -> None:
+        request.tools = filter_tools(_phase_from_state(request.state), request.tools, self._allowed)
+
+    def wrap_model_call(self, request, handler):
+        self._gate(request)
         return handler(request)
 
-    return _gate
+    async def awrap_model_call(self, request, handler):
+        self._gate(request)
+        return await handler(request)
+
+
+def fsm_tool_gate(allowed: dict):
+    return _FsmToolGate(allowed)
 
 
 def fsm_tool_enforce(allowed: dict):
@@ -195,12 +209,22 @@ def fsm_tool_enforce(allowed: dict):
     permitted tool — and because we return a real ToolMessage, the conversation
     stays valid (no dangling tool_use).
     """
-    from langchain_core.messages import ToolMessage
+    return _FsmToolEnforce(allowed)
 
-    @wrap_tool_call
-    def _enforce(request, handler):
+
+class _FsmToolEnforce(AgentMiddleware):
+    """`wrap_tool_call` gate enforcement (sync + async — see _FsmToolGate note)."""
+
+    def __init__(self, allowed: dict):
+        super().__init__()
+        self._allowed = allowed
+
+    def _blocked(self, request):
+        """Return an error ToolMessage if this tool isn't allowed now, else None."""
+        from langchain_core.messages import ToolMessage
+
         fsm = _phase_from_state(request.state)
-        names = allowed_tool_names(fsm, allowed)
+        names = allowed_tool_names(fsm, self._allowed)
         if names is not None:
             tool_name = _tool_call_field(request.tool_call, "name")
             if tool_name not in names:
@@ -214,9 +238,15 @@ def fsm_tool_enforce(allowed: dict):
                     name=tool_name,
                     status="error",
                 )
-        return handler(request)
+        return None
 
-    return _enforce
+    def wrap_tool_call(self, request, handler):
+        blocked = self._blocked(request)
+        return blocked if blocked is not None else handler(request)
+
+    async def awrap_tool_call(self, request, handler):
+        blocked = self._blocked(request)
+        return blocked if blocked is not None else await handler(request)
 
 
 # Blocking stages whose retry-exhaustion should pause for a human (NOT optional bisect).
@@ -247,17 +277,25 @@ def stage_hitl_middleware(stages: tuple[str, ...] = _HITL_STAGES):
     stage failure never blocks on input that won't come. Because the Manager runs as a
     subgraph node, the interrupt bubbles to the served stream (Studio / Agent Chat UI).
     """
-    from langgraph.types import Command, interrupt
+    return [_StageHitl(stages)]
 
-    from autodebug.state import DebugState
 
-    blocking = set(stages)
+class _StageHitl(AgentMiddleware):
+    """`wrap_tool_call` HITL pause on stage failure (sync + async — see _FsmToolGate
+    note). The post-handler processing is identical for both; only the ``handler``
+    await differs, so the logic lives in ``_process``."""
 
-    @wrap_tool_call
-    def _hitl(request, handler):
-        result = handler(request)
+    def __init__(self, stages: tuple[str, ...]):
+        super().__init__()
+        self._blocking = set(stages)
+
+    def _process(self, request, result):
+        from langgraph.types import Command, interrupt
+
+        from autodebug.state import DebugState
+
         name = _tool_call_field(request.tool_call, "name")
-        if name not in blocking or not isinstance(result, Command):
+        if name not in self._blocking or not isinstance(result, Command):
             return result
         msgs = (result.update or {}).get("messages") if isinstance(result.update, dict) else None
         tm = msgs[0] if msgs else None
@@ -278,4 +316,8 @@ def stage_hitl_middleware(stages: tuple[str, ...] = _HITL_STAGES):
             tm.content = f"{signal}\n\n[Developer guidance — follow this]: {fb}"
         return result
 
-    return [_hitl]
+    def wrap_tool_call(self, request, handler):
+        return self._process(request, handler(request))
+
+    async def awrap_tool_call(self, request, handler):
+        return self._process(request, await handler(request))
