@@ -337,18 +337,27 @@ def summarization_middleware(
     ]
 
 
+# Max consecutive text-only (no tool call) model responses before we stop nudging
+# and end the run — bounds the retry when the model can't/won't call a tool.
+_MAX_NO_TOOL_RETRIES = 5
+
+
 def require_tool_calls_middleware() -> list:
     """Reject text-only AI responses and force the model to retry with a tool call.
 
     Modern reasoning models will happily emit thousands of tokens of analysis
     text without ever calling a tool — burning budget without making progress.
     After every model call, if the response has no tool_calls, we append a
-    short corrective message and jump back to the model node so it tries
-    again. The budget middleware naturally bounds the loop.
+    short corrective message and jump back to the model node so it tries again —
+    up to _MAX_NO_TOOL_RETRIES times, then end the run (the jump bypasses the
+    before_model budget check, so an unbounded loop can't be stopped by it).
     """
     from langchain_core.messages import AIMessage, HumanMessage
 
-    @after_model(can_jump_to=["model"])
+    nudge = ("Your last response had no tool call. Every response MUST "
+             "be a tool call. Make a tool call now — do not write text.")
+
+    @after_model(can_jump_to=["model", "end"])
     def _require_tool(state: AgentState, runtime: Runtime):
         msg = state["messages"][-1]
         if not isinstance(msg, AIMessage):
@@ -356,15 +365,25 @@ def require_tool_calls_middleware() -> list:
         tool_calls = getattr(msg, "tool_calls", None) or []
         if tool_calls:
             return None
-        return {
-            "messages": [
-                HumanMessage(content=(
-                    "Your last response had no tool call. Every response MUST "
-                    "be a tool call. Make a tool call now — do not write text."
-                ))
-            ],
-            "jump_to": "model",
-        }
+        # Bound the retry. `jump_to: model` re-enters the model node DIRECTLY,
+        # bypassing the before_model hooks — so the session budget check never runs
+        # and can't stop us. If the model is broken (e.g. a pulled model 404ing on
+        # every call, then degrading to a text error AIMessage via
+        # ModelRetryMiddleware's on_failure='continue'), this would loop until the
+        # graph recursion limit (a 2.5-hour, 0-cost GraphRecursionError). Count the
+        # consecutive nudges already in the trajectory and give up after a few:
+        # end the run cleanly (FAILED) instead of spinning.
+        streak = 0
+        for m in reversed(state["messages"][:-1]):
+            if isinstance(m, HumanMessage) and str(getattr(m, "content", "")) == nudge:
+                streak += 1
+            elif isinstance(m, AIMessage):
+                continue
+            else:
+                break
+        if streak >= _MAX_NO_TOOL_RETRIES:
+            return {"jump_to": "end"}
+        return {"messages": [HumanMessage(content=nudge)], "jump_to": "model"}
 
     return [_require_tool]
 

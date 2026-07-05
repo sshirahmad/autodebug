@@ -619,6 +619,28 @@ class TestRequireToolCallsMiddleware:
         )
         assert out is None
 
+    def test_ends_run_after_max_no_tool_retries(self):
+        # A broken model (e.g. a pulled model 404ing every call, degraded to a text
+        # error message) would otherwise loop model<->nudge forever: jump_to model
+        # bypasses the before_model budget check, so nothing stops it until the graph
+        # recursion cap (a 2.5h, 0-cost GraphRecursionError). After the cap we END.
+        from langchain_core.messages import AIMessage, HumanMessage
+        from autodebug.agents.base import require_tool_calls_middleware, _MAX_NO_TOOL_RETRIES
+
+        mw = require_tool_calls_middleware()[0]
+        nudge = mw.after_model(state={"messages": [AIMessage(content="text", tool_calls=[])]},
+                               runtime=None)["messages"][0].content
+
+        # Build a trajectory with _MAX_NO_TOOL_RETRIES prior nudges, then another
+        # text-only AI response -> should give up and jump to "end", not "model".
+        msgs = []
+        for _ in range(_MAX_NO_TOOL_RETRIES):
+            msgs.append(AIMessage(content="text", tool_calls=[]))
+            msgs.append(HumanMessage(content=nudge))
+        msgs.append(AIMessage(content="still text", tool_calls=[]))
+        out = mw.after_model(state={"messages": msgs}, runtime=None)
+        assert out == {"jump_to": "end"}
+
 
 # ---------------------------------------------------------------------------
 # model_for_attempt — optionally escalate to a stronger model on retries
