@@ -88,9 +88,13 @@ class TestCliParity:
         assert "issues/1" in str(_FakeGraph.last_payload)
 
     def test_requires_bug_or_issue(self, monkeypatch):
+        import re
         r = _run(monkeypatch, ["https://x/y"])
         assert r.exit_code == 2
-        assert "Provide a bug" in r.output
+        # Strip ANSI + collapse whitespace so a wrapped/boxed error (narrow CI
+        # terminal) still matches the phrase.
+        clean = " ".join(re.sub(r"\x1b\[[0-9;]*m", "", r.output).split())
+        assert "Provide a bug" in clean
 
 
 class TestCliRendering:

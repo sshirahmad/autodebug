@@ -38,7 +38,6 @@ data/
 
 # LangGraph dev server cache (`langgraph dev`)
 .langgraph_api/
-.langgraph_api.stopped_*/
 
 # Local-only: trace-recovery helper + personal notes (not for publication)
 eval/recover_from_traces.py
