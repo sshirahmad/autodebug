@@ -585,7 +585,10 @@ def maybe_audit(
         content = resp.content if isinstance(resp.content, str) else str(resp.content)
         return _parse_verdict(content)
     except Exception as exc:
-        logger.warning(
+        # The audit is a best-effort check that degrades to "accept"; a failure
+        # (commonly a transient rate limit) is not actionable, so log at debug to
+        # keep it out of the default terminal output.
+        logger.debug(
             "Audit (%s) failed on model %r (provider %r); accepting. %s: %s",
             kind, jmodel, jprovider, type(exc).__name__, exc,
         )

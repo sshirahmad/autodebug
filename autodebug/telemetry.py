@@ -59,5 +59,17 @@ def setup_tracing(project_name: str = "autodebug") -> None:
     )
     LangChainInstrumentor().instrument(tracer_provider=tracer_provider)
 
+    # HITL resume (Command(resume=…)) makes newer LangChain fire an `on_resume`
+    # callback that openinference's tracer (<=0.1.66) doesn't implement, logging a
+    # noisy but harmless AttributeError on every resume. Add a no-op so resumes stay
+    # quiet. Best-effort — never let this break tracing setup.
+    try:
+        from openinference.instrumentation.langchain._tracer import OpenInferenceTracer
+
+        if not hasattr(OpenInferenceTracer, "on_resume"):
+            OpenInferenceTracer.on_resume = lambda self, *a, **k: None
+    except Exception:  # noqa: BLE001
+        pass
+
     _instrumented = True
     print(f"[autodebug] Phoenix tracing enabled → {endpoint}")
