@@ -29,3 +29,20 @@ BugsInPy/
 
 # LangMem SQLite store (env-specific binary)
 data/
+
+# Agent checkpoints / resume store (per-machine, regenerated)
+.autodebug/
+
+# skill update lock files
+.skills/**/.lock
+
+# LangGraph dev server cache (`langgraph dev`)
+.langgraph_api/
+
+# Local-only: trace-recovery helper + personal notes (not for publication)
+eval/recover_from_traces.py
+ideas.txt
+TODO.md
+
+# AUTODEBUG_DEBUG_BUILD=1 build logs (debug artifacts)
+build_logs/

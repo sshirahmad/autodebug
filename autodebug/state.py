@@ -32,6 +32,12 @@ class RootCauseResult(BaseModel):
     summary: str
     relevant_lines: list[str]
     hypothesis: str
+    evidence: str = ""   # runtime evidence the agent observed (postmortem/inspect_at)
+    fix_plan: str = ""   # the concrete change the fixer should EXECUTE (not re-derive)
+    # Ranked alternative hypotheses to fall back to if the fix for the primary
+    # one fails — so a loop-back EXPLORES a different cause instead of re-deriving
+    # the same (failed) one. See DebugState.hypothesis_attempts for what's been tried.
+    alternatives: list[str] = Field(default_factory=list)
 
 
 class FixResult(BaseModel):
@@ -44,28 +50,41 @@ class FixResult(BaseModel):
 class DebugState(BaseModel):
     """Single state object threaded through the entire LangGraph pipeline."""
 
-    # --- Input ---
+    # --- Input (production-real only; benchmark/test metadata lives in the eval
+    # harness, never here — the agents must run as they would in production) ---
     repo_url: str
     bug_report: str
-    known_good_commit: Optional[str] = None
+    known_good_commit: Optional[str] = None  # optional real hint: a version where it worked
     github_issue_url: Optional[str] = None
-    pre_fix_commit: Optional[str] = None     # fixed_commit_id~1; clone is checked out here
-    fixed_commit_id: Optional[str] = None    # the commit where the fix landed (for test-file sync)
-    test_file: Optional[str] = None          # path to the relevant test file
-    test_command: Optional[str] = None       # command to run targeted regression tests
-    test_patch: Optional[str] = None         # explicit test-only diff to apply at clone
+    ref: Optional[str] = None                # commit/branch to check out (defaults to HEAD)
+    # Production-real environment (NOT test metadata): the deployment's pinned
+    # dependencies, setup step, and interpreter version, used at clone time so the
+    # agent runs against the versions the code actually expects.
+    requirements: Optional[str] = None
+    setup_command: Optional[str] = None
+    python_version: Optional[str] = None  # e.g. "3.7.3"; selects the per-bug conda env
 
     # --- Runtime ---
     stage: PipelineStage = PipelineStage.INIT
     manager_phase: Optional[str] = None  # last Manager FSM phase (manager mode only)
     repo_volume: Optional[str] = None  # Docker volume name holding the cloned repo
     error: Optional[str] = None
+    # Free-text guidance a developer supplied via human-in-the-loop after a failed
+    # attempt (see autodebug/graph/interactive.py's human_review node). Threaded into the
+    # next attempt's prompt so the retry is steered, not a blind replay.
+    user_feedback: Optional[str] = None
 
     # --- Agent outputs (filled in as pipeline progresses) ---
     repro: Optional[ReproResult] = None
     bisect: Optional[BisectResult] = None
     root_cause: Optional[RootCauseResult] = None
     fix: Optional[FixResult] = None
+
+    # The hypothesis→fix attempt "tree": one node per fix attempt, recording the
+    # hypothesis tried, a digest of the patch, and the outcome ("pass"/"fail").
+    # Lets a loop-back avoid re-trying a hypothesis+patch that already failed and
+    # steer root_cause toward an untried alternative.
+    hypothesis_attempts: list[dict] = Field(default_factory=list)
 
     # --- Metadata ---
     messages: list[dict] = Field(default_factory=list)

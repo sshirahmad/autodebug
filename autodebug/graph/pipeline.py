@@ -11,12 +11,8 @@ the per-agent sandbox containers attach to the same repo state.
 
 from __future__ import annotations
 
-import os
-
 from opentelemetry import trace
 
-from autodebug.agents import run_bisect, run_fix, run_repro, run_root_cause
-from autodebug.memory import store_agent_run
 from autodebug.sandbox import (
     clone_into_volume,
     create_repo_volume,
@@ -32,12 +28,13 @@ def clone_repo(state: DebugState) -> DebugState:
     """Provision a Docker volume and clone the repo into it via a one-shot container."""
     volume = create_repo_volume()
     try:
+        # Production clone: just the repo at the given ref (default HEAD). No test
+        # files are injected — the benchmark's FAIL_TO_PASS test is applied only in
+        # the eval harness's separate scoring sandbox, never in the agents' repo.
         clone_into_volume(
-            volume,
-            state.repo_url,
-            state.pre_fix_commit,
-            test_patch=state.test_patch,
-            fixed_commit=state.fixed_commit_id,
+            volume, state.repo_url, state.ref,
+            requirements=state.requirements, setup_command=state.setup_command,
+            python_version=state.python_version,
         )
     except Exception:
         remove_repo_volume(volume)
@@ -48,62 +45,54 @@ def clone_repo(state: DebugState) -> DebugState:
 
 
 # ---------------------------------------------------------------------------
-# Pipeline
+# Pipeline (a thin, unattended wrapper over THE graph — see registry.build_graph)
 # ---------------------------------------------------------------------------
 
-_STAGES = (
-    ("repro", run_repro),
-    ("bisect", run_bisect),
-    ("root_cause", run_root_cause),
-    ("fix", run_fix),
-)
 
+def run_pipeline(repo_url: str, bug_report: str, *, run_label: str | None = None,
+                 **kwargs) -> DebugState:
+    """Run AutoDebug unattended (no HITL) and return the final DebugState.
 
-def _resolve_stages(registry):
-    """Pick the orchestration mode.
-
-    If a `manager` agent is configured (and not disabled via AUTODEBUG_MANAGER=0),
-    run the single FSM-driven Manager agent, which delegates to the sub-agents
-    itself. Otherwise fall back to the classic linear repro->...->fix sequence.
+    This is a thin SYNCHRONOUS wrapper over THE graph — the exact same graph Studio
+    and the CLI serve, just built with ``hitl=False`` — so eval/CLI/Studio share one
+    orchestration. `run_label` names the root trace span (e.g. "ansible-1") for
+    Phoenix; it never reaches the agents. Production inputs go in the run config; the
+    agent graph never sees test metadata (that stays in the eval scorer).
     """
-    manager_on = (
-        "manager" in registry.config.agents
-        and os.getenv("AUTODEBUG_MANAGER", "1") != "0"
-    )
-    if manager_on:
-        from autodebug.agents import run_manager
-        return (("manager", run_manager),)
-    return _STAGES
-
-
-def _failed(state: DebugState) -> bool:
-    # state.stage may be enum or its string value depending on coercion path.
-    return str(state.stage) in (PipelineStage.FAILED.value, str(PipelineStage.FAILED))
-
-
-def run_pipeline(repo_url: str, bug_report: str, **kwargs) -> DebugState:
-    """Run the full clone → repro → bisect → root_cause → fix sequence."""
     setup_tracing()
-    from autodebug.registry import AutoDebugRegistry
-    registry = AutoDebugRegistry.from_file()
+    from langchain_core.messages import HumanMessage
+    from langgraph.checkpoint.memory import MemorySaver
 
-    with _tracer.start_as_current_span("autodebug.pipeline") as span:
+    from autodebug.registry import AutoDebugRegistry
+
+    graph = AutoDebugRegistry.from_file().build_graph(hitl=False, checkpointer=MemorySaver())
+    config = {"configurable": {
+        "thread_id": run_label or "autodebug",
+        "repo_url": repo_url, "bug_report": bug_report,
+        "ref": kwargs.get("ref"),
+        "known_good": kwargs.get("known_good_commit"),
+        "issue_url": kwargs.get("github_issue_url"),
+        "requirements": kwargs.get("requirements"),
+        "setup_command": kwargs.get("setup_command"),
+        "python_version": kwargs.get("python_version"),
+    }}
+    state = DebugState(repo_url=repo_url, bug_report=bug_report, **kwargs)
+    with _tracer.start_as_current_span(run_label or "autodebug.pipeline") as span:
         span.set_attribute("repo_url", repo_url)
         span.set_attribute("bug_report", bug_report[:500])
-
-        state = DebugState(repo_url=repo_url, bug_report=bug_report, **kwargs)
+        if run_label:
+            span.set_attribute("instance_id", run_label)
         try:
-            state = clone_repo(state)
-
-            for name, runner in _resolve_stages(registry):
-                if _failed(state):
-                    break
-                with _tracer.start_as_current_span(f"autodebug.{name}"):
-                    state = runner(state, registry=registry)
-                if os.getenv("AUTODEBUG_MEMORY_ENABLED", "0") == "1":
-                    store_agent_run(name, state)
-
+            final = graph.invoke({"messages": [HumanMessage(content=bug_report)]}, config=config)
+            debug = (final or {}).get("debug")
+            if debug:
+                state = DebugState(**debug)
             span.set_attribute("final_stage", str(state.stage))
+            return state
+        except Exception as e:  # noqa: BLE001 — surface as a FAILED state, don't crash
+            span.record_exception(e)
+            state.stage = PipelineStage.FAILED
+            state.error = state.error or f"Pipeline: {type(e).__name__}: {str(e)[:300]}"
             return state
         finally:
             # Always release the volume so dangling state doesn't accumulate.

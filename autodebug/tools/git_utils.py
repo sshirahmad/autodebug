@@ -6,9 +6,12 @@ so the repo lives entirely inside the Docker volume.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from autodebug.sandbox import Sandbox
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -79,3 +82,35 @@ def unshallow(sandbox: Sandbox) -> None:
 
 def checkout(sandbox: Sandbox, ref: str) -> None:
     sandbox.git("checkout", "--force", ref)
+
+
+def reset_worktree(sandbox: Sandbox) -> None:
+    """Revert all working-tree changes to the current commit (the buggy checkout).
+
+    The repo volume is shared across stages, so a FAILED fix leaves its patches on
+    the tree. Without this, a later stage — a fix retry, or a manager loop-back to
+    repro/root_cause — would run against (and a new fix's `git diff` would capture)
+    the leftover patch. `apply_patch` only edits tracked files, so `reset --hard`
+    fully undoes it; untracked files are left alone. Best-effort, never raises.
+    """
+    try:
+        sandbox.git("reset", "--hard", "HEAD")
+    except Exception as exc:
+        logger.warning("Could not reset the working tree: %s: %s",
+                       type(exc).__name__, exc)
+
+
+def restore_checkout(sandbox: Sandbox, sha: str) -> None:
+    """Return the working tree to `sha`, aborting any in-progress `git bisect`.
+
+    The repo volume is shared across pipeline stages; a crashed or unfinished
+    bisect (or a stray checkout) would otherwise leave the tree on the wrong
+    commit, so root_cause/fix would run against the wrong code. Best-effort —
+    never raises, so it's safe in a `finally`.
+    """
+    try:
+        sandbox.git("bisect", "reset")        # no-op (nonzero) if not bisecting
+        sandbox.git("checkout", "--force", sha)
+    except Exception as exc:
+        logger.warning("Could not restore the working tree to %s: %s: %s",
+                       sha, type(exc).__name__, exc)

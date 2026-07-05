@@ -7,6 +7,14 @@ from langchain_core.messages import AIMessage
 from autodebug.state import DebugState, PipelineStage, ReproResult, BisectResult, RootCauseResult
 
 
+@pytest.fixture(autouse=True)
+def _disable_judge(monkeypatch):
+    """Keep the adversarial audit OFF by default so driver tests that populate a
+    submission don't make a live judge call. Tests exercising the judge re-enable
+    it explicitly (via setenv/delenv) on top of this."""
+    monkeypatch.setenv("AUTODEBUG_JUDGE", "0")
+
+
 def ai_with_tool_call(name: str, args: dict, id: str = "tc1") -> AIMessage:
     """Return an AIMessage that contains a single tool call."""
     return AIMessage(

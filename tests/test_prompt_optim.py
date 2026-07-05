@@ -38,6 +38,25 @@ def _patch_langmem(monkeypatch, out="IMPROVED PROMPT"):
     return sink
 
 
+def _patch_langmem_by_model(monkeypatch, behavior):
+    """build_model passes the model_id straight through, and each optimizer's
+    invoke() dispatches on it via `behavior(model_id) -> output|raises`. Lets a
+    test fail on the agent model and succeed on the fallback."""
+    import langmem
+
+    monkeypatch.setattr(base, "build_model", lambda model_id=None, provider=None: model_id)
+
+    class _Opt:
+        def __init__(self, model):
+            self.model = model
+
+        def invoke(self, inp):
+            return behavior(self.model)
+
+    monkeypatch.setattr(langmem, "create_prompt_optimizer",
+                        lambda model, kind="gradient": _Opt(model))
+
+
 class TestMaybeOptimizePrompt:
     def test_disabled_via_env_returns_original(self, monkeypatch):
         monkeypatch.setenv("AUTODEBUG_PROMPT_OPTIM", "0")
@@ -74,6 +93,74 @@ class TestMaybeOptimizePrompt:
         monkeypatch.delenv("AUTODEBUG_PROMPT_OPTIM", raising=False)
         _patch_langmem(monkeypatch, out="   ")
         assert base.maybe_optimize_prompt("ORIG", [AIMessage(content="x")], "fb") == "ORIG"
+
+    def test_uses_the_dedicated_optimizer_model_not_the_agent_model(self, monkeypatch):
+        monkeypatch.delenv("AUTODEBUG_PROMPT_OPTIM", raising=False)
+        monkeypatch.setenv("AUTODEBUG_PROMPT_OPTIM_MODEL", "opt-model")
+        used = {}
+
+        def behavior(model):
+            used["model"] = model
+            return "IMPROVED"
+
+        _patch_langmem_by_model(monkeypatch, behavior)
+        out = base.maybe_optimize_prompt(
+            "ORIG", [AIMessage(content="x")], "fb", model_id="agent-model")
+        assert out == "IMPROVED"
+        assert used["model"] == "opt-model"  # the dedicated model, not "agent-model"
+
+    def test_defaults_to_gpt_4o_mini_when_unset(self, monkeypatch):
+        monkeypatch.delenv("AUTODEBUG_PROMPT_OPTIM", raising=False)
+        monkeypatch.delenv("AUTODEBUG_PROMPT_OPTIM_MODEL", raising=False)
+        used = {}
+
+        def behavior(model):
+            used["model"] = model
+            return "IMPROVED"
+
+        _patch_langmem_by_model(monkeypatch, behavior)
+        base.maybe_optimize_prompt("ORIG", [AIMessage(content="x")], "fb", model_id="agent-model")
+        assert used["model"] == base._DEFAULT_OPTIM_MODEL
+
+
+class TestBraceMasking:
+    """LangMem reads literal {x} as required f-string variables; our static
+    prompts/trajectories carry code with braces (e.g. {sha}). We mask them for the
+    optimizer round-trip so it doesn't demand spurious variables or crash .format()."""
+
+    def test_mask_then_unmask_is_identity(self):
+        s = 'use {sha}; idx = commits[len(commits)//2]; first_bad = {x}'
+        masked = base._mask_braces(s)
+        assert "{" not in masked and "}" not in masked
+        assert base._unmask_braces(masked) == s
+
+    def test_masked_prompt_exposes_no_fstring_variables(self):
+        import re
+        masked = base._mask_braces("find {sha} at {len(commits)} -- {first_bad}")
+        assert re.findall(r"\{(.+?)\}", masked) == []  # LangMem extracts nothing
+
+    def test_optimizer_receives_masked_prompt_and_result_is_unmasked(self, monkeypatch):
+        monkeypatch.delenv("AUTODEBUG_PROMPT_OPTIM", raising=False)
+        seen = {}
+
+        def behavior(_model):
+            return "improved with {sha}"   # model echoes a brace -> must round-trip
+
+        # capture what the optimizer was handed
+        import langmem
+        monkeypatch.setattr(base, "build_model", lambda model_id=None, provider=None: model_id)
+
+        class _Opt:
+            def __init__(self, model): pass
+            def invoke(self, inp):
+                seen["prompt"] = inp["prompt"]
+                return behavior(None)
+
+        monkeypatch.setattr(langmem, "create_prompt_optimizer",
+                            lambda model, kind="gradient": _Opt(model))
+        out = base.maybe_optimize_prompt("keep {sha} here", [AIMessage(content="x {y}")], "fb")
+        assert "{" not in seen["prompt"] and "}" not in seen["prompt"]  # masked going in
+        assert out == "improved with {sha}"                            # unmasked coming out
 
 
 class TestTrimTrajectory:

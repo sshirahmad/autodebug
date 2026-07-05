@@ -83,6 +83,14 @@ class AutoDebugRegistry:
     def available_agents(self) -> list[str]:
         return sorted(self.config.agents)
 
+    def build_graph(self, *, hitl: bool = False, checkpointer=None, manager_node=None):
+        """THE graph factory — one compiled graph (prepare → clone → manager) that
+        every entry point runs. `hitl` is the only behavioral switch: True for
+        interactive (CLI/Studio, pauses for input when stuck), False for unattended
+        (eval/CI, never blocks). See autodebug/graph/interactive.py."""
+        from autodebug.graph.interactive import build
+        return build(self, hitl=hitl, checkpointer=checkpointer, manager_node=manager_node)
+
     def run(self, repo_url: str, bug_report: str, **kwargs):
         from autodebug.graph.pipeline import run_pipeline
         return run_pipeline(repo_url=repo_url, bug_report=bug_report, **kwargs)

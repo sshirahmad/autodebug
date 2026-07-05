@@ -13,6 +13,7 @@ Env vars:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sqlite3
@@ -28,10 +29,17 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 _DB_PATH      = Path(__file__).resolve().parents[1] / "data" / "memory.db"
 _EMBED_MODEL  = os.getenv("AUTODEBUG_EMBED_MODEL", "huggingface:sentence-transformers/all-MiniLM-L6-v2")
 _EMBED_DIMS   = int(os.getenv("AUTODEBUG_EMBED_DIMS", "384"))
 _MEMORY_MODEL = os.getenv("AUTODEBUG_MEMORY_MODEL", "openrouter/owl-alpha")
+# Provider for the memory model. None => build_model falls back to the agent's
+# provider (AUTODEBUG_MODEL_PROVIDER) — set this when the memory model needs a
+# different provider/route than the agent's (e.g. agent on Anthropic, memory on
+# an OpenRouter model).
+_MEMORY_PROVIDER = os.getenv("AUTODEBUG_MEMORY_PROVIDER") or None
 
 _EXTRACT_INSTRUCTIONS = (
     "Extract debugging actions, observations, and results from this debugging session. "
@@ -79,6 +87,14 @@ def memory_store() -> SqliteStore:
     if _store is None:
         _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False, isolation_level=None)
+        # memory.db is a single store shared across runs (cross-bug learning is the
+        # point). Make it safe for concurrent worker processes the same way as the
+        # checkpointer: WAL lets a reader and a writer proceed at once, and the busy
+        # timeout makes a contending writer WAIT instead of failing "database is
+        # locked". (Failures here are swallowed, so without this, memory writes are
+        # just silently dropped under --workers contention.)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"PRAGMA busy_timeout={int(os.getenv('AUTODEBUG_SQLITE_BUSY_MS', '30000'))}")
         store = SqliteStore(
             conn,
             index=IndexConfig(
@@ -97,8 +113,8 @@ def memory_store() -> SqliteStore:
 # ---------------------------------------------------------------------------
 
 def _get_manager(namespace: tuple[str, ...]):
-    from autodebug.agents.base import _build_model
-    model = _build_model(model_id=_MEMORY_MODEL)
+    from autodebug.agents.base import build_model
+    model = build_model(model_id=_MEMORY_MODEL, provider=_MEMORY_PROVIDER)
     return create_memory_store_manager(
         model,
         schemas=[DebugAction, DebugObservation, DebugResult],
@@ -117,8 +133,10 @@ def store_agent_run(stage: str, state) -> None:
         messages = [HumanMessage(content=_build_summary(stage, project, state))]
         manager = _get_manager(("autodebug", stage))
         manager.invoke({"messages": messages}, config={"recursion_limit": 500})
-    except Exception:
-        pass  # memory failures must never break the pipeline
+    except Exception as exc:
+        # Memory failures must never break the pipeline — but surface them.
+        logger.warning("Memory store failed for stage %r: %s: %s",
+                       stage, type(exc).__name__, exc)
 
 
 def _project_from_url(repo_url: str) -> str:
@@ -183,14 +201,38 @@ _SEARCH_INSTRUCTIONS_BY_AGENT = {
 
 
 def make_search_memory_tool(agent_name: str = "unknown", **_):
-    """Factory: returns a LangChain tool that searches this agent's past memories only.
+    """Factory: returns a LangChain tool that searches past debugging memories.
+
+    Searches the whole ("autodebug",) namespace PREFIX, not just this agent's
+    sub-namespace. In manager mode every memory is written under
+    ("autodebug", "manager") (one store_agent_run per session), so a per-agent
+    search of ("autodebug", <stage>) found almost nothing — the memories were
+    effectively write-only. The prefix reaches them all (the per-agent
+    `instructions` still steer the query); store.search treats the first arg as a
+    namespace prefix.
 
     The underlying LangMem tool exposes a rich schema (query, namespace filters,
     limits, etc.) that models often hallucinate field names for — we've seen
     `{'key': '<uuid>'}` instead of `{'query': '<text>'}`. Wrap it with a clean
     single-arg `query: str` signature so the LLM can only get it right.
+
+    RECALL is opt-in: memories are always WRITTEN (the corpus grows), but agents
+    only SEARCH them when AUTODEBUG_MEMORY_ENABLED=1. Off by default gives a clean,
+    reproducible baseline (no recall influence) and skips loading the embedding
+    model / touching the store entirely.
     """
-    namespace = ("autodebug", agent_name)
+    if os.getenv("AUTODEBUG_MEMORY_ENABLED", "0") != "1":
+        @tool(parse_docstring=True)
+        def search_memory(query: str) -> str:
+            """Search past debugging sessions for relevant patterns.
+
+            Args:
+                query: Natural-language description of what you're looking for.
+            """
+            return "Memory recall is disabled for this run (AUTODEBUG_MEMORY_ENABLED=0)."
+        return search_memory
+
+    namespace = ("autodebug",)
     instructions = _SEARCH_INSTRUCTIONS_BY_AGENT.get(
         agent_name,
         "Search past debugging sessions for relevant patterns and strategies.",
@@ -201,7 +243,7 @@ def make_search_memory_tool(agent_name: str = "unknown", **_):
         instructions=instructions,
     )
 
-    @tool
+    @tool(parse_docstring=True)
     def search_memory(query: str) -> str:
         """Search past debugging sessions for relevant patterns.
 
@@ -212,6 +254,7 @@ def make_search_memory_tool(agent_name: str = "unknown", **_):
         try:
             return str(underlying.invoke({"query": query}))
         except Exception as exc:
+            logger.warning("Memory search failed: %s: %s", type(exc).__name__, exc)
             return f"memory search failed: {exc}"
 
     return search_memory

@@ -7,15 +7,17 @@
     "run_fix_agent",
     "finish"
   ],
-  "time_budget_seconds": 5400,
-  "cost_budget_usd": 1.00,
+  "time_budget_seconds": 10800,
+  "cost_budget_usd": 2.00,
   "cost_per_1k_input_tokens": 0.003,
   "cost_per_1k_output_tokens": 0.015,
+  "session_cost_budget_usd": 16.0,
+  "session_time_budget_seconds": 10800,
   "max_retries": 0,
   "tool_call_limits": {
-    "run_repro_agent": 3,
-    "run_bisect_agent": 2,
-    "run_root_cause_agent": 3,
-    "run_fix_agent": 4
+    "run_repro_agent": 5,
+    "run_bisect_agent": 3,
+    "run_root_cause_agent": 5,
+    "run_fix_agent": 6
   }
 }

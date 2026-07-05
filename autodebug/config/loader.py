@@ -47,18 +47,47 @@ class ConfigLoader:
             k: (v.strip() if isinstance(v, str) else v) for k, v in data.items()
         }
 
-    def resolve_skills(self, names: list[str]) -> str:
-        """Inject a compact skills directory into the system prompt.
+    def _load_skill_body(self, name: str) -> str:
+        """Return a skill's SKILL.md content with the YAML frontmatter stripped.
 
-        Each skill's SKILL.md must have YAML frontmatter with `name` and
-        `description` fields. Only those two fields are injected here — the
-        full content is loaded on demand via the load_skill tool.
+        Mirrors the load_skill tool so the auto-injected primary skill reads the
+        same as if the agent had loaded it. Empty string if the skill is missing.
+        """
+        skill_file = _REPO_ROOT / ".skills" / name / "SKILL.md"
+        if not skill_file.exists():
+            return ""
+        content = skill_file.read_text(encoding="utf-8")
+        if content.startswith("---"):
+            end = content.find("---", 3)
+            if end != -1:
+                content = content[end + 3:].lstrip()
+        return content.strip()
+
+    def resolve_skills(self, names: list[str]) -> str:
+        """Assemble the skills section of a system prompt.
+
+        Agents almost never call `load_skill` on their own, so the *first*
+        configured skill (the agent's primary method) is inlined in FULL here —
+        guaranteeing the core guidance is present every run. The remaining skills
+        stay as one-line descriptions, loadable on demand via `load_skill`.
         """
         if not names:
             return ""
         skills_root = _REPO_ROOT / ".skills"
+        parts: list[str] = []
+
+        primary = names[0]
+        primary_body = self._load_skill_body(primary)
+        if primary_body:
+            parts.append(
+                f"## Primary skill (already loaded): {primary}\n\n{primary_body}"
+            )
+        elif (skills_root / primary / "SKILL.md").exists() is False:
+            import warnings
+            warnings.warn(f"Skill '{primary}' not found", stacklevel=2)
+
         entries: list[str] = []
-        for name in names:
+        for name in names[1:]:
             skill_file = skills_root / name / "SKILL.md"
             if not skill_file.exists():
                 import warnings
@@ -66,12 +95,13 @@ class ConfigLoader:
                 continue
             description = _parse_skill_description(skill_file.read_text(encoding="utf-8"))
             entries.append(f"- **{name}**: {description}")
-        if not entries:
-            return ""
-        lines = ["## Available Skills", ""]
-        lines.extend(entries)
-        lines += ["", "Call `load_skill(name)` to load the full guide for any skill above."]
-        return "\n".join(lines)
+        if entries:
+            lines = ["## Additional skills", ""]
+            lines.extend(entries)
+            lines += ["", "Call `load_skill(name)` to load the full guide for any skill above."]
+            parts.append("\n".join(lines))
+
+        return "\n\n---\n\n".join(parts)
 
     def _read_json(self, relative: str) -> dict:
         path = self.config_dir / relative

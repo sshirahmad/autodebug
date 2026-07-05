@@ -21,14 +21,16 @@ def gql(query, variables=None):
         raise RuntimeError(resp['errors'])
     return resp['data']
 
+_COUNT = int(sys.argv[1]) if len(sys.argv) > 1 else 3
+
 data = gql('''
 {
   getProjectByName(name: "autodebug") {
     spans(
-      first: 3
+      first: %d
       rootSpansOnly: true
       sort: { col: startTime, dir: desc }
-    ) {
+    ) {''' % _COUNT + '''
       edges {
         node {
           name

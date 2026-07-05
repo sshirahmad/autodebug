@@ -1,4 +1,4 @@
-from autodebug.tools.shared import make_read_file_tool, make_list_files_tool
+from autodebug.tools.shared import make_read_file_tool, make_list_files_tool, make_shell_tool
 from autodebug.memory import make_search_memory_tool
 from autodebug.tools.repro import make_run_script_tool, make_submit_repro_tool
 from autodebug.tools.bisect import (
@@ -6,7 +6,8 @@ from autodebug.tools.bisect import (
     make_submit_result_tool, make_submit_culprit_tool,
 )
 from autodebug.tools.root_cause import (
-    make_read_file_at_parent_tool, make_run_repro_with_traceback_tool, make_submit_root_cause_tool,
+    make_read_file_at_parent_tool, make_run_repro_with_traceback_tool,
+    make_inspect_at_tool, make_submit_root_cause_tool,
 )
 from autodebug.tools.fix import (
     make_apply_patch_tool, make_run_repro_tool, make_run_tests_tool, make_submit_fix_tool,
