@@ -10,11 +10,23 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import typer  # noqa: E402
 from typer.testing import CliRunner  # noqa: E402
 
 import autodebug.graph as graph_mod  # noqa: E402
 from autodebug import cli  # noqa: E402
 from autodebug.state import DebugState  # noqa: E402
+
+
+def _debug_option_flags() -> set[str]:
+    """The option flags registered on the `debug` subcommand. Introspect the click
+    command rather than parsing --help text: the rendered help wraps/truncates at
+    narrow terminal widths (e.g. in CI), which is flaky."""
+    debug_cmd = typer.main.get_command(cli.app).commands["debug"]
+    flags: set[str] = set()
+    for p in debug_cmd.params:
+        flags.update(getattr(p, "opts", []))
+    return flags
 
 
 class _FakeGraph:
@@ -42,12 +54,12 @@ class TestCliParity:
     def test_debug_is_a_named_subcommand(self):
         # `autodebug debug <repo>` must work as documented (Typer would otherwise
         # collapse a single command to `autodebug <repo>`).
-        assert "debug" in CliRunner().invoke(cli.app, ["--help"]).output
+        assert "debug" in typer.main.get_command(cli.app).commands
 
-    def test_new_options_appear_in_help(self):
-        out = CliRunner().invoke(cli.app, ["debug", "--help"]).output
+    def test_new_options_are_registered(self):
+        flags = _debug_option_flags()
         for opt in ("--ref", "--requirements", "--setup-command", "--python-version"):
-            assert opt in out
+            assert opt in flags
 
     def test_ref_and_env_fields_reach_config(self, monkeypatch):
         r = _run(monkeypatch, ["https://x/y", "--bug", "boom", "--ref", "abc123",
