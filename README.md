@@ -86,6 +86,14 @@ autodebug debug https://github.com/psf/black \
   --good <known-good-commit-or-date>     # optional, helps bisect
 ```
 
+`--bug` can be replaced (or augmented) by `--issue <github-issue-url>`: the issue's
+title and body are fetched and folded into the bug report (set `GITHUB_TOKEN` for
+private repos or higher rate limits).
+
+```bash
+autodebug debug https://github.com/psf/black --issue https://github.com/psf/black/issues/1234
+```
+
 It streams progress live and **pauses to ask you when it gets stuck** — a stage
 exhausts its retries, or the session budget runs out (human-in-the-loop). Pass
 `--unattended` to disable the prompts (for CI/batch); it then runs to completion and
@@ -132,14 +140,27 @@ langgraph dev
 over the standard LangGraph protocol, and provides persistence so threads, streaming,
 and interrupts work. Two ways to use it — **no custom backend needed**:
 
+**Submitting a bug report.** The graph needs two things: a **repo URL** and a
+**bug report**. The simplest way — works in *both* UIs — is to put the repo URL on
+its own line in the chat message, followed by the report:
+
+```
+https://github.com/psf/black
+black crashes in AWS Lambda: ProcessPoolExecutor fails when /dev/shm is unavailable
+```
+
+The first URL is taken as the repo; the rest is the bug report. (Optional
+`ref`/`known_good`/`requirements`/… still come from the run config.)
+
 - **LangGraph Studio** — open the `smith.langchain.com/studio?baseUrl=…` URL printed
-  by `langgraph dev`. It has a **config panel**, so set `repo_url` (and optional
-  `ref`/`known_good`/`requirements`/…) there and type the bug report as the message.
-  This is the quickest way to drive a run and watch its state.
+  by `langgraph dev`. Either paste the repo URL + report as the message (above), or use
+  the **config panel** — the graph declares a context schema (`repo_url`, `ref`,
+  `known_good`, `issue_url`, `requirements`, `setup_command`, `python_version`), so
+  those appear as form fields; set `repo_url` there and type just the bug as the message.
 - **Agent Chat UI** — point [Agent Chat UI](https://github.com/langchain-ai/agent-chat-ui)
   (a separate Next.js frontend) at `http://localhost:2024` with assistant id
-  `autodebug`. (It has no config panel, so the run target must come from Studio or be
-  parsed from the first message.)
+  `autodebug`. It has no config panel, so use the **message form above** (repo URL on the
+  first line) — that's the whole run target.
 
 **Architecture.** The graph is `prepare → clone → manager`, where `manager` is the
 Manager `create_agent` graph compiled **as a subgraph node** that shares the parent's
@@ -180,7 +201,7 @@ common ones — see [.env.example](.env.example) for the full list:
 | `AUTODEBUG_PROMPT_OPTIM` | Rewrite a failing agent's prompt from its trajectory on retry | `1` |
 | `AUTODEBUG_MEMORY_ENABLED` | Memory **recall** via LangMem (memories are always written; this gates reads) | `0` |
 | `SANDBOX_IMAGE` / `SANDBOX_TIMEOUT_SECONDS` / `SANDBOX_MEM_LIMIT` | Docker sandbox knobs | `autodebug-sandbox:latest` / `300` / `512m` |
-| `GITHUB_TOKEN` | For reading issues / opening PRs | — |
+| `GITHUB_TOKEN` | Reading GitHub issues via `--issue` (higher rate limits / private repos) | — |
 
 Per-agent knobs (time/cost budget, model, allowed tools, tool-call limits) live
 in `config/agents/*.json`; their system prompts are in `config/prompts/*.yaml`.
@@ -203,6 +224,43 @@ python eval/run_eval.py --ids black-1,pandas-23
 
 Metrics are printed and saved to `eval/results/run_<timestamp>.json`:
 `repro_rate`, `bisect_accuracy`, `fix_rate`, plus token/cost/wall-time averages.
+
+### Results
+
+On a **348-instance** BugsInPy-derived subset spanning **10 projects**, AutoDebug
+**reproduces 88%** of bugs and **fixes 67%** of the *scoreable* ones (a fix is
+counted only after the gold baseline proves the instance scoreable — see below).
+
+| Metric | Value |
+|--------|-------|
+| Reproduction rate | **87.9%** (306 / 348) |
+| Fix rate (of scoreable) | **67.2%** (223 / 332) |
+| Bisect — culprit file overlap | 64.1% |
+| Bisect — exact culprit SHA | 1.7% |
+| Excluded as `harness_invalid` | 16 / 348 |
+| Avg cost / instance | ~$6.15 |
+
+Per project:
+
+| Project | N | Fixed | Failed | No patch | Excluded | Fix rate |
+|---------|---:|---:|---:|---:|---:|---:|
+| ansible | 18 | 10 | 4 | 3 | 1 | 59% |
+| black | 23 | 13 | 6 | 3 | 1 | 59% |
+| cookiecutter | 4 | 2 | 2 | 0 | 0 | 50% |
+| fastapi | 16 | 13 | 2 | 0 | 1 | 87% |
+| httpie | 5 | 0 | 0 | 5 | 0 | 0% |
+| keras | 45 | 31 | 7 | 6 | 1 | 70% |
+| luigi | 33 | 28 | 1 | 2 | 2 | 90% |
+| matplotlib | 30 | 24 | 3 | 3 | 0 | 80% |
+| pandas | 169 | 99 | 26 | 35 | 9 | 62% |
+| sanic | 5 | 3 | 0 | 1 | 1 | 75% |
+| **Total** | **348** | **223** | **51** | **58** | **16** | **67.2%** |
+
+*Fix rate is over scoreable instances only (excluding `harness_invalid`). "Exact
+culprit SHA" is deliberately strict — a regression is usually introduced across a
+range of commits, so **file overlap** is the more meaningful bisect signal.
+Numbers are a single unattended run with `claude-sonnet-4-6`; the model, budgets,
+and prompts are all configurable, so your mileage will vary.*
 
 ### Fix scoring distinguishes a bad fix from a broken harness
 
