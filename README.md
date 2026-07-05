@@ -16,19 +16,9 @@ A **Manager** agent orchestrates four specialist sub-agents through a finite
 state machine, calling each as a tool and deciding the next move from the signal
 it returns:
 
-```
-                 ┌─────────────────────────────────────────────┐
-                 │                  Manager (FSM)               │
-                 │   init → reproduced → bisected → analyzed    │
-                 │                    ↘  revising  ↙            │
-                 └─────────────────────────────────────────────┘
-   run_repro_agent     run_bisect_agent   run_root_cause_agent   run_fix_agent
-        │                    │                    │                    │
-   reproduce the        find the commit      explain WHY it       write & verify
-   bug as a script      that introduced it   broke (observed      the patch against
-   (the success         (git pickaxe /       at runtime)          the reproduction
-   oracle)              bisect)
-```
+<p align="center">
+  <img src="docs/architecture.svg" alt="AutoDebug architecture: a Manager FSM orchestrates repro, bisect, root-cause, and fix sub-agents to turn a repo + bug report into a verified fix" width="820">
+</p>
 
 | Stage | Agent | Output |
 |-------|-------|--------|
@@ -237,9 +227,10 @@ Metrics are printed and saved to `eval/results/run_<timestamp>.json`:
 
 ### Results
 
-On a **348-instance** BugsInPy-derived subset spanning **10 projects**, AutoDebug
-**reproduces 88%** of bugs and **fixes 67%** of the *scoreable* ones (a fix is
-counted only after the gold baseline proves the instance scoreable — see below).
+On a **348-instance** [BugsInPy](https://github.com/soarsmu/BugsInPy)-derived subset
+spanning **10 projects**, AutoDebug **reproduces 88%** of bugs and **fixes 67%** of
+the *scoreable* ones (a fix is counted only after the gold baseline proves the
+instance scoreable — see below).
 
 | Metric | Value |
 |--------|-------|
@@ -269,7 +260,7 @@ Per project:
 *Fix rate is over scoreable instances only (excluding `harness_invalid`). "Exact
 culprit SHA" is deliberately strict — a regression is usually introduced across a
 range of commits, so **file overlap** is the more meaningful bisect signal.
-Numbers are a single unattended run with `claude-sonnet-4-6`; the model, budgets,
+Numbers are a single unattended run with OpenRouter's free models; the model, budgets,
 and prompts are all configurable, so your mileage will vary.*
 
 ### Fix scoring distinguishes a bad fix from a broken harness

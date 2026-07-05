@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 580" font-family="'Segoe UI', system-ui, -apple-system, Roboto, sans-serif">
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="5.5" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#94a3b8"/>
+    </marker>
+    <style>
+      .bg    { fill:#ffffff; stroke:#e2e8f0; stroke-width:1.5 }
+      .title { font-size:23px; font-weight:700; fill:#0f172a }
+      .sub   { font-size:13px; fill:#64748b }
+      .pill  { fill:#f8fafc; stroke:#94a3b8; stroke-width:1.5 }
+      .ptext { font-size:14px; font-weight:600; fill:#1e293b }
+      .mgr   { fill:#eef2ff; stroke:#6366f1; stroke-width:2 }
+      .mlab  { font-size:14px; font-weight:700; fill:#4338ca }
+      .mnote { font-size:11.5px; fill:#6366f1 }
+      .chip  { fill:#ffffff; stroke:#c7d2fe; stroke-width:1.25 }
+      .ctext { font-size:11.5px; font-weight:600; fill:#4338ca }
+      .revis { font-size:11px; font-style:italic; fill:#818cf8 }
+      .agent { fill:#f0fdfa; stroke:#14b8a6; stroke-width:1.75 }
+      .amono { font-size:12.5px; font-weight:700; fill:#0f766e;
+               font-family:'JetBrains Mono', ui-monospace, Consolas, monospace }
+      .desc  { font-size:11px; fill:#334155 }
+      .out   { fill:#f0fdf4; stroke:#22c55e; stroke-width:2 }
+      .otext { font-size:14px; font-weight:700; fill:#15803d }
+      .note  { font-size:11.5px; fill:#64748b }
+      .arrow { stroke:#94a3b8; stroke-width:1.75; fill:none; marker-end:url(#ah) }
+      .loop  { stroke:#a5b4fc; stroke-width:1.5; fill:none; stroke-dasharray:4 3; marker-end:url(#ah) }
+      .arw   { font-size:13px; fill:#94a3b8 }
+    </style>
+  </defs>
+
+  <rect class="bg" x="8" y="8" width="904" height="564" rx="14"/>
+
+  <text class="title" x="30" y="42">AutoDebug</text>
+  <text class="sub"   x="31" y="62">Autonomous debugging agent — reproduce · bisect · root-cause · fix, then verify its own patch.</text>
+
+  <!-- input -->
+  <rect class="pill" x="300" y="80" width="320" height="34" rx="17"/>
+  <text class="ptext" x="460" y="102" text-anchor="middle">Repository  +  natural-language bug report</text>
+  <path class="arrow" d="M460,114 L460,130"/>
+
+  <!-- manager -->
+  <rect class="mgr" x="150" y="130" width="620" height="138" rx="12"/>
+  <text class="mlab"  x="172" y="156">Manager · finite-state machine</text>
+  <text class="mnote" x="172" y="174">calls each sub-agent as a tool and picks the next move from its result</text>
+
+  <!-- phase chips -->
+  <g transform="translate(0,4)">
+    <rect class="chip" x="172" y="186" width="46"  height="24" rx="12"/>
+    <text class="ctext" x="195" y="202" text-anchor="middle">init</text>
+    <text class="arw" x="226" y="203" text-anchor="middle">→</text>
+    <rect class="chip" x="238" y="186" width="104" height="24" rx="12"/>
+    <text class="ctext" x="290" y="202" text-anchor="middle">reproduced</text>
+    <text class="arw" x="350" y="203" text-anchor="middle">→</text>
+    <rect class="chip" x="360" y="186" width="86"  height="24" rx="12"/>
+    <text class="ctext" x="403" y="202" text-anchor="middle">bisected</text>
+    <text class="arw" x="454" y="203" text-anchor="middle">→</text>
+    <rect class="chip" x="464" y="186" width="88"  height="24" rx="12"/>
+    <text class="ctext" x="508" y="202" text-anchor="middle">analyzed</text>
+  </g>
+  <!-- revising loop -->
+  <path class="loop" d="M508,214 C508,250 292,250 292,216"/>
+  <text class="revis" x="400" y="250" text-anchor="middle">revising — loop back to the weakest link when a fix fails</text>
+
+  <!-- fan-out to sub-agents -->
+  <path class="arrow" d="M460,268 L140,296"/>
+  <path class="arrow" d="M460,268 L353,296"/>
+  <path class="arrow" d="M460,268 L567,296"/>
+  <path class="arrow" d="M460,268 L780,296"/>
+
+  <!-- sub-agent cards -->
+  <g>
+    <rect class="agent" x="40"  y="300" width="195" height="150" rx="10"/>
+    <text class="amono" x="54"  y="326">run_repro_agent</text>
+    <text class="desc"  x="54"  y="350">Reproduce the bug as a</text>
+    <text class="desc"  x="54"  y="366">runnable script — the</text>
+    <text class="desc"  x="54"  y="382">success oracle for the run.</text>
+
+    <rect class="agent" x="255" y="300" width="195" height="150" rx="10"/>
+    <text class="amono" x="269" y="326">run_bisect_agent</text>
+    <text class="desc"  x="269" y="350">Find the commit that</text>
+    <text class="desc"  x="269" y="366">introduced the</text>
+    <text class="desc"  x="269" y="382">regression.</text>
+
+    <rect class="agent" x="470" y="300" width="195" height="150" rx="10"/>
+    <text class="amono" x="484" y="326">run_root_cause_agent</text>
+    <text class="desc"  x="484" y="350">Explain why it broke —</text>
+    <text class="desc"  x="484" y="366">a hypothesis observed</text>
+    <text class="desc"  x="484" y="382">at runtime + a fix plan.</text>
+
+    <rect class="agent" x="685" y="300" width="195" height="150" rx="10"/>
+    <text class="amono" x="699" y="326">run_fix_agent</text>
+    <text class="desc"  x="699" y="350">Write &amp; verify the patch</text>
+    <text class="desc"  x="699" y="366">against the reproduction</text>
+    <text class="desc"  x="699" y="382">(and targeted tests).</text>
+  </g>
+
+  <!-- converge to output -->
+  <path class="arrow" d="M137,450 L455,478"/>
+  <path class="arrow" d="M352,450 L458,478"/>
+  <path class="arrow" d="M567,450 L462,478"/>
+  <path class="arrow" d="M782,450 L465,478"/>
+
+  <!-- output -->
+  <rect class="out" x="290" y="480" width="340" height="34" rx="17"/>
+  <text class="otext" x="460" y="502" text-anchor="middle">✓  Verified fix  +  its reproduction</text>
+
+  <!-- footer notes -->
+  <text class="note" x="460" y="544" text-anchor="middle">Every stage runs in an isolated Docker sandbox  ·  scored by a held-out test the agents never see  ·  CLI + LangGraph Studio</text>
+</svg>
