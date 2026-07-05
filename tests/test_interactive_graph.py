@@ -28,6 +28,62 @@ class TestHelpers:
         ds = DebugState(repo_url="u", bug_report="b", repo_volume="vol")
         assert gi._ds({"debug": ds.model_dump()}).repo_volume == "vol"
 
+    def test_split_repo_and_report_extracts_url_from_message(self):
+        # Agent Chat UI offers only a message box, so a run must be drivable from the
+        # message alone: first URL -> repo, the rest -> bug report.
+        url, rep = gi._split_repo_and_report(
+            "https://github.com/psf/black\nblack crashes when /dev/shm is unavailable")
+        assert url == "https://github.com/psf/black"
+        assert rep == "black crashes when /dev/shm is unavailable"
+
+    def test_split_repo_drops_bare_repo_label(self):
+        url, rep = gi._split_repo_and_report("Repo: https://github.com/psf/black\nBug: it crashes")
+        assert url == "https://github.com/psf/black"
+        assert rep == "Bug: it crashes"
+
+    def test_split_repo_no_url_keeps_whole_report(self):
+        url, rep = gi._split_repo_and_report("no url here, just a report")
+        assert url == "" and rep == "no url here, just a report"
+
+    async def test_prepare_parses_repo_from_message_when_config_absent(self, monkeypatch):
+        # No repo_url in config -> prepare must parse it out of the chat message.
+        def clone(ds):
+            ds.repo_volume = "v"; ds.stage = PipelineStage.REPRO; return ds
+        monkeypatch.setattr(gi, "clone_repo", clone)
+        seen = {}
+        g = gi.build_graph(manager_node=lambda s: seen.update(debug=s["debug"]) or {"messages": []})
+        await g.ainvoke(
+            {"messages": [HumanMessage(content="https://github.com/psf/black\nit crashes")]},
+            config={"configurable": {"thread_id": "t"}},  # note: no repo_url
+        )
+        assert seen["debug"]["repo_url"] == "https://github.com/psf/black"
+        assert seen["debug"]["bug_report"] == "it crashes"
+
+    def test_run_context_schema_declares_repo_url(self):
+        # The declared context schema is what makes Studio render a config form.
+        assert "repo_url" in gi.RunContext.__annotations__
+        assert "manager" in gi.graph.get_graph().nodes
+
+    async def test_prepare_pasted_issue_url_yields_repo_and_folds_issue(self, monkeypatch):
+        # A pasted issue/PR URL doubles as the repo AND the issue, whose text is
+        # fetched and folded into the bug report (fetch stubbed — no network).
+        monkeypatch.setattr(gi, "fetch_issue", lambda url: "Issue title\n\nissue body")
+
+        def clone(ds):
+            ds.repo_volume = "v"; ds.stage = PipelineStage.REPRO; return ds
+        monkeypatch.setattr(gi, "clone_repo", clone)
+
+        seen = {}
+        g = gi.build_graph(manager_node=lambda s: seen.update(debug=s["debug"]) or {"messages": []})
+        await g.ainvoke(
+            {"messages": [HumanMessage(content="https://github.com/psf/black/issues/42\nit crashes")]},
+            config={"configurable": {"thread_id": "t"}},
+        )
+        dbg = seen["debug"]
+        assert dbg["repo_url"] == "https://github.com/psf/black"          # derived from issue URL
+        assert dbg["github_issue_url"] == "https://github.com/psf/black/issues/42"
+        assert "it crashes" in dbg["bug_report"] and "issue body" in dbg["bug_report"]
+
 
 class TestGraphWiring:
     def test_graph_exposes_shared_channels(self):
