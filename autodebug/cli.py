@@ -22,6 +22,37 @@ app = typer.Typer(help="AutoDebug — reproduce, bisect, and fix bugs automatica
 console = Console()
 
 
+@app.callback()
+def _main() -> None:
+    """AutoDebug — reproduce, bisect, and fix bugs automatically.
+
+    A no-op callback so Typer keeps `debug` as a *named* subcommand (a single
+    command would otherwise collapse to `autodebug <repo>`), matching the docs
+    `autodebug debug <repo>` and leaving room for future subcommands.
+    """
+
+
+def _text_of(content) -> str:
+    """Printable text from a message content (a str, or a list of content blocks)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for b in content:
+            if isinstance(b, str):
+                out.append(b)
+            elif isinstance(b, dict) and b.get("type") == "text":
+                out.append(b.get("text", ""))
+        return "".join(out)
+    return ""
+
+
+def _first_line(s, n: int = 100) -> str:
+    """A compact one-line preview of a (possibly huge, multi-line) tool result."""
+    s = " ".join(str(s).split())
+    return s[:n] + ("…" if len(s) > n else "")
+
+
 def _print_summary(debug: dict | None) -> None:
     from autodebug.state import DebugState
 
@@ -47,10 +78,21 @@ def _print_summary(debug: dict | None) -> None:
 @app.command()
 def debug(
     repo_url: str = typer.Argument(..., help="GitHub repo URL to debug"),
-    bug_report: str = typer.Option(..., "--bug", "-b", help="Bug report text"),
-    issue_url: Optional[str] = typer.Option(None, "--issue", "-i", help="GitHub issue URL"),
+    bug_report: Optional[str] = typer.Option(None, "--bug", "-b",
+                                             help="Bug report text (or use --issue)"),
+    issue_url: Optional[str] = typer.Option(None, "--issue", "-i",
+                                            help="GitHub issue/PR URL; its title+body is folded into the report"),
     known_good: Optional[str] = typer.Option(None, "--good", "-g",
                                              help="Known good commit hash or date"),
+    ref: Optional[str] = typer.Option(None, "--ref", "-r",
+                                      help="Commit SHA or branch to check out (default: repository HEAD)"),
+    requirements: Optional[str] = typer.Option(None, "--requirements",
+                                               help="Pinned deps to layer on top: a path to a "
+                                                    "requirements/freeze file, or inline text"),
+    setup_command: Optional[str] = typer.Option(None, "--setup-command",
+                                                help="Extra shell command run in the repo after dependency install"),
+    python_version: Optional[str] = typer.Option(None, "--python-version",
+                                                 help="Python version for the sandbox env (e.g. 3.11)"),
     unattended: bool = typer.Option(
         False, "--unattended",
         help="Never pause for input (CI/batch). By default AutoDebug pauses to ask you "
@@ -58,32 +100,77 @@ def debug(
 ):
     """Reproduce, bisect, root-cause, and fix a bug — pausing to ask for guidance when
     stuck (use --unattended to disable prompts)."""
+    from pathlib import Path
+
     from langchain_core.messages import HumanMessage
     from langgraph.types import Command
     from autodebug.graph import build_graph
 
+    if not bug_report and not issue_url:
+        raise typer.BadParameter("Provide a bug report with --bug and/or --issue.")
+    # --requirements accepts a path to a requirements/freeze file OR inline text.
+    reqs = requirements
+    if requirements and Path(requirements).is_file():
+        reqs = Path(requirements).read_text(encoding="utf-8", errors="replace")
+
     console.print(Panel(f"[bold blue]AutoDebug[/bold blue]\n{repo_url}", expand=False))
     graph = build_graph(hitl=not unattended)
     config = {"configurable": {"thread_id": uuid.uuid4().hex, "repo_url": repo_url,
-                               "issue_url": issue_url, "known_good": known_good}}
+                               "issue_url": issue_url, "known_good": known_good,
+                               "ref": ref, "requirements": reqs,
+                               "setup_command": setup_command,
+                               "python_version": python_version}}
 
     async def _drive(payload):
         # subgraphs=True so the Manager subgraph's live output streams and its
-        # interrupts surface; `messages` = token-level text, `updates` = interrupts.
+        # interrupts surface. `messages` streams the agents' TEXT token-by-token;
+        # `updates` carries tool activity + interrupts. We render them separately so
+        # the terminal stays readable: only the model's own text streams inline, while
+        # tool calls/results (incl. huge memory JSON, `ls` dumps) print as compact
+        # one-liners — otherwise everything blends into one wall of text.
+        from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+
+        current = {"id": None}
         async for _ns, mode, chunk in graph.astream(
             payload, config=config, stream_mode=["updates", "messages"], subgraphs=True
         ):
             if mode == "messages":
                 msg, _meta = chunk
-                if getattr(msg, "content", ""):
-                    console.print(msg.content, end="", soft_wrap=True)
-            elif mode == "updates" and "__interrupt__" in chunk:
-                intr = chunk["__interrupt__"]
-                first = intr[0] if isinstance(intr, (list, tuple)) else intr
-                return getattr(first, "value", first)        # paused for input
+                # Only the model's own text — skip tool dumps, HumanMessage nudges, etc.
+                if not isinstance(msg, (AIMessage, AIMessageChunk)):
+                    continue
+                text = _text_of(getattr(msg, "content", ""))
+                if not text:
+                    continue
+                # Suppress the retry middleware's degraded "Model call failed after N
+                # attempts with …" notices — huge 429/rate-limit JSON blobs, not agent
+                # output. The agent still sees them internally; this is display-only.
+                if text.lstrip().startswith("Model call failed after"):
+                    continue
+                mid = getattr(msg, "id", None)
+                if mid != current["id"]:          # blank line between turns
+                    console.print()
+                    current["id"] = mid
+                console.print(text, end="", soft_wrap=True, markup=False)
+            elif mode == "updates":
+                if "__interrupt__" in chunk:
+                    intr = chunk["__interrupt__"]
+                    first = intr[0] if isinstance(intr, (list, tuple)) else intr
+                    return getattr(first, "value", first)     # paused for input
+                for _node, val in (chunk or {}).items():
+                    for m in (val.get("messages") if isinstance(val, dict) else None) or []:
+                        if isinstance(m, AIMessage):
+                            for tc in getattr(m, "tool_calls", None) or []:
+                                console.print(f"\n🔧 {tc.get('name', '?')}",
+                                              style="cyan", markup=False)
+                        elif isinstance(m, ToolMessage):
+                            err = getattr(m, "status", None) == "error"
+                            console.print(f"   {'✗' if err else '✓'} {_first_line(m.content)}",
+                                          style="red" if err else "dim", markup=False)
         return None
 
-    payload = {"messages": [HumanMessage(content=bug_report)]}
+    payload = {"messages": [HumanMessage(
+        content=bug_report or f"Fix the bug reported at {issue_url}")]}
     while True:
         pause = asyncio.run(_drive(payload))
         if pause is None:

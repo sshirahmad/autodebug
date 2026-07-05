@@ -104,6 +104,16 @@ autodebug debug https://github.com/psf/black --bug "..."               # interac
 autodebug debug https://github.com/psf/black --bug "..." --unattended  # no prompts (CI)
 ```
 
+The CLI exposes the same run parameters as the Studio config panel, all optional:
+
+| Flag | Purpose |
+|------|---------|
+| `--ref` | commit SHA / branch to check out (default: repository HEAD) |
+| `--good` | a known-good commit or date (hint for bisect) |
+| `--requirements` | pinned deps to layer on top — a path to a requirements/freeze file, or inline text |
+| `--setup-command` | extra shell command run in the repo after dependency install |
+| `--python-version` | Python version for the sandbox env (e.g. `3.11`) |
+
 Or from Python — **one graph** drives every entry point (CLI, Studio, eval):
 
 ```python
