@@ -41,3 +41,6 @@ data/
 
 # AUTODEBUG_DEBUG_BUILD=1 build logs (debug artifacts)
 build_logs/
+
+# BitFun: a separate project checkout (own git repo) used for benchmarking; not part of AutoDebug
+BitFun/

@@ -307,19 +307,33 @@ def compute_metrics(results: list[dict]) -> dict[str, Any]:
     # fix failures and silently deflate the rate; they're reported separately.
     scoreable = [r for r in results if r.get("fix_category") != "harness_invalid"]
     ns = len(scoreable)
-    return {
+
+    # None-safe: a field can be None (e.g. repro/bisect are N/A for the BitFun runner,
+    # which has no reproduce/bisect stage) — count truthy values, treat None as 0.
+    def rate(key, rows):
+        return sum(1 for r in rows if r.get(key)) / len(rows) if rows else 0.0
+
+    def avg(key):
+        return sum((r.get(key) or 0) for r in results) / n
+
+    metrics = {
         "total": n,
-        "repro_rate": sum(r["repro_success"] for r in results) / n,
-        "bisect_accuracy": sum(r["bisect_correct"] for r in results) / n,
-        "bisect_sha_match_rate": sum(r.get("bisect_sha_match", False) for r in results) / n,
-        "bisect_file_overlap_rate": sum(r.get("bisect_file_overlap", False) for r in results) / n,
-        "fix_rate": (sum(r["fix_success"] for r in scoreable) / ns) if ns else 0.0,
+        "repro_rate": rate("repro_success", results),
+        "bisect_accuracy": rate("bisect_correct", results),
+        "bisect_sha_match_rate": rate("bisect_sha_match", results),
+        "bisect_file_overlap_rate": rate("bisect_file_overlap", results),
+        "fix_rate": rate("fix_success", scoreable),
         "fix_scoreable": ns,
         "harness_invalid": n - ns,
-        "avg_tokens": sum(r.get("total_tokens", 0) for r in results) / n,
-        "avg_cost_usd": sum(r.get("total_cost", 0) for r in results) / n,
-        "avg_wall_seconds": sum(r.get("wall_seconds", 0) for r in results) / n,
+        "avg_tokens": avg("total_tokens"),
+        "avg_cost_usd": avg("total_cost"),
+        "avg_wall_seconds": avg("wall_seconds"),
     }
+    # BitFun's token-economy metric, if any result reported it.
+    chr_vals = [r["cache_hit_rate"] for r in results if r.get("cache_hit_rate") is not None]
+    if chr_vals:
+        metrics["avg_cache_hit_rate"] = sum(chr_vals) / len(chr_vals)
+    return metrics
 
 
 def select_instances(dataset: list[dict], limit: int = 0, ids: str = "") -> list[dict]:
@@ -577,7 +591,13 @@ def _run_parallel(todo: list, fh, results: list, workers: int, fn=None, status=_
 
 
 def main(dataset_path: str, limit: int = 0, ids: str = "", resume: str = "",
-         workers: int = 1, scoreable: str = "") -> None:
+         workers: int = 1, scoreable: str = "", runner: str = "autodebug") -> None:
+    # Which agent produces the patch. Both are scored by the SAME validate_fix oracle
+    # on the SAME instances, so results are directly comparable (see eval/bitfun_runner).
+    if runner == "bitfun":
+        from eval.bitfun_runner import run_bitfun_on_instance as _fn
+    else:
+        _fn = run_on_instance
     # Agents mutate a single shared .skills/ path; during a (possibly parallel)
     # eval that's a race + a reproducibility hazard, so disable skill writes
     # unless the user explicitly opts in. Set before workers spawn so they inherit.
@@ -629,9 +649,9 @@ def main(dataset_path: str, limit: int = 0, ids: str = "", resume: str = "",
         for r in excluded:                       # record the gated-out instances first
             _persist(fh, results, r)
         if workers > 1 and len(todo) > 1:
-            _run_parallel(todo, fh, results, workers)
+            _run_parallel(todo, fh, results, workers, fn=_fn)
         elif todo:
-            _run_sequential(todo, fh, results)
+            _run_sequential(todo, fh, results, fn=_fn)
 
     metrics = compute_metrics(results)
     print("\n--- Metrics ---")
@@ -699,6 +719,12 @@ if __name__ == "__main__":
              "scoreable instances; unscoreable ones are recorded as harness_invalid "
              "up front (never sent to the agent).",
     )
+    parser.add_argument(
+        "--runner", choices=("autodebug", "bitfun"), default="autodebug",
+        help="Which agent produces the patch. 'bitfun' drives the BitFun CLI "
+             "(eval/bitfun_runner) instead of AutoDebug; both are scored by the SAME "
+             "held-out oracle on the SAME instances, for a direct comparison.",
+    )
     args = parser.parse_args()
     if args.compare:
         compare_runs(args.compare[0], args.compare[1])
@@ -707,4 +733,5 @@ if __name__ == "__main__":
     elif args.calibrate:
         calibrate(args.dataset, args.limit, args.ids, args.resume, args.workers)
     else:
-        main(args.dataset, args.limit, args.ids, args.resume, args.workers, args.scoreable)
+        main(args.dataset, args.limit, args.ids, args.resume, args.workers,
+             args.scoreable, args.runner)
