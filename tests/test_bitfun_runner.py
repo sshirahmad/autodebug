@@ -35,6 +35,25 @@ class TestArgv:
         assert "--agent" in argv and "agentic" in argv
         assert "--session-id" in argv and "abc" in argv   # so we can query usage after
 
+    def test_auto_flag_included_when_supported(self, monkeypatch):
+        # newer bitfun-cli permission-rejects every tool call in headless exec
+        # unless --auto is passed; older builds don't have the flag at all
+        argv = br.bitfun_exec_argv("bitfun-cli", "m", agent="debug",
+                                   patch_path="/tmp/p.diff", auto=True)
+        assert "--auto" in argv
+        argv = br.bitfun_exec_argv("bitfun-cli", "m", agent="debug",
+                                   patch_path="/tmp/p.diff", auto=False)
+        assert "--auto" not in argv
+        # default (auto=None) probes the binary once
+        monkeypatch.setattr(br, "_supports_auto_flag", lambda b: True)
+        argv = br.bitfun_exec_argv("bitfun-cli", "m", agent="debug", patch_path="/tmp/p.diff")
+        assert "--auto" in argv
+
+    def test_auto_probe_handles_missing_binary(self):
+        br._AUTO_FLAG_CACHE.clear()
+        assert br._supports_auto_flag("definitely-not-a-real-binary-xyz") is False
+        assert br._AUTO_FLAG_CACHE["definitely-not-a-real-binary-xyz"] is False  # cached
+
     def test_autonomous_prompt_wraps_report_and_forbids_questions(self):
         msg = br._autonomous_prompt(_INSTANCE["bug_report"])
         assert _INSTANCE["bug_report"] in msg            # core bug report preserved
@@ -43,6 +62,51 @@ class TestArgv:
         for leak in (_INSTANCE["test_command"], _INSTANCE["fixed_commit_id"],
                      _INSTANCE["ground_truth_patch"]):
             assert leak not in msg
+
+
+class TestDockerized:
+    def test_docker_argv_wraps_and_preserves_inner_args(self, monkeypatch):
+        monkeypatch.setattr(br, "_DOCKER_IMAGE", "autodebug-sandbox:latest")
+        inner = ["/opt/bitfun-cli", "exec", "msg", "--agent", "debug",
+                 "--output-patch", "/tmp/w/patch.diff"]
+        argv = br._docker_argv(inner, mounts=[("/opt/bitfun-cli", "/usr/local/bin/bitfun-cli", "ro")],
+                               workdir="/tmp/w/repo", name="bitfun-abc")
+        assert argv[:3] == ["docker", "run", "--rm"]
+        assert "autodebug-sandbox:latest" in argv
+        assert "--name" in argv and "bitfun-abc" in argv
+        assert "-v" in argv and "/opt/bitfun-cli:/usr/local/bin/bitfun-cli:ro" in argv
+        assert "-w" in argv and "/tmp/w/repo" in argv
+        # the in-container command uses PATH, not the host binary path
+        i = argv.index("autodebug-sandbox:latest")
+        assert argv[i + 1] == "bitfun-cli" and argv[i + 2:] == inner[1:]
+        assert "/opt/bitfun-cli" not in argv[i + 1:]
+
+    def test_docker_mounts_include_config_session_and_workdir(self, tmp_path):
+        mounts = br._docker_mounts("bitfun-cli", root=tmp_path)
+        dsts = [d for _, d, _ in mounts]
+        assert "/usr/local/bin/bitfun-cli" in dsts     # the binary
+        assert "/bfhome/.config/bitfun" in dsts        # model config (API key)
+        assert "/bfhome/.bitfun" in dsts               # session store for `usage`
+        assert "/bfhome" in dsts                       # scratch HOME
+        assert str(tmp_path) in dsts                   # workdir at its own path
+
+    def test_produce_patch_wraps_exec_in_docker_when_image_set(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(br, "_DOCKER_IMAGE", "img:x")
+        calls = []
+
+        def fake_run(cmd, cwd=None, timeout=None):
+            calls.append(cmd)
+            class _P:
+                stdout = ""
+            return _P()
+
+        br.produce_patch(_INSTANCE, bitfun_bin="bitfun-cli", workdir_root=tmp_path, run=fake_run)
+        execs = [c for c in calls if c[:2] == ["docker", "run"]]
+        assert execs, "bitfun exec was not containerized"
+        assert any("exec" in c for c in execs)         # the agent run
+        assert any("usage" in c for c in execs)        # the token-accounting query
+        # git clone/checkout stay on the host (trusted, and hooks don't run on clone)
+        assert calls[0][:2] == ["git", "clone"]
 
 
 class TestUsageParsing:
