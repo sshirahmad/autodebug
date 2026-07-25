@@ -14,6 +14,13 @@ Configuration (env, so the parallel harness inherits it):
   BITFUN_CLI      path to the built `bitfun-cli` binary (default: "bitfun-cli" on PATH)
   BITFUN_AGENT    agent type passed to `--agent` (default: "agentic")
   BITFUN_TIMEOUT  per-instance wall budget in seconds (default: 1800)
+  BITFUN_DOCKER_IMAGE  when set (e.g. "autodebug-sandbox:latest"), every bitfun-cli
+                  invocation runs inside a `docker run` of this image instead of on
+                  the host: the binary, the instance workdir, and ~/.config/bitfun +
+                  ~/.bitfun are mounted in, and the container runs as the host uid.
+                  Filesystem/process isolation for the agent; network stays open
+                  (the model API needs it). BITFUN_DOCKER_CPUS / BITFUN_DOCKER_MEM
+                  cap resources (default 2 / 4g).
 
 Standalone smoke (the "run BitFun on one instance" check):
   python -m eval.bitfun_runner --id black-1
@@ -39,6 +46,9 @@ _DEFAULT_TIMEOUT = int(os.getenv("BITFUN_TIMEOUT", "1800"))
 # reports tokens, not dollars). Set both to the SAME model's price AutoDebug uses.
 _COST_PER_1K_IN = float(os.getenv("BITFUN_COST_PER_1K_INPUT", "0") or 0)
 _COST_PER_1K_OUT = float(os.getenv("BITFUN_COST_PER_1K_OUTPUT", "0") or 0)
+# When set, bitfun-cli runs inside this Docker image (sandboxing the agent's shell/
+# edit tools away from the host) instead of directly on the host. Empty = host exec.
+_DOCKER_IMAGE = os.getenv("BITFUN_DOCKER_IMAGE", "")
 
 
 def _autonomous_prompt(bug_report: str) -> str:
@@ -72,15 +82,88 @@ def _cost_from_tokens(meta: dict):
     return round((inp or 0) / 1000 * _COST_PER_1K_IN + (out or 0) / 1000 * _COST_PER_1K_OUT, 4)
 
 
+def _supports_auto_flag(bitfun_bin: str) -> bool:
+    """Whether this bitfun-cli build has `exec --auto` (auto-approve tool requests).
+
+    Newer builds REQUIRE it headless — without it every ExecCommand/Edit is
+    permission-rejected and the run ends patchless; older builds don't have the
+    flag and never blocked. Probe `exec --help` once per binary path.
+    """
+    cached = _AUTO_FLAG_CACHE.get(bitfun_bin)
+    if cached is not None:
+        return cached
+    probe = [bitfun_bin, "exec", "--help"]
+    if _DOCKER_IMAGE:  # binary may only be runnable inside the container
+        probe = _docker_argv(probe, mounts=_docker_mounts(bitfun_bin))
+    try:
+        proc = subprocess.run(probe, capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=60)
+        supported = "--auto" in (proc.stdout or "") + (proc.stderr or "")
+    except OSError:
+        supported = False
+    _AUTO_FLAG_CACHE[bitfun_bin] = supported
+    return supported
+
+
+_AUTO_FLAG_CACHE: dict[str, bool] = {}
+
+
+def _docker_mounts(bitfun_bin: str, root=None) -> list[tuple[str, str, str]]:
+    """(host, container, mode) mounts for a containerized bitfun-cli invocation.
+
+    The binary lands on PATH; the user's real config (API key) and session store
+    (~/.bitfun, needed so a follow-up `bitfun usage` sees the session) are mounted
+    under /bfhome, which HOME points at inside the container. The instance workdir
+    (when given) mounts at its own host path so `--output-patch` and -w stay valid.
+    """
+    binary = shutil.which(bitfun_bin) or bitfun_bin
+    home = Path.home()
+    mounts = [
+        (str(Path(binary).resolve()), "/usr/local/bin/bitfun-cli", "ro"),
+        (str(home / ".config" / "bitfun"), "/bfhome/.config/bitfun", "rw"),
+        (str(home / ".bitfun"), "/bfhome/.bitfun", "rw"),
+    ]
+    if root is not None:
+        # scratch HOME parent so stray writes (~/.cache, …) succeed under --user
+        mounts.insert(0, (str(Path(root) / "home"), "/bfhome", "rw"))
+        mounts.append((str(root), str(root), "rw"))
+    return mounts
+
+
+def _docker_argv(inner: list[str], *, mounts, workdir=None, name=None) -> list[str]:
+    """Wrap a bitfun-cli argv in `docker run` (image = BITFUN_DOCKER_IMAGE).
+
+    Runs as the host uid/gid (a root-owned file in a bind-mounted $HOME would be
+    undeletable for a non-root user) with HOME=/bfhome so bitfun resolves its config
+    there. `name` makes the container killable on timeout — killing the `docker run`
+    client alone would leak it.
+    """
+    argv = ["docker", "run", "--rm"]
+    if name:
+        argv += ["--name", name]
+    if hasattr(os, "getuid"):  # not on Windows; Docker Desktop maps perms itself
+        argv += ["--user", f"{os.getuid()}:{os.getgid()}"]
+    argv += ["-e", "HOME=/bfhome", "-e", "XDG_CONFIG_HOME=/bfhome/.config"]
+    for src, dst, mode in mounts:
+        argv += ["-v", f"{src}:{dst}:{mode}"]
+    if workdir:
+        argv += ["-w", str(workdir)]
+    argv += ["--cpus", os.getenv("BITFUN_DOCKER_CPUS", "2"),
+             "--memory", os.getenv("BITFUN_DOCKER_MEM", "4g"),
+             _DOCKER_IMAGE, "bitfun-cli"]
+    return argv + inner[1:]  # inner[0] is the host binary path; in-container it's on PATH
+
+
 def bitfun_exec_argv(bitfun_bin: str, message: str, *, agent: str, patch_path,
-                     session_id: str | None = None) -> list[str]:
+                     session_id: str | None = None, auto: bool | None = None) -> list[str]:
     """The argv for one non-interactive BitFun run that emits a git-diff patch.
 
     Only the bug-report `message` is passed — never a test command, fixed commit, or
     expected diff — so BitFun sees exactly what AutoDebug's agents see (production
-    fidelity). `--output-patch` writes `git diff` of the workspace; `--confirm` is
-    off by default so tool calls don't block a headless run. A fixed `--session-id`
-    lets us query `bitfun usage <id>` afterwards for token accounting.
+    fidelity). `--output-patch` writes `git diff` of the workspace; `--auto`
+    (when the build supports it) approves tool requests so a headless run is never
+    permission-rejected. A fixed `--session-id` lets us query `bitfun usage <id>`
+    afterwards for token accounting.
     """
     argv = [
         bitfun_bin, "exec", message,
@@ -88,6 +171,10 @@ def bitfun_exec_argv(bitfun_bin: str, message: str, *, agent: str, patch_path,
         "--output-patch", str(patch_path),
         "--output-format", "json",
     ]
+    if auto is None:
+        auto = _supports_auto_flag(bitfun_bin)
+    if auto:
+        argv.append("--auto")
     if session_id:
         argv += ["--session-id", session_id]
     return argv
@@ -164,6 +251,12 @@ def produce_patch(instance: dict, *, bitfun_bin=_DEFAULT_BIN, agent=_DEFAULT_AGE
     session_id = uuid.uuid4().hex
     argv = bitfun_exec_argv(bitfun_bin, _autonomous_prompt(instance["bug_report"]),
                             agent=agent, patch_path=patch_path, session_id=session_id)
+    container = None
+    if _DOCKER_IMAGE:
+        (root / "home").mkdir(exist_ok=True)  # scratch HOME for the non-root container
+        container = f"bitfun-{session_id[:12]}"
+        argv = _docker_argv(argv, mounts=_docker_mounts(bitfun_bin, root=root),
+                            workdir=repo_dir, name=container)
     timed_out = False
     try:
         proc = run(argv, cwd=str(repo_dir), timeout=timeout)
@@ -174,6 +267,14 @@ def produce_patch(instance: dict, *, bitfun_bin=_DEFAULT_BIN, agent=_DEFAULT_AGE
         timed_out = True
         stdout = (e.stdout if isinstance(e.stdout, str) else "") or ""
         stderr = ((e.stderr if isinstance(e.stderr, str) else "") or "") + f"\n[TIMED OUT after {timeout}s]"
+        if container:
+            # killing the `docker run` client doesn't stop the container — kill it
+            # by name or the agent keeps running (and billing) unsupervised
+            try:
+                subprocess.run(["docker", "rm", "-f", container],
+                               capture_output=True, timeout=60)
+            except Exception:  # noqa: BLE001
+                pass
 
     # Always capture BitFun's own output so a `no_patch`/error is diagnosable.
     out = stdout + "\n----- STDERR -----\n" + stderr
@@ -188,7 +289,12 @@ def produce_patch(instance: dict, *, bitfun_bin=_DEFAULT_BIN, agent=_DEFAULT_AGE
     # Token accounting: BitFun streams events (no usage total), so query
     # `bitfun usage <session_id>` IN THE WORKSPACE and parse its markdown. Best-effort.
     try:
-        up = run([bitfun_bin, "usage", session_id], cwd=str(repo_dir), timeout=120)
+        usage_argv = [bitfun_bin, "usage", session_id]
+        if _DOCKER_IMAGE:  # same mounts: the session store lives in ~/.bitfun
+            usage_argv = _docker_argv(usage_argv,
+                                      mounts=_docker_mounts(bitfun_bin, root=root),
+                                      workdir=repo_dir)
+        up = run(usage_argv, cwd=str(repo_dir), timeout=120)
         report = parse_usage_report(getattr(up, "stdout", "") or "")
         if any(v is not None for v in report.values()):
             meta.update(report)
