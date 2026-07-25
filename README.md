@@ -281,6 +281,38 @@ Useful toggles: `AUTODEBUG_EVAL_BASELINE=0` disables gold-baseline validation
 (falls back to output heuristics); `AUTODEBUG_PIP_INSTALL=0` skips dependency
 installation.
 
+### Comparison against a free-form agent baseline (BitFun)
+
+The dominant paradigm for coding agents (SWE-agent, Cursor, Claude Code, and
+most local AI workbenches) is an LLM in a free-form tool loop, where the
+debugging workflow lives in the prompt as a suggestion rather than being
+enforced. To test whether AutoDebug's FSM buys anything over that paradigm at
+equal model, it was benchmarked head-to-head against
+[BitFun](https://github.com/GCWing/BitFun)'s `debug` agent — a representative
+instance of the free-form loop whose own prompt prescribes the same
+hypothesis-driven, reproduce-before-fixing discipline AutoDebug enforces
+mechanically. BitFun was driven through the identical clone → patch → oracle
+harness (`eval/bitfun_runner.py`) and scored by the *same* held-out gold-test
+oracle, on the *same* instances, with the *same* model pinned on both arms
+(`tencent/hy3:free` via OpenRouter).
+
+| Metric | AutoDebug | BitFun (`debug`) |
+|---|---:|---:|
+| Fix rate (143 paired-scoreable instances) | **69.9%** (100/143) | 57.3% (82/143) |
+| Statistical significance | McNemar χ²=4.52, p≈0.034 | — |
+| Non-pass outcomes declared as abstention | **39.5%** (17/43) | 1.6% (1/61) |
+| Non-pass outcomes submitted as a wrong patch | 60.5% (26/43) | 98.4% (60/61) |
+| Avg tokens / instance | 890,679 | 841,798 |
+| Avg wall-clock / instance | 1,651s | 375s (4.4× faster) |
+
+<p align="center">
+  <img src="docs/bitfun_fixrate.png" alt="Fix rate bar chart: AutoDebug 69.9% (100/143) vs BitFun 57.3% (82/143), McNemar chi-squared 4.52, p approximately 0.034" width="400">
+  <img src="docs/bitfun_failuremode.png" alt="Stacked bar chart of failure-mode composition: AutoDebug converts 39.5% of its non-pass outcomes into declared abstentions vs BitFun's 1.6%; the remainder are silent wrong patches" width="400">
+</p>
+
+At comparable token cost, AutoDebug's fix-rate lead is statistically
+significant — not just a raw edge. 
+
 ---
 
 ## Tracing
